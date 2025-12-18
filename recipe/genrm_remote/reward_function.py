@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
+from concurrent.futures import ThreadPoolExecutor
 from time import sleep
 
-import aiohttp
+import requests
 
 from verl.utils.reward_score.math_reward import last_boxed_only_string, remove_boxed
 
@@ -42,29 +42,16 @@ Please put your final answer (i.e., 'True' or 'False') in \\boxed{{}}.
 """.strip()
 
 
-async def post_request(payload, endpoint):
-    url = f"{BASE_URL}/{endpoint}"
-    try:
-        timeout = aiohttp.ClientTimeout(total=None)
-        session = aiohttp.ClientSession(timeout=timeout)
-        async with session.post(url, json=payload) as resp:
-            output = await resp.text()
-            output = json.loads(output)
-            return output
-    except Exception as e:
-        raise e
-    finally:
-        await session.close()
-
-
-async def get_response(problem, solution_str, ground_truth):
+def get_response(problem, solution_str, ground_truth):
     prompt = GENRM_PROMPT_TEMPLATE.format(problem=problem, solution=solution_str)
     messages = [{"role": "user", "content": prompt}]
     for attempt in range(MAX_RETRIES):
         try:
+            headers = {"Content-Type": "application/json"}
+            chat_url = f"{BASE_URL}/v1/chat/completions"
             data = {"model": MODEL_NAME, "messages": messages}
-            output = await post_request(data, "v1/chat/completions")
-            response = output["choices"][0]["message"]["content"]
+            output = requests.post(chat_url, headers=headers, json=data, timeout=30)
+            response = output.json()["choices"][0]["message"]["content"]
             return response
         except Exception as e:
             if attempt < MAX_RETRIES - 1:
@@ -90,7 +77,7 @@ def compute_reward(response):
     return reward_score
 
 
-async def compute_score(data_source, solution_str, ground_truth, extra_info):
+def compute_score(data_source, solution_str, ground_truth, extra_info):
     split = extra_info["split"]
     from verl.utils.reward_score import default_compute_score
 
@@ -100,10 +87,24 @@ async def compute_score(data_source, solution_str, ground_truth, extra_info):
         return func_rm_score
     else:
         problem = extra_info["question"]
-        response = await get_response(problem, solution_str, ground_truth)
+        response = get_response(problem, solution_str, ground_truth)
         if response is not None:
             reward_score = compute_reward(response)
         else:
             reward_score = 0.0
 
         return reward_score
+
+
+def compute_score_batch(data_sources, solution_strs, ground_truths, extra_infos):
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = []
+        for data_source, solution_str, ground_truth, extra_info in zip(
+            data_sources, solution_strs, ground_truths, extra_infos, strict=True
+        ):
+            future = executor.submit(compute_score, data_source, solution_str, ground_truth, extra_info)
+            futures.append(future)
+
+        results = [future.result() for future in futures]
+
+    return results

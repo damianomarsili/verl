@@ -133,6 +133,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     trainer.save_freq=20 \
     trainer.total_epochs=1 \
     trainer.default_local_dir="${CKPTS_DIR}" \
+    trainer.device=npu \
     trainer.resume_mode=auto \
     actor_rollout_ref.actor.entropy_checkpointing=True \
     actor_rollout_ref.ref.entropy_checkpointing=True \

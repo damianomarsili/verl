@@ -22,16 +22,6 @@ data:
   # Validation parquet. Can be a list or a single file.
   val_files: ~/data/rlhf/gsm8k/test.parquet
 
-  # Maximum sample length to be used.
-  # Set to -1 to use full dataset, otherwise, randomly
-  # select the specified number of samples from train dataset
-  train_max_samples: -1
-
-  # Maximum sample length to be used.
-  # Set to -1 to use full dataset, otherwise, randomly
-  # select the specified number of samples from val dataset
-  val_max_samples: -1
-
   # The field in the dataset where the prompt is located. Default is 'prompt'.
   prompt_key: prompt
 
@@ -57,17 +47,13 @@ data:
   return_raw_input_ids: False
 
   # Whether to return the original chat (prompt) without applying chat template.
-  return_raw_chat: True
+  return_raw_chat: False
 
   # Whether to return the full prompt with chat template.
   return_full_prompt: False
 
   # Whether to shuffle the data in the dataloader.
   shuffle: True
-
-  # An integer seed to use when shuffling the data. If not set or set to
-  # `null`, the data shuffling will not be seeded, resulting in a different data order on each run.
-  seed: null
 
   # num dataloader workers
   dataloader_num_workers: 8
@@ -165,7 +151,7 @@ actor_rollout_ref:
     enable_activation_offload: false
 
     # Whether to remove padding tokens in inputs during training
-    use_remove_padding: true
+    use_remove_padding: false
 
     # Set to positive value to enable LoRA (e.g., 32)
     lora_rank: 0
@@ -254,12 +240,8 @@ actor_rollout_ref:
     # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
     clip_ratio_c: 3.0
 
-    # Loss aggregation mode: "token-mean", "seq-mean-token-sum", "seq-mean-token-mean", or "seq-mean-token-sum-norm"
+    # Loss aggregation mode: "token-mean", "seq-mean-token-sum", or "seq-mean-token-mean"
     loss_agg_mode: token-mean
-
-    # Scale factor for "seq-mean-token-sum-norm" loss aggregation mode.
-    # If null, uses response_length. Set to a constant to ensure consistent normalization.
-    loss_scale_factor: null
 
     # Entropy regularization coefficient in PPO loss
     entropy_coeff: 0
@@ -319,8 +301,8 @@ actor_rollout_ref:
       # Number of cosine cycles in LR schedule
       num_cycles: 0.5
 
-      # LR scheduler type: "constant" or "cosine"
-      lr_scheduler_type: constant
+      # LR warmup style: "constant" or "cosine"
+      warmup_style: constant
 
       # Total training steps (must be overridden at runtime)
       total_training_steps: -1
@@ -415,7 +397,7 @@ actor_rollout_ref:
     name: vllm
 
     # sync: LLM, async: AsyncLLM
-    mode: async
+    mode: sync
 
     # Sampling temperature for rollout.
     temperature: 1.0
@@ -623,8 +605,8 @@ critic:
     # Minimum LR ratio for cosine schedule
     min_lr_ratio: 0.0
 
-    # LR scheduler type: "constant" or "cosine"
-    lr_scheduler_type: constant
+    # LR warmup style: "constant" or "cosine"
+    warmup_style: constant
 
     # Total training steps (must be overridden at runtime)
     total_training_steps: -1

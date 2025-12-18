@@ -15,7 +15,6 @@
 Utilities to create common models from huggingface
 """
 
-import json
 import os
 import re
 import warnings
@@ -24,13 +23,11 @@ from typing import Optional
 
 import numpy as np
 import torch
-from tensordict.tensorclass import NonTensorData
 from torch import nn
 from transformers import (
     AutoConfig,
     AutoModel,
     AutoModelForCausalLM,
-    AutoModelForImageTextToText,
     AutoModelForSequenceClassification,
     AutoModelForTokenClassification,
     AutoModelForVision2Seq,
@@ -398,7 +395,7 @@ def _get_parallel_model_architecture_from_config(config: PretrainedConfig, value
     )
 
 
-def _load_hf_model(config, model_config, is_value_model):
+def _load_hf_model(config, model_config, is_value_model, local_cache_path):
     """Helper function containing the loading hf model logic"""
     from accelerate import init_empty_weights
     from megatron.core import parallel_state as mpu
@@ -407,6 +404,7 @@ def _load_hf_model(config, model_config, is_value_model):
 
     assert hasattr(model_config, "architectures"), "architectures cannot be empty when load weight!"
     architectures = getattr(model_config, "architectures", [])
+    local_cache_path = os.path.expanduser(local_cache_path)
 
     # get auto class
     auto_cls = get_hf_auto_model_class(model_config)
@@ -415,7 +413,9 @@ def _load_hf_model(config, model_config, is_value_model):
         from verl.utils.fs import copy_to_local
 
         print(f"start download from {config.model.path}")
-        local_model_path = copy_to_local(src=config.model.path, use_shm=config.model.get("use_shm", False))
+        local_model_path = copy_to_local(
+            src=config.model.path, cache_dir=local_cache_path, use_shm=config.model.get("use_shm", False)
+        )
         print("finish download")
     else:
         local_model_path = config.model.path
@@ -452,19 +452,26 @@ def _load_hf_model(config, model_config, is_value_model):
     return architectures, model, state_dict, is_value_model
 
 
-def get_hf_model_path(config):
+def get_hf_model_path(config, local_cache_path="~/.cache/verl/rlhf"):
+    local_cache_path = os.path.expanduser(local_cache_path)
     if config.model.path.startswith("hdfs:"):
         from verl.utils.fs import copy_to_local
 
-        local_model_path = copy_to_local(src=config.model.path, use_shm=config.model.get("use_shm", False))
+        local_model_path = copy_to_local(
+            src=config.model.path, cache_dir=local_cache_path, use_shm=config.model.get("use_shm", False)
+        )
     else:
         local_model_path = config.model.path
     return local_model_path
 
 
-def load_megatron_model_weights(config, model_config, parallel_model, params_dtype, is_value_model=False):
+def load_megatron_model_weights(
+    config, model_config, parallel_model, params_dtype, is_value_model=False, local_cache_path="~/.cache/verl/rlhf"
+):
     """Load weights for verl customized model."""
-    architectures, model, state_dict, is_value_model = _load_hf_model(config, model_config, is_value_model)
+    architectures, model, state_dict, is_value_model = _load_hf_model(
+        config, model_config, is_value_model, local_cache_path
+    )
 
     from verl.models.weight_loader_registry import get_weight_loader
 
@@ -483,9 +490,11 @@ def load_megatron_model_weights(config, model_config, parallel_model, params_dty
     return model.config
 
 
-def load_megatron_gptmodel_weights(config, model_config, parallel_model, params_dtype, is_value_model=False):
+def load_megatron_gptmodel_weights(
+    config, model_config, parallel_model, params_dtype, is_value_model=False, local_cache_path="~/.cache/verl/rlhf"
+):
     """Load weights for mcore GPT model."""
-    _, model, state_dict, is_value_model = _load_hf_model(config, model_config, is_value_model)
+    _, model, state_dict, is_value_model = _load_hf_model(config, model_config, is_value_model, local_cache_path)
 
     from verl.models.mcore.loader import load_state_dict_to_megatron_gptmodel
 
@@ -533,7 +542,7 @@ def pad_packed_inputs(unpad_tokens: torch.Tensor, cu_seqlens, max_seqlen_in_batc
     return unpad_tokens, cu_seqlens, max_seqlen_in_batch
 
 
-def load_mcore_dist_weights(parallel_model, dist_weight_path, is_value_model=False, prefix=""):
+def load_mcore_dist_weights(parallel_model, dist_weight_path, is_value_model=False):
     from megatron.core import dist_checkpointing
     from megatron.core.dist_checkpointing.serialization import StrictHandling
 
@@ -542,7 +551,7 @@ def load_mcore_dist_weights(parallel_model, dist_weight_path, is_value_model=Fal
     # strict = StrictHandling.IGNORE_ALL if is_value_model else StrictHandling.ASSUME_OK_UNEXPECTED
     strict = StrictHandling.ASSUME_OK_UNEXPECTED
     for model in parallel_model:
-        ssd = unwrap_model(model).sharded_state_dict(prefix=prefix)
+        ssd = unwrap_model(model).sharded_state_dict()
         if is_value_model:
             for k in list(ssd.keys()):
                 if "output_layer" in k:
@@ -675,20 +684,14 @@ def get_hf_auto_model_class(hf_config):
                 actor_module_class = AutoModelForVision2Seq
             case "AutoModelForCausalLM":
                 actor_module_class = AutoModelForCausalLM
-            case "AutoModelForImageTextToText":
-                actor_module_class = AutoModelForImageTextToText
             case _:
                 actor_module_class = AutoModel
     else:
         actor_module_class = AutoModel
-        # For VLM models, we use type to check instead of architecture
-        if type(hf_config) in AutoModelForImageTextToText._model_mapping.keys():
-            actor_module_class = AutoModelForImageTextToText
-        else:
-            for key, cls in _architecture_to_auto_class.items():
-                if key in hf_config.architectures[0]:
-                    actor_module_class = cls
-                    break
+        for key, cls in _architecture_to_auto_class.items():
+            if key in hf_config.architectures[0]:
+                actor_module_class = cls
+                break
 
     return actor_module_class
 
@@ -717,10 +720,6 @@ def extract_multi_modal_inputs(
         selected_batch_data = [batch_data[i] for i in indices if i < len(batch_data)]
 
     for inputs in selected_batch_data:
-        inputs = inputs.data if isinstance(inputs, NonTensorData) else inputs
-        # Mixed pure text and multi-modal dataset.
-        if inputs is None:
-            continue
         if "image_bound" in inputs:
             has_image_bound = True
         for key, value in inputs.items():
@@ -736,41 +735,6 @@ def extract_multi_modal_inputs(
             multi_modal_inputs[key] = torch.cat(values, dim=0)
 
     return multi_modal_inputs
-
-
-def get_lora_rank_from_adapter(adapter_path: str | os.PathLike) -> int:
-    """
-    Extract LoRA rank from adapter configuration file.
-
-    Args:
-        adapter_path: Path to LoRA adapter directory
-
-    Returns:
-        LoRA rank value from adapter_config.json
-
-    Raises:
-        FileNotFoundError: If adapter path or config file doesn't exist
-        ValueError: If config file is invalid or missing rank
-    """
-    adapter_path = os.path.abspath(os.path.expanduser(str(adapter_path)))
-
-    if not os.path.exists(adapter_path):
-        raise FileNotFoundError(f"LoRA adapter path not found: {adapter_path}")
-
-    config_path = os.path.join(adapter_path, "adapter_config.json")
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"adapter_config.json not found in {adapter_path}")
-
-    try:
-        with open(config_path, encoding="utf-8") as f:
-            config = json.load(f)
-            if "r" not in config:
-                raise ValueError(f"LoRA rank 'r' not found in {config_path}")
-            return int(config["r"])
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON in {config_path}: {e}") from e
-    except (KeyError, ValueError) as e:
-        raise ValueError(f"Cannot parse LoRA rank from {config_path}: {e}") from e
 
 
 @dataclass

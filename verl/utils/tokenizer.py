@@ -13,7 +13,11 @@
 # limitations under the License.
 """Utils for tokenization."""
 
+import math
+import os
+import re
 import warnings
+from transformers import AutoConfig
 
 __all__ = ["hf_tokenizer", "hf_processor"]
 
@@ -57,10 +61,90 @@ def hf_tokenizer(name_or_path, correct_pad_token=True, correct_gemma2=True, **kw
         )
         kwargs["eos_token"] = "<end_of_turn>"
         kwargs["eos_token_id"] = 107
+    trust_remote_code = True
+    kwargs["trust_remote_code"] = trust_remote_code
     tokenizer = AutoTokenizer.from_pretrained(name_or_path, **kwargs)
+
+    config = None
+    try:
+        config = AutoConfig.from_pretrained(name_or_path, trust_remote_code=trust_remote_code)
+    except Exception:
+        warnings.warn(
+            f"Failed to load config for tokenizer '{name_or_path}'. InternVL specific tweaks are skipped.",
+            stacklevel=1,
+        )
+
+    if config is not None and re.match(r"internvl", getattr(config, "model_type", ""), re.IGNORECASE):
+        tokenizer.context_image_token = "<IMG_CONTEXT>"
+        tokenizer.end_image_token = "</img>"
+        tokenizer.start_image_token = "<img>"
+        tokenizer.video_token = "<video>"
+        # InternVL processors expect *_token_id attributes to be present.
+        tokenizer.context_image_token_id = tokenizer.convert_tokens_to_ids(tokenizer.context_image_token)
+        tokenizer.start_image_token_id = tokenizer.convert_tokens_to_ids(tokenizer.start_image_token)
+        tokenizer.end_image_token_id = tokenizer.convert_tokens_to_ids(tokenizer.end_image_token)
+        tokenizer.video_token_id = tokenizer.convert_tokens_to_ids(tokenizer.video_token)
+        tokenizer.chat_template = (
+            "{% for message in messages %}"
+            "{{'<|im_start|>' + message['role'] + ''}}"
+            "{% if message['content'] is string %}"
+            "{{ message['content'] }}"
+            "{% else %}"
+            "{% for content in message['content'] %}"
+            "{% if content['type'] == 'image' %}{{ '<image>' }}"
+            "{% elif content['type'] == 'video' %}{{ '<video>' }}"
+            "{% elif content['type'] == 'text' %}{{ content['text'] }}{% endif %}"
+            "{% endfor %}"
+            "{% endif %}"
+            "{{'<|im_end|>'}}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}{{'<|im_start|>assistant' }}{% endif %}"
+        )
+
     if correct_pad_token:
         set_pad_token_id(tokenizer)
     return tokenizer
+
+
+def _get_internvl_processor_overrides(config=None):
+    """Read optional InternVL processor overrides from environment variables.
+
+    The defaults depend on the InternVL vision configuration so that the number of
+    textual image context tokens matches the actual number of vision features.
+    """
+
+    def _int_env(key, default):
+        try:
+            return int(os.environ.get(key, default))
+        except ValueError:
+            return default
+
+    vision_config = getattr(config, "vision_config", None)
+    patch_size = getattr(vision_config, "patch_size", 14)
+    base_image_res = getattr(vision_config, "image_size", 448)
+    force_image_size = getattr(config, "force_image_size", None)
+    downsample_ratio = getattr(config, "downsample_ratio", 0.5)
+
+    if isinstance(force_image_size, int) and force_image_size > 0:
+        base_image_res = force_image_size
+
+    max_patches = _int_env("VERL_INTERNVL_MAX_PATCHES", 1)
+    if max_patches <= 0:
+        max_patches = 1
+
+    if max_patches <= 1:
+        default_image_res = min(base_image_res, 320)
+    else:
+        default_image_res = base_image_res
+
+    image_res = _int_env("VERL_INTERNVL_IMAGE_RES", default_image_res)
+    # Ensure at least one patch per dimension before downsampling.
+    patches_per_dim = max(image_res // patch_size, 1)
+    default_seq_float = (patches_per_dim ** 2) * (downsample_ratio ** 2)
+    default_seq_len = max(1, int(math.floor(default_seq_float + 1e-6)))
+    image_seq_length = _int_env("VERL_INTERNVL_IMAGE_SEQ_LEN", default_seq_len)
+
+    return image_seq_length, image_res, max_patches
 
 
 def hf_processor(name_or_path, **kwargs):
@@ -74,8 +158,58 @@ def hf_processor(name_or_path, **kwargs):
     """
     from transformers import AutoProcessor
 
+    trust_remote_code = True
+    kwargs["trust_remote_code"] = trust_remote_code
+    config = None
     try:
-        processor = AutoProcessor.from_pretrained(name_or_path, **kwargs)
+        config = AutoConfig.from_pretrained(name_or_path, trust_remote_code=trust_remote_code)
+    except Exception:
+        warnings.warn(
+            f"Failed to load config for processor '{name_or_path}'. InternVL specific tweaks are skipped.",
+            stacklevel=1,
+        )
+
+    try:
+        if config is not None and re.match(r"internvl", getattr(config, "model_type", ""), re.IGNORECASE):
+            from transformers.models.got_ocr2 import GotOcr2ImageProcessorFast
+            from transformers.models.internvl import InternVLProcessor
+            from transformers.models.internvl.video_processing_internvl import InternVLVideoProcessor
+
+            imagenet_mean = [0.485, 0.456, 0.406]
+            imagenet_std = [0.229, 0.224, 0.225]
+
+            image_seq_length, image_res, max_patches = _get_internvl_processor_overrides(config)
+            if max_patches is None or max_patches <= 0:
+                max_patches = 1
+
+            image_processor = GotOcr2ImageProcessorFast(
+                crop_to_patches=False,
+                data_format="channels_first",
+                default_to_square=True,
+                    do_convert_rgb=True,
+                    do_normalize=True,
+                    do_rescale=True,
+                    do_resize=True,
+                    rescale_factor=0.00392156862745098,
+                    size={"height": image_res, "width": image_res},
+                    max_patches=max_patches,
+                    min_patches=min(1, max_patches),
+                    resample=3,
+                    return_tensors=None,
+                    image_mean=imagenet_mean,
+                    image_std=imagenet_std,
+            )
+            video_processor = InternVLVideoProcessor()
+            tokenizer = hf_tokenizer(name_or_path, trust_remote_code=trust_remote_code)
+            processor = InternVLProcessor(
+                image_processor=image_processor,
+                image_seq_length=image_seq_length,
+                tokenizer=tokenizer,
+                chat_template=tokenizer.chat_template,
+                video_processor=video_processor,
+            )
+        else:
+            processor = AutoProcessor.from_pretrained(name_or_path, **kwargs)
     except Exception as e:
         processor = None
         # TODO(haibin.lin): try-catch should be removed after adding transformer version req to setup.py to avoid

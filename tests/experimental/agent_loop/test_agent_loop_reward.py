@@ -13,7 +13,6 @@
 # limitations under the License.
 import os
 
-import pytest
 import ray
 from hydra import compose, initialize_config_dir
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -25,7 +24,6 @@ from verl.trainer.main_ppo import create_rl_sampler
 from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
 
 
-@pytest.mark.skip(reason="compute score is deprecated and replaced by reward manager worker")
 def test_agent_loop_compute_score():
     ray.init(
         runtime_env={

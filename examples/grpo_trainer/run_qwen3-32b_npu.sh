@@ -55,4 +55,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.resume_from_path=checkpoints/ \
     trainer.save_freq=500 \
     trainer.test_freq=50 \
-    trainer.total_epochs=50 $@
+    trainer.total_epochs=50 \
+    trainer.device=npu $@

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
 import logging
 import os
 from dataclasses import dataclass
@@ -210,10 +209,8 @@ def _get_input_embeds(
         patch_dim = config.in_channels * config.temporal_patch_size * config.patch_size**2
         pixel_values = torch.zeros((16, patch_dim), dtype=inputs_embeds.dtype, device=inputs_embeds.device)
         image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long, device=inputs_embeds.device)
-        image_embeds, dummy_deepstack_image_embeds = model.visual(pixel_values, grid_thw=image_grid_thw)
+        image_embeds, _ = model.visual(pixel_values, grid_thw=image_grid_thw)
         inputs_embeds += 0.0 * image_embeds.mean()
-        for emb in dummy_deepstack_image_embeds or []:
-            inputs_embeds += 0.0 * emb.mean()
 
     if attention_mask is not None:
         attention_mask = attention_mask.to(inputs_embeds.device)
@@ -335,41 +332,3 @@ def forward_with_triton_backend(
         entropy=entropy,
         hidden_states=outputs.hidden_states,
     )
-
-
-def patch_qwen3_vl_moe_sparse_moe_block_forward():
-    """
-    Monkey patch to fix a bug in transformers 4.57.3 where Qwen3VLMoeTextSparseMoeBlock.forward
-    incorrectly uses torch.zeros_like(hidden_states) instead of torch.zeros_like(router_logits)
-    when creating router_weights (line 148 in modeling_qwen3_vl_moe.py).
-
-    This is a minimal fix that only changes the problematic line while keeping the rest of the
-    original implementation intact.
-    """
-    try:
-        from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import Qwen3VLMoeTextSparseMoeBlock
-    except ImportError:
-        # Model not available, skip patching
-        return
-
-    # Store the original forward method for reference
-    original_forward = Qwen3VLMoeTextSparseMoeBlock.forward
-
-    @functools.wraps(original_forward)
-    def patched_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        batch_size = hidden_states.shape[0]
-        hidden_states = hidden_states.reshape(-1, self.hidden_size)
-        router_logits = self.gate(hidden_states)
-        routing_weights = torch.nn.functional.softmax(router_logits, dim=-1, dtype=torch.float)
-        routing_weights, router_indices = torch.topk(routing_weights, self.top_k, dim=-1)
-        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
-        # BUG FIX: Original code incorrectly uses hidden_states here, should use router_logits
-        routing_weights = routing_weights.to(router_logits.dtype)
-        router_weights = torch.zeros_like(router_logits).scatter_(1, router_indices, routing_weights)
-        hidden_states = hidden_states.reshape(batch_size, -1, self.hidden_size)
-        routed_out = self.experts(hidden_states, router_weights, router_indices)
-        return routed_out
-
-    # Apply the patch
-    Qwen3VLMoeTextSparseMoeBlock.forward = patched_forward
-    logger.info("Monkey patched Qwen3VLMoeTextSparseMoeBlock.forward to fix router_weights bug")

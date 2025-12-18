@@ -28,8 +28,8 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
-from verl.utils.device import auto_set_ascend_device_name, is_cuda_available
-from verl.utils.import_utils import load_extern_object
+from verl.utils.device import is_cuda_available
+from verl.utils.import_utils import load_extern_type
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
@@ -39,21 +39,17 @@ def main(config):
     Args:
         config_dict: Hydra configuration dictionary containing training parameters.
     """
-    # Automatically set `config.trainer.device = npu` when running on Ascend NPU.
-    auto_set_ascend_device_name(config)
-
     run_ppo(config)
 
 
 # Define a function to run the PPO-like training process
-def run_ppo(config, task_runner_class=None) -> None:
+def run_ppo(config) -> None:
     """Initialize Ray cluster and run distributed PPO training process.
 
     Args:
         config: Training configuration object containing all necessary parameters
                 for distributed PPO training including Ray initialization settings,
                 model paths, and training hyperparameters.
-        task_runner_class: For recipe to change TaskRunner.
     """
     # Check if Ray is not initialized
     if not ray.is_initialized():
@@ -64,20 +60,10 @@ def run_ppo(config, task_runner_class=None) -> None:
         default_runtime_env = get_ppo_ray_runtime_env()
         ray_init_kwargs = config.ray_kwargs.get("ray_init", {})
         runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})
-
-        if config.transfer_queue.enable:
-            # Add runtime environment variables for transfer queue
-            runtime_env_vars = runtime_env_kwargs.get("env_vars", {})
-            runtime_env_vars["TRANSFER_QUEUE_ENABLE"] = "1"
-            runtime_env_kwargs["env_vars"] = runtime_env_vars
-
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
         print(f"ray init kwargs: {ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
-
-    if task_runner_class is None:
-        task_runner_class = ray.remote(num_cpus=1)(TaskRunner)  # please make sure main_task is not scheduled on head
 
     # Create a remote instance of the TaskRunner class, and
     # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
@@ -93,9 +79,9 @@ def run_ppo(config, task_runner_class=None) -> None:
         nsight_options = OmegaConf.to_container(
             config.global_profiler.global_tool_config.nsys.controller_nsight_options
         )
-        runner = task_runner_class.options(runtime_env={"nsight": nsight_options}).remote()
+        runner = TaskRunner.options(runtime_env={"nsight": nsight_options}).remote()
     else:
-        runner = task_runner_class.remote()
+        runner = TaskRunner.remote()
     ray.get(runner.run.remote(config))
 
     # [Optional] get the path of the timeline trace file from the configuration, default to None
@@ -105,6 +91,7 @@ def run_ppo(config, task_runner_class=None) -> None:
         ray.timeline(filename=timeline_json_file)
 
 
+@ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
 class TaskRunner:
     """Ray remote class for executing distributed PPO training tasks.
 
@@ -123,31 +110,6 @@ class TaskRunner:
     def add_actor_rollout_worker(self, config):
         """Add actor rollout worker based on the actor strategy."""
         from verl.single_controller.ray import RayWorkerGroup
-        from verl.trainer.ppo.ray_trainer import Role
-
-        use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
-
-        # use new model engine implementation
-        if use_legacy_worker_impl == "disable":
-            from verl.workers.engine_workers import ActorRolloutRefWorker
-
-            actor_rollout_cls = ActorRolloutRefWorker
-            ray_worker_group_cls = RayWorkerGroup
-            # NOTE: In new model engine, ref policy and actor rollout are in same ActorRolloutRefWorker,
-            # while in legacy model engine, ref policy is in a separate ActorRolloutRefWorker.
-            if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
-                role = Role.ActorRolloutRef
-            else:
-                role = Role.ActorRollout
-            self.role_worker_mapping[role] = ray.remote(actor_rollout_cls)
-            self.mapping[role] = "global_pool"
-            return actor_rollout_cls, ray_worker_group_cls
-
-        if config.actor_rollout_ref.rollout.mode == "sync":
-            raise ValueError(
-                "Rollout mode 'sync' has been removed. Please set "
-                "`actor_rollout_ref.rollout.mode=async` to use the native server rollout."
-            )
 
         if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
             from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker
@@ -172,27 +134,26 @@ class TaskRunner:
         else:
             raise NotImplementedError
 
+        from verl.trainer.ppo.ray_trainer import Role
+
         self.role_worker_mapping[Role.ActorRollout] = ray.remote(actor_rollout_cls)
-        self.mapping[Role.ActorRollout] = "global_pool"
+
         return actor_rollout_cls, ray_worker_group_cls
 
     def add_critic_worker(self, config):
         """Add critic worker to role mapping."""
-        use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
         if config.critic.strategy in {"fsdp", "fsdp2"}:
+            use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
             if use_legacy_worker_impl in ["auto", "enable"]:
                 from verl.workers.fsdp_workers import CriticWorker
             elif use_legacy_worker_impl == "disable":
-                # we don't need to specialize critic worker. Just use TrainingWorker
-                from verl.workers.engine_workers import TrainingWorker
+                from verl.workers.roles import CriticWorker
 
-                CriticWorker = TrainingWorker
                 print("Using new worker implementation")
             else:
                 raise ValueError(f"Invalid use_legacy_worker_impl: {use_legacy_worker_impl}")
 
         elif config.critic.strategy == "megatron":
-            # TODO: switch this to TrainingWorker as well
             from verl.workers.megatron_workers import CriticWorker
 
         else:
@@ -201,10 +162,10 @@ class TaskRunner:
         from verl.trainer.ppo.ray_trainer import Role
 
         self.role_worker_mapping[Role.Critic] = ray.remote(CriticWorker)
-        self.mapping[Role.Critic] = "global_pool"
 
     def init_resource_pool_mgr(self, config):
         """Initialize resource pool manager."""
+        from verl.trainer.ppo.ray_trainer import Role
 
         global_pool_id = "global_pool"
         resource_pool_spec = {
@@ -220,6 +181,8 @@ class TaskRunner:
             reward_pool = [config.reward_model.n_gpus_per_node] * config.reward_model.nnodes
             resource_pool_spec["reward_pool"] = reward_pool
 
+        self.mapping[Role.ActorRollout] = global_pool_id
+        self.mapping[Role.Critic] = global_pool_id
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
@@ -231,17 +194,17 @@ class TaskRunner:
 
         if config.reward_model.enable:
             use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
-            if use_legacy_worker_impl in ["auto", "enable", "disable"]:
+            if use_legacy_worker_impl in ["auto", "enable"]:
                 if config.reward_model.strategy in {"fsdp", "fsdp2"}:
                     from verl.workers.fsdp_workers import RewardModelWorker
                 elif config.reward_model.strategy == "megatron":
                     from verl.workers.megatron_workers import RewardModelWorker
                 else:
                     raise NotImplementedError
-            # elif use_legacy_worker_impl == "disable":
-            #     from verl.workers.engine_workers import RewardModelWorker
-            #
-            #     print("Using new worker implementation")
+            elif use_legacy_worker_impl == "disable":
+                from verl.workers.roles import RewardModelWorker
+
+                print("Using new worker implementation")
             else:
                 raise ValueError(f"Invalid use_legacy_worker_impl: {use_legacy_worker_impl}")
 
@@ -254,12 +217,6 @@ class TaskRunner:
     def add_ref_policy_worker(self, config, ref_policy_cls):
         """Add reference policy worker if KL loss or KL reward is used."""
         from verl.trainer.ppo.ray_trainer import Role
-
-        # Ref policy has been fused into ActorRolloutRefWorker in new model engine,
-        # we don't need to add a separate ref policy worker group.
-        use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
-        if use_legacy_worker_impl == "disable":
-            return
 
         if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
             self.role_worker_mapping[Role.RefPolicy] = ray.remote(ref_policy_cls)
@@ -334,22 +291,8 @@ class TaskRunner:
         from verl.utils.dataset.rl_dataset import collate_fn
 
         # Create training and validation datasets.
-        train_dataset = create_rl_dataset(
-            config.data.train_files,
-            config.data,
-            tokenizer,
-            processor,
-            is_train=True,
-            max_samples=config.data.get("train_max_samples", -1),
-        )
-        val_dataset = create_rl_dataset(
-            config.data.val_files,
-            config.data,
-            tokenizer,
-            processor,
-            is_train=False,
-            max_samples=config.data.get("val_max_samples", -1),
-        )
+        train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor, is_train=True)
+        val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor, is_train=False)
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
         # Initialize the PPO trainer.
@@ -374,7 +317,7 @@ class TaskRunner:
         trainer.fit()
 
 
-def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True, max_samples: int = -1):
+def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True):
     """Create a dataset.
 
     Arguments:
@@ -394,7 +337,7 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
     # and if the path to the custom class is provided
     if "custom_cls" in data_config and data_config.custom_cls.get("path", None) is not None:
         # Dynamically load the custom dataset class
-        dataset_cls = load_extern_object(data_config.custom_cls.path, data_config.custom_cls.name)
+        dataset_cls = load_extern_type(data_config.custom_cls.path, data_config.custom_cls.name)
         # Verify that the custom dataset class inherits from torch.utils.data.Dataset
         if not issubclass(dataset_cls, Dataset):
             raise TypeError(
@@ -418,7 +361,6 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
         tokenizer=tokenizer,
         processor=processor,
         config=data_config,
-        max_samples=max_samples,
     )
 
     return dataset
@@ -434,14 +376,136 @@ def create_rl_sampler(data_config, dataset):
     Returns:
         sampler (Sampler): The sampler.
     """
-    import torch
-    from torch.utils.data import SequentialSampler
+    import math
+    from collections import deque
 
-    # torch.utils.data.RandomSampler could not recover properly
-    from torchdata.stateful_dataloader.sampler import RandomSampler
+    import torch
+    from torch.utils.data import RandomSampler, Sampler, SequentialSampler
+
+    class _BalancedBinarySampler(Sampler[int]):
+        """Sampler that enforces 50/50 sampling between two label groups per batch."""
+
+        def __init__(
+            self,
+            dataset,
+            batch_size: int,
+            positive_labels,
+            negative_labels,
+            seed: int,
+        ):
+            if batch_size % 2 != 0:
+                raise ValueError(
+                    f"Balanced binary sampling requires an even batch size, got {batch_size}."
+                )
+            self.dataset = dataset
+            self.batch_size = batch_size
+            self.samples_per_class = batch_size // 2
+            self.generator = torch.Generator()
+            self.generator.manual_seed(seed)
+
+            self.positive_labels = self._normalize_label_set(positive_labels, "positive")
+            self.negative_labels = self._normalize_label_set(negative_labels, "negative")
+
+            self.positive_indices = self._collect_indices(self.positive_labels)
+            self.negative_indices = self._collect_indices(self.negative_labels)
+
+            if len(self.positive_indices) == 0 or len(self.negative_indices) == 0:
+                raise ValueError(
+                    "Balanced binary sampling requires at least one example for each label group."
+                )
+
+            self.num_batches = math.ceil(
+                max(len(self.positive_indices), len(self.negative_indices)) / self.samples_per_class
+            )
+            self.length = self.num_batches * self.batch_size
+
+            self._positive_queue: deque[int] = deque()
+            self._negative_queue: deque[int] = deque()
+
+            print(
+                f"Using balanced binary sampler with {len(self.positive_indices)} positive "
+                f"and {len(self.negative_indices)} negative examples."
+            )
+
+        @staticmethod
+        def _normalize_label_set(labels, label_kind: str) -> set[str]:
+            if labels is None:
+                return set()
+            if isinstance(labels, (str, int, float, bool)):
+                labels_iterable = [labels]
+            else:
+                try:
+                    labels_iterable = list(labels)
+                except TypeError:
+                    raise TypeError(
+                        f"balance_binary_{label_kind}_labels must be a string or iterable, got {type(labels)}"
+                    ) from None
+
+            normalized: set[str] = set()
+            for label in labels_iterable:
+                if label is None:
+                    continue
+                normalized.add(str(label).strip().lower())
+            if not normalized:
+                raise ValueError(
+                    f"balance_binary_{label_kind}_labels must contain at least one non-empty label."
+                )
+            return normalized
+
+        def _collect_indices(self, label_set: set[str]) -> list[int]:
+            indices: list[int] = []
+            dataframe = getattr(self.dataset, "dataframe", None)
+            if dataframe is None:
+                for idx in range(len(self.dataset)):
+                    example = self.dataset[idx]
+                    label = self._extract_label(example)
+                    if label in label_set:
+                        indices.append(idx)
+                return indices
+
+            for idx in range(len(dataframe)):
+                entry = dataframe[idx]
+                label = self._extract_label(entry)
+                if label in label_set:
+                    indices.append(idx)
+            return indices
+
+        @staticmethod
+        def _extract_label(example) -> str | None:
+            reward_info = None
+            if isinstance(example, dict):
+                reward_info = example.get("reward_model")
+            if isinstance(reward_info, dict):
+                ground_truth = reward_info.get("ground_truth")
+                if isinstance(ground_truth, str):
+                    return ground_truth.strip().lower()
+                if isinstance(ground_truth, (int, float, bool)):
+                    return str(ground_truth).strip().lower()
+            return None
+
+        def __len__(self) -> int:
+            return self.length
+
+        def __iter__(self):
+            for _ in range(self.num_batches):
+                positive_batch = self._draw_samples(self._positive_queue, self.positive_indices)
+                negative_batch = self._draw_samples(self._negative_queue, self.negative_indices)
+                combined = positive_batch + negative_batch
+                perm = torch.randperm(len(combined), generator=self.generator).tolist()
+                for idx in perm:
+                    yield combined[idx]
+
+        def _draw_samples(self, queue: deque[int], source_indices: list[int]) -> list[int]:
+            while len(queue) < self.samples_per_class:
+                queue.extend(self._shuffled_indices(source_indices))
+            return [queue.popleft() for _ in range(self.samples_per_class)]
+
+        def _shuffled_indices(self, indices: list[int]) -> list[int]:
+            order = torch.randperm(len(indices), generator=self.generator).tolist()
+            return [indices[i] for i in order]
 
     if data_config.sampler is not None and data_config.sampler.get("class_path", None) is not None:
-        curriculum_class = load_extern_object(
+        curriculum_class = load_extern_type(
             data_config.sampler.class_path,
             data_config.sampler.class_name,
         )
@@ -455,14 +519,22 @@ def create_rl_sampler(data_config, dataset):
             "If the dataloader caches data before the batch is done the "
             "curriculum sampler won't have the opportunity to reorder it. "
         )
-
+    elif data_config.get("balance_binary_labels", False):
+        batch_size = data_config.get("gen_batch_size", data_config.train_batch_size)
+        positive_labels = list(data_config.get("balance_binary_positive_labels", ["yes"]))
+        negative_labels = list(data_config.get("balance_binary_negative_labels", ["no"]))
+        sampler = _BalancedBinarySampler(
+            dataset=dataset,
+            batch_size=batch_size,
+            positive_labels=positive_labels,
+            negative_labels=negative_labels,
+            seed=data_config.get("seed", 1),
+        )
     # Use a sampler to facilitate checkpoint resumption.
     # If shuffling is enabled in the data configuration, create a random sampler.
     elif data_config.shuffle:
         train_dataloader_generator = torch.Generator()
-        seed = data_config.get("seed")
-        if seed is not None:
-            train_dataloader_generator.manual_seed(seed)
+        train_dataloader_generator.manual_seed(data_config.get("seed", 1))
         sampler = RandomSampler(data_source=dataset, generator=train_dataloader_generator)
     else:
         # If shuffling is disabled, use a sequential sampler to iterate through the dataset in order.

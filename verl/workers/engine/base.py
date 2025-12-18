@@ -15,8 +15,7 @@
 The abstract base class defining the interface for model training engines.
 """
 
-from abc import abstractmethod
-from typing import Any, Callable, Generator, Optional
+from typing import Any, Callable, Optional
 
 import torch
 from tensordict import TensorDict
@@ -40,19 +39,7 @@ class BaseEngine:
         """
         raise NotImplementedError
 
-    @property
-    @abstractmethod
-    def is_param_offload_enabled(self) -> bool:
-        """Whether parameter offloading is enabled."""
-        raise NotImplementedError
-
-    @property
-    @abstractmethod
-    def is_optimizer_offload_enabled(self) -> bool:
-        """Whether optimizer offloading is enabled."""
-        raise NotImplementedError
-
-    def train_mode(self, **kwargs):
+    def train_mode(self):
         """
         Context manager entry for switching the engine and model into training mode.
 
@@ -62,7 +49,7 @@ class BaseEngine:
         """
         raise NotImplementedError
 
-    def eval_mode(self, **kwargs):
+    def eval_mode(self):
         """
         Context manager entry for switching the engine and model into evaluation mode.
 
@@ -122,7 +109,6 @@ class BaseEngine:
         outputs = self.forward_backward_batch(data, loss_function, forward_only=False)
         grad_norm = self.optimizer_step()
         if self.is_mp_src_rank_with_outputs():
-            assert "grad_norm" not in outputs["metrics"]
             outputs["metrics"]["grad_norm"] = grad_norm
         return outputs
 
@@ -140,14 +126,7 @@ class BaseEngine:
             outputs = self.forward_backward_batch(data, loss_function, forward_only=True)
         return outputs
 
-    def get_per_tensor_param(self) -> tuple[Generator[tuple[str, torch.Tensor], None, None], Optional[dict]]:
-        """
-        Get a generator that yields per-tensor parameters and optional peft config.
-
-        Returns:
-            Generator[tuple[str, torch.Tensor]]: A generator that yields tuples of parameter names and tensors.
-            Optional[dict]: Optional peft config.
-        """
+    def get_per_tensor_param(self):
         raise NotImplementedError
 
     def get_data_parallel_size(self):
@@ -159,7 +138,7 @@ class BaseEngine:
     def get_data_parallel_group(self):
         raise NotImplementedError
 
-    def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
+    def to(self, device: str, model: bool = True, optimizer: bool = True):
         """
         Move model parameters, optimizer states, or both to the specified device.
 
@@ -167,19 +146,10 @@ class BaseEngine:
             device: Target device identifier.
             model: If True, move the model.
             optimizer: If True, move the optimizer states.
-            grad: If True, move the gradient buffer.
         """
-        if not model:
-            assert not optimizer and not grad, "Model must be moved to device along with optimizer and grad"
+        raise NotImplementedError
 
-    def save_checkpoint(
-        self,
-        local_path: str,
-        hdfs_path: Optional[str] = None,
-        global_step: int = 0,
-        max_ckpt_to_keep: Optional[int] = None,
-        **kwargs,
-    ) -> None:
+    def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
         """
         Save model, optimizer, and scheduler states to a checkpoint.
 
@@ -188,13 +158,10 @@ class BaseEngine:
             hdfs_path: Optional HDFS path to copy checkpoint.
             global_step: Integer training step number for naming.
             max_ckpt_to_keep: Maximum number of recent checkpoints to retain.
-            **kwargs: Arbitrary keyword arguments.
         """
         raise NotImplementedError
 
-    def load_checkpoint(
-        self, local_path: str, hdfs_path: Optional[str] = None, del_local_after_load: bool = True, **kwargs
-    ) -> None:
+    def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=True):
         """
         Load model, optimizer, and scheduler states from a checkpoint.
 
@@ -202,7 +169,6 @@ class BaseEngine:
             local_path: Local filesystem path of the checkpoint.
             hdfs_path: Optional HDFS path where checkpoint is stored.
             del_local_after_load: Whether to delete local copy after loading.
-            **kwargs: Arbitrary keyword arguments.
         """
         raise NotImplementedError
 
@@ -211,41 +177,6 @@ class BaseEngine:
         Whether the current rank is the first rank in model parallel group that contains model outputs
         """
         raise NotImplementedError
-
-
-class BaseEngineCtx:
-    def __init__(self, engine: BaseEngine, mode, **kwargs):
-        """Base Engine context that handles load and offload
-
-        Args:
-            engine:
-            **kwargs:
-        """
-        self.engine = engine
-        self.mode = mode
-        assert self.mode in ("train", "eval")
-        self.disable_auto_offload = kwargs.pop("disable_auto_offload", False)
-
-    def _context_switch(self, device):
-        if self.disable_auto_offload:
-            return
-        if self.mode == "eval":
-            self.engine.to(device=device, model=self.engine.is_param_offload_enabled, optimizer=False, grad=False)
-        elif self.mode == "train":
-            self.engine.to(
-                device=device,
-                model=self.engine.is_param_offload_enabled,
-                optimizer=self.engine.is_optimizer_offload_enabled,
-                grad=self.engine.is_param_offload_enabled,
-            )
-
-    def __enter__(self):
-        self._context_switch(get_device_name())
-        self.engine.mode = self.mode
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self._context_switch("cpu")
-        self.engine.mode = None
 
 
 class EngineRegistry:

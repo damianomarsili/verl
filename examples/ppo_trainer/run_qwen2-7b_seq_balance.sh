@@ -9,8 +9,10 @@ train_files="['$gsm8k_train_path', '$math_train_path']"
 test_files="['$gsm8k_test_path', '$math_test_path']"
 
 # For async rollout mode, dataset should return raw chat.
-rollout_mode="async"
-return_raw_chat="True"
+rollout_mode="sync"
+if [ "$rollout_mode" = "async" ]; then
+    return_raw_chat="True"
+fi
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=gae \

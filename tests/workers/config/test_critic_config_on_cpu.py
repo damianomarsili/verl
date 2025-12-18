@@ -23,14 +23,11 @@ from verl.utils.profiler import ProfilerConfig
 from verl.workers.config import (
     CriticConfig,
     FSDPCriticConfig,
-    FSDPOptimizerConfig,
     McoreCriticConfig,
-    McoreOptimizerConfig,
     OptimizerConfig,
 )
 
 
-@pytest.mark.skip(reason="This test is flaky when we actively load model config")
 class TestCriticConfig:
     """Test suite for critic configuration dataclasses."""
 
@@ -106,15 +103,16 @@ class TestCriticConfig:
 
     def test_config_inheritance_hierarchy(self):
         """Test that the inheritance hierarchy is correct."""
-        megatron_config = McoreCriticConfig(ppo_micro_batch_size_per_gpu=1, optim=McoreOptimizerConfig(lr=0.1))
+        optim = OptimizerConfig(lr=0.1)
+        megatron_config = McoreCriticConfig(ppo_micro_batch_size_per_gpu=1, optim=optim)
         assert isinstance(megatron_config, CriticConfig)
         assert isinstance(megatron_config, McoreCriticConfig)
 
-        fsdp_config = FSDPCriticConfig(ppo_micro_batch_size_per_gpu=1, optim=FSDPOptimizerConfig(lr=0.1))
+        fsdp_config = FSDPCriticConfig(ppo_micro_batch_size_per_gpu=1, optim=optim)
         assert isinstance(fsdp_config, CriticConfig)
         assert isinstance(fsdp_config, FSDPCriticConfig)
 
-        critic_config = CriticConfig(ppo_micro_batch_size_per_gpu=1, strategy="fsdp2", optim=OptimizerConfig(lr=0.1))
+        critic_config = CriticConfig(ppo_micro_batch_size_per_gpu=1, strategy="fsdp2", optim=optim)
         assert isinstance(critic_config, CriticConfig)
         assert not isinstance(critic_config, McoreCriticConfig)
         assert not isinstance(critic_config, FSDPCriticConfig)
@@ -138,21 +136,22 @@ class TestCriticConfig:
 
     def test_frozen_fields_immutability(self):
         """Test that frozen fields raise exceptions when modified after creation."""
-        critic_config = CriticConfig(ppo_micro_batch_size_per_gpu=1, strategy="fsdp2", optim=OptimizerConfig(lr=0.1))
+        optim = OptimizerConfig(lr=0.1)
+        critic_config = CriticConfig(ppo_micro_batch_size_per_gpu=1, strategy="fsdp2", optim=optim)
         frozen_fields = ["rollout_n", "strategy", "cliprange_value"]
 
         for field_name in frozen_fields:
             with pytest.raises((AttributeError, TypeError, ValueError)):
                 setattr(critic_config, field_name, "modified_value")
 
-        megatron_config = McoreCriticConfig(ppo_micro_batch_size_per_gpu=1, optim=McoreOptimizerConfig(lr=0.1))
+        megatron_config = McoreCriticConfig(ppo_micro_batch_size_per_gpu=1, optim=optim)
         megatron_frozen_fields = ["nccl_timeout", "load_weight", "data_loader_seed"]
 
         for field_name in megatron_frozen_fields:
             with pytest.raises((AttributeError, TypeError, ValueError)):
                 setattr(megatron_config, field_name, "modified_value")
 
-        fsdp_config = FSDPCriticConfig(ppo_micro_batch_size_per_gpu=1, optim=FSDPOptimizerConfig(lr=0.1))
+        fsdp_config = FSDPCriticConfig(ppo_micro_batch_size_per_gpu=1, optim=optim)
         fsdp_frozen_fields = ["ulysses_sequence_parallel_size", "grad_clip"]
 
         for field_name in fsdp_frozen_fields:
@@ -172,7 +171,7 @@ class TestCriticConfig:
         assert critic_config.ppo_micro_batch_size == 4
         assert critic_config.ppo_micro_batch_size_per_gpu == 2
 
-        fsdp_config = FSDPCriticConfig(ppo_micro_batch_size_per_gpu=1, optim=FSDPOptimizerConfig(lr=0.1))
+        fsdp_config = FSDPCriticConfig(ppo_micro_batch_size_per_gpu=1, optim=optim)
 
         fsdp_config.forward_micro_batch_size = 16
         fsdp_config.forward_micro_batch_size_per_gpu = 8
@@ -278,11 +277,12 @@ class TestCriticConfig:
 
     def test_fsdp_sequence_parallelism_validation(self):
         """Test FSDP sequence parallelism validation in FSDPCriticConfig.__post_init__."""
+        optim = OptimizerConfig(lr=0.1)
         valid_config = FSDPCriticConfig(
             ppo_micro_batch_size_per_gpu=2,
             ulysses_sequence_parallel_size=2,
             model={"use_remove_padding": True},
-            optim=FSDPOptimizerConfig(lr=0.1),
+            optim=optim,
         )
         assert valid_config.ulysses_sequence_parallel_size == 2
 
@@ -293,13 +293,13 @@ class TestCriticConfig:
                 ppo_micro_batch_size_per_gpu=2,
                 ulysses_sequence_parallel_size=2,
                 model={"use_remove_padding": False},
-                optim=FSDPOptimizerConfig(lr=0.1),
+                optim=optim,
             )
 
         valid_config_no_sp = FSDPCriticConfig(
             ppo_micro_batch_size_per_gpu=2,
             ulysses_sequence_parallel_size=1,
             model={"use_remove_padding": False},
-            optim=FSDPOptimizerConfig(lr=0.1),
+            optim=optim,
         )
         assert valid_config_no_sp.ulysses_sequence_parallel_size == 1
