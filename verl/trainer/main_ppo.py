@@ -72,12 +72,16 @@ def run_ppo(config, task_runner_class=None) -> None:
             runtime_env_kwargs["env_vars"] = runtime_env_vars
 
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
-        ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
+        ray_init_kwargs = OmegaConf.create(
+            {**ray_init_kwargs, "runtime_env": runtime_env}
+        )
         print(f"ray init kwargs: {ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
 
     if task_runner_class is None:
-        task_runner_class = ray.remote(num_cpus=1)(TaskRunner)  # please make sure main_task is not scheduled on head
+        task_runner_class = ray.remote(num_cpus=1)(
+            TaskRunner
+        )  # please make sure main_task is not scheduled on head
 
     # Create a remote instance of the TaskRunner class, and
     # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
@@ -89,11 +93,15 @@ def run_ppo(config, task_runner_class=None) -> None:
     ):
         from verl.utils.import_utils import is_nvtx_available
 
-        assert is_nvtx_available(), "nvtx is not available in CUDA platform. Please 'pip3 install nvtx'"
+        assert (
+            is_nvtx_available()
+        ), "nvtx is not available in CUDA platform. Please 'pip3 install nvtx'"
         nsight_options = OmegaConf.to_container(
             config.global_profiler.global_tool_config.nsys.controller_nsight_options
         )
-        runner = task_runner_class.options(runtime_env={"nsight": nsight_options}).remote()
+        runner = task_runner_class.options(
+            runtime_env={"nsight": nsight_options}
+        ).remote()
     else:
         runner = task_runner_class.remote()
     ray.get(runner.run.remote(config))
@@ -137,7 +145,10 @@ class TaskRunner:
             lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
             if lora_rank <= 0:
                 lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
-            ref_in_actor = lora_rank > 0 or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
+            ref_in_actor = (
+                lora_rank > 0
+                or config.actor_rollout_ref.model.get("lora_adapter_path") is not None
+            )
             # NOTE: In new model engine, ref policy and actor rollout are in same ActorRolloutRefWorker,
             # while in legacy model engine, ref policy is in a separate ActorRolloutRefWorker.
             if need_reference_policy(config) and not ref_in_actor:
@@ -182,7 +193,9 @@ class TaskRunner:
                 CriticWorker = TrainingWorker
                 print("Using new worker implementation")
             else:
-                raise ValueError(f"Invalid use_legacy_worker_impl: {use_legacy_worker_impl}")
+                raise ValueError(
+                    f"Invalid use_legacy_worker_impl: {use_legacy_worker_impl}"
+                )
 
         elif config.critic.strategy == "megatron":
             # TODO: switch this to TrainingWorker as well
@@ -206,16 +219,22 @@ class TaskRunner:
         # TODO Here you can use the new registration method to support dynamic registration of roles
         if config.reward_model.enable_resource_pool:
             if config.reward_model.n_gpus_per_node <= 0:
-                raise ValueError("config.reward_model.n_gpus_per_node must be greater than 0")
+                raise ValueError(
+                    "config.reward_model.n_gpus_per_node must be greater than 0"
+                )
             if config.reward_model.nnodes <= 0:
                 raise ValueError("config.reward_model.nnodes must be greater than 0")
 
-            reward_pool = [config.reward_model.n_gpus_per_node] * config.reward_model.nnodes
+            reward_pool = [
+                config.reward_model.n_gpus_per_node
+            ] * config.reward_model.nnodes
             resource_pool_spec["reward_pool"] = reward_pool
 
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 
-        resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
+        resource_pool_manager = ResourcePoolManager(
+            resource_pool_spec=resource_pool_spec, mapping=self.mapping
+        )
         return resource_pool_manager
 
     def add_reward_model_worker(self, config):
@@ -223,7 +242,9 @@ class TaskRunner:
         from verl.trainer.ppo.ray_trainer import Role
 
         if config.reward_model.enable:
-            use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+            use_legacy_worker_impl = config.trainer.get(
+                "use_legacy_worker_impl", "auto"
+            )
             if use_legacy_worker_impl in ["auto", "enable", "disable"]:
                 if config.reward_model.strategy in {"fsdp", "fsdp2"}:
                     from verl.workers.fsdp_workers import RewardModelWorker
@@ -236,7 +257,9 @@ class TaskRunner:
             #
             #     print("Using new worker implementation")
             else:
-                raise ValueError(f"Invalid use_legacy_worker_impl: {use_legacy_worker_impl}")
+                raise ValueError(
+                    f"Invalid use_legacy_worker_impl: {use_legacy_worker_impl}"
+                )
 
             self.role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
             if config.reward_model.enable_resource_pool:
@@ -303,7 +326,8 @@ class TaskRunner:
         # Download the checkpoint from HDFS to the local machine.
         # `use_shm` determines whether to use shared memory, which could lead to faster model loading if turned on
         local_path = copy_to_local(
-            config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
+            config.actor_rollout_ref.model.path,
+            use_shm=config.actor_rollout_ref.model.get("use_shm", False),
         )
 
         # Instantiate the tokenizer and processor.
@@ -312,14 +336,22 @@ class TaskRunner:
         trust_remote_code = config.data.get("trust_remote_code", False)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         # Used for multimodal LLM, could be None
-        processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
+        processor = hf_processor(
+            local_path, trust_remote_code=trust_remote_code, use_fast=True
+        )
 
         # Load the reward manager for training and validation.
         reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
+            config,
+            tokenizer,
+            num_examine=0,
+            **config.reward_model.get("reward_kwargs", {}),
         )
         val_reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
+            config,
+            tokenizer,
+            num_examine=1,
+            **config.reward_model.get("reward_kwargs", {}),
         )
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
@@ -367,7 +399,9 @@ class TaskRunner:
         trainer.fit()
 
 
-def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True, max_samples: int = -1):
+def create_rl_dataset(
+    data_paths, data_config, tokenizer, processor, is_train=True, max_samples: int = -1
+):
     """Create a dataset.
 
     Arguments:
@@ -407,13 +441,152 @@ def create_rl_sampler(data_config, dataset):
     Returns:
         sampler (Sampler): The sampler.
     """
+    import math
+    from collections import deque
+
     import torch
     from torch.utils.data import SequentialSampler
 
     # torch.utils.data.RandomSampler could not recover properly
     from torchdata.stateful_dataloader.sampler import RandomSampler
 
-    if data_config.sampler is not None and data_config.sampler.get("class_path", None) is not None:
+    class _BalancedBinarySampler(Sampler[int]):
+        """Sampler that enforces 50/50 sampling between two label groups per batch."""
+
+        def __init__(
+            self,
+            dataset,
+            batch_size: int,
+            positive_labels,
+            negative_labels,
+            seed: int,
+        ):
+            if batch_size % 2 != 0:
+                raise ValueError(
+                    f"Balanced binary sampling requires an even batch size, got {batch_size}."
+                )
+            self.dataset = dataset
+            self.batch_size = batch_size
+            self.samples_per_class = batch_size // 2
+            self.generator = torch.Generator()
+            self.generator.manual_seed(seed)
+
+            self.positive_labels = self._normalize_label_set(
+                positive_labels, "positive"
+            )
+            self.negative_labels = self._normalize_label_set(
+                negative_labels, "negative"
+            )
+
+            self.positive_indices = self._collect_indices(self.positive_labels)
+            self.negative_indices = self._collect_indices(self.negative_labels)
+
+            if len(self.positive_indices) == 0 or len(self.negative_indices) == 0:
+                raise ValueError(
+                    "Balanced binary sampling requires at least one example for each label group."
+                )
+
+            self.num_batches = math.ceil(
+                max(len(self.positive_indices), len(self.negative_indices))
+                / self.samples_per_class
+            )
+            self.length = self.num_batches * self.batch_size
+
+            self._positive_queue: deque[int] = deque()
+            self._negative_queue: deque[int] = deque()
+
+            print(
+                f"Using balanced binary sampler with {len(self.positive_indices)} positive "
+                f"and {len(self.negative_indices)} negative examples."
+            )
+
+        @staticmethod
+        def _normalize_label_set(labels, label_kind: str) -> set[str]:
+            if labels is None:
+                return set()
+            if isinstance(labels, (str, int, float, bool)):
+                labels_iterable = [labels]
+            else:
+                try:
+                    labels_iterable = list(labels)
+                except TypeError:
+                    raise TypeError(
+                        f"balance_binary_{label_kind}_labels must be a string or iterable, got {type(labels)}"
+                    ) from None
+
+            normalized: set[str] = set()
+            for label in labels_iterable:
+                if label is None:
+                    continue
+                normalized.add(str(label).strip().lower())
+            if not normalized:
+                raise ValueError(
+                    f"balance_binary_{label_kind}_labels must contain at least one non-empty label."
+                )
+            return normalized
+
+        def _collect_indices(self, label_set: set[str]) -> list[int]:
+            indices: list[int] = []
+            dataframe = getattr(self.dataset, "dataframe", None)
+            if dataframe is None:
+                for idx in range(len(self.dataset)):
+                    example = self.dataset[idx]
+                    label = self._extract_label(example)
+                    if label in label_set:
+                        indices.append(idx)
+                return indices
+
+            for idx in range(len(dataframe)):
+                entry = dataframe[idx]
+                label = self._extract_label(entry)
+                if label in label_set:
+                    indices.append(idx)
+            return indices
+
+        @staticmethod
+        def _extract_label(example) -> str | None:
+            reward_info = None
+            if isinstance(example, dict):
+                reward_info = example.get("reward_model")
+            if isinstance(reward_info, dict):
+                ground_truth = reward_info.get("ground_truth")
+                if isinstance(ground_truth, str):
+                    return ground_truth.strip().lower()
+                if isinstance(ground_truth, (int, float, bool)):
+                    return str(ground_truth).strip().lower()
+            return None
+
+        def __len__(self) -> int:
+            return self.length
+
+        def __iter__(self):
+            for _ in range(self.num_batches):
+                positive_batch = self._draw_samples(
+                    self._positive_queue, self.positive_indices
+                )
+                negative_batch = self._draw_samples(
+                    self._negative_queue, self.negative_indices
+                )
+                combined = positive_batch + negative_batch
+                perm = torch.randperm(len(combined), generator=self.generator).tolist()
+                for idx in perm:
+                    yield combined[idx]
+
+        def _draw_samples(
+            self, queue: deque[int], source_indices: list[int]
+        ) -> list[int]:
+            while len(queue) < self.samples_per_class:
+                queue.extend(self._shuffled_indices(source_indices))
+            return [queue.popleft() for _ in range(self.samples_per_class)]
+
+        def _shuffled_indices(self, indices: list[int]) -> list[int]:
+            order = torch.randperm(len(indices), generator=self.generator).tolist()
+            return [indices[i] for i in order]
+
+    if (
+        data_config.sampler is not None
+        and data_config.sampler.get("class_path", None) is not None
+    ):
         curriculum_class = load_extern_object(
             data_config.sampler.class_path,
             data_config.sampler.class_name,
@@ -428,6 +601,21 @@ def create_rl_sampler(data_config, dataset):
             "If the dataloader caches data before the batch is done the "
             "curriculum sampler won't have the opportunity to reorder it. "
         )
+    elif data_config.get("balance_binary_labels", False):
+        batch_size = data_config.get("gen_batch_size", data_config.train_batch_size)
+        positive_labels = list(
+            data_config.get("balance_binary_positive_labels", ["yes"])
+        )
+        negative_labels = list(
+            data_config.get("balance_binary_negative_labels", ["no"])
+        )
+        sampler = _BalancedBinarySampler(
+            dataset=dataset,
+            batch_size=batch_size,
+            positive_labels=positive_labels,
+            negative_labels=negative_labels,
+            seed=data_config.get("seed", 1),
+        )
 
     # Use a sampler to facilitate checkpoint resumption.
     # If shuffling is enabled in the data configuration, create a random sampler.
@@ -436,7 +624,9 @@ def create_rl_sampler(data_config, dataset):
         seed = data_config.get("seed")
         if seed is not None:
             train_dataloader_generator.manual_seed(seed)
-        sampler = RandomSampler(data_source=dataset, generator=train_dataloader_generator)
+        sampler = RandomSampler(
+            data_source=dataset, generator=train_dataloader_generator
+        )
     else:
         # If shuffling is disabled, use a sequential sampler to iterate through the dataset in order.
         sampler = SequentialSampler(data_source=dataset)
