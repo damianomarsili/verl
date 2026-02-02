@@ -143,6 +143,12 @@ trainer:
   # Number of generations to log during validation
   log_val_generations: 0
 
+  # Fraction of samples to log in wandb tables (0 disables)
+  log_sample_fraction: 0.0
+
+  # Log sample tables every N steps
+  log_sample_every_n_steps: 1
+
   # Directory for logging rollout data; no dump if null
   rollout_data_dir: null
 
@@ -179,6 +185,9 @@ trainer:
 
   # Whether to run validation only
   val_only: False
+
+  # Exit after validation (useful for debug runs)
+  debug_exit_after_val: False
 
   # Validation frequency (in training iterations)
   test_freq: -1

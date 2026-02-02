@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import re
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -65,6 +66,9 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+
+ANSWER_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.IGNORECASE | re.DOTALL)
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -477,6 +481,147 @@ class RayPPOTrainer:
         # Log to each configured logger
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
+    def _extract_final_answer(self, text: str) -> str:
+        if not text:
+            return ""
+        open_matches = list(re.finditer(r"(?is)<answer>", text))
+        if not open_matches:
+            return ""
+        match = open_matches[-1]
+        content_start = match.end()
+        close_match = re.search(r"(?is)</answer>", text[content_start:])
+        if close_match:
+            content_end = content_start + close_match.start()
+            return text[content_start:content_end].strip()
+        next_tag = re.search(r"(?is)<(reason|depth|loc|verifier|answer)>", text[content_start:])
+        if next_tag:
+            content_end = content_start + next_tag.start()
+            return text[content_start:content_end].strip()
+        return text[content_start:].strip()
+
+    def _extract_query_and_image(self, raw_prompt: object) -> tuple[str, object]:
+        query_text = ""
+        image_entry: object = None
+        if isinstance(raw_prompt, list):
+            for message in raw_prompt:
+                if not isinstance(message, dict) or message.get("role") != "user":
+                    continue
+                content = message.get("content")
+                if isinstance(content, str):
+                    query_text = content.replace("<image>", "").strip()
+                elif isinstance(content, list):
+                    text_parts: list[str] = []
+                    for item in content:
+                        if not isinstance(item, dict):
+                            continue
+                        if item.get("type") == "text":
+                            text_parts.append(str(item.get("text", "")))
+                        elif item.get("type") == "image" and image_entry is None:
+                            image_entry = item
+                    query_text = "".join(text_parts).strip()
+                break
+        return query_text, image_entry
+
+    def _format_image_for_wandb(self, image_entry: object):
+        if not isinstance(image_entry, dict):
+            return ""
+        if "path" in image_entry:
+            return image_entry.get("path", "")
+        image_obj = image_entry.get("image")
+        if image_obj is None and "bytes" in image_entry:
+            try:
+                from io import BytesIO
+                from PIL import Image
+
+                image_obj = Image.open(BytesIO(image_entry["bytes"]))
+            except Exception:
+                image_obj = None
+        if image_obj is None:
+            return ""
+        import wandb
+
+        return wandb.Image(image_obj)
+
+    def _select_sample_indices(self, n: int, fraction: float) -> list[int]:
+        if n <= 0:
+            return []
+        if fraction >= 1:
+            return list(range(n))
+        if fraction <= 0:
+            return []
+        stride = max(1, int(round(1 / fraction)))
+        indices = list(range(0, n, stride))
+        if not indices:
+            return [0]
+        return indices
+
+    def _maybe_log_sample_table(
+        self,
+        split: str,
+        raw_prompts: list[object],
+        outputs: list[str],
+        gts: list[object],
+        scores: list[float],
+    ) -> None:
+        loggers = self.config.trainer.logger
+        if isinstance(loggers, str):
+            loggers = [loggers]
+
+        if "wandb" not in loggers:
+            return
+
+        fraction = float(self.config.trainer.get("log_sample_fraction", 0.0))
+        if fraction <= 0:
+            return
+
+        if self.config.trainer.get("log_sample_every_n_steps", 1) > 1:
+            step_mod = self.config.trainer.get("log_sample_every_n_steps", 1)
+            if self.global_steps % step_mod != 0:
+                return
+
+        n = min(len(outputs), len(scores), len(gts), len(raw_prompts))
+        if n <= 0:
+            return
+
+        indices = self._select_sample_indices(n, fraction)
+
+        import wandb
+
+        columns = [
+            "step",
+            "split",
+            "query",
+            "image",
+            "output",
+            "final_answer",
+            "ground_truth",
+            "reward",
+        ]
+        rows = []
+        for idx in indices:
+            raw_prompt = raw_prompts[idx]
+            query, image_entry = self._extract_query_and_image(raw_prompt)
+            if not query:
+                query = ""
+            image_value = self._format_image_for_wandb(image_entry)
+            output_text = outputs[idx]
+            final_answer = self._extract_final_answer(output_text)
+            rows.append(
+                [
+                    self.global_steps,
+                    split,
+                    query,
+                    image_value,
+                    output_text,
+                    final_answer,
+                    gts[idx],
+                    scores[idx],
+                ]
+            )
+
+        table = wandb.Table(columns=columns, data=rows)
+        wandb.log({f"{split}/samples": table}, step=self.global_steps)
+
     def _compute_or_extract_reward(
         self,
         batch: DataProto,
@@ -561,6 +706,7 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_uids = []
+        sample_raw_prompts = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -626,6 +772,11 @@ class RayPPOTrainer:
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
             sample_uids.extend(test_batch.non_tensor_batch["uid"])
+            raw_prompts = test_batch.non_tensor_batch.get("raw_prompt", None)
+            if raw_prompts is not None:
+                sample_raw_prompts.extend(raw_prompts.tolist())
+            else:
+                sample_raw_prompts.extend(input_texts)
 
             # evaluate using reward_function
             reward_tensor, reward_extra_info = self._compute_or_extract_reward(
@@ -650,6 +801,13 @@ class RayPPOTrainer:
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+        self._maybe_log_sample_table(
+            split="val",
+            raw_prompts=sample_raw_prompts,
+            outputs=sample_outputs,
+            gts=sample_gts,
+            scores=sample_scores,
+        )
 
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
@@ -1332,7 +1490,7 @@ class RayPPOTrainer:
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
-            if self.config.trainer.get("val_only", False):
+            if self.config.trainer.get("val_only", False) or self.config.trainer.get("debug_exit_after_val", False):
                 return
 
         if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
@@ -1553,6 +1711,36 @@ class RayPPOTrainer:
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+                        # Log a sample table from training batches to wandb if enabled.
+                        if float(self.config.trainer.get("log_sample_fraction", 0.0)) > 0:
+                            outputs = self.tokenizer.batch_decode(
+                                batch.batch["responses"], skip_special_tokens=True
+                            )
+                            scores = reward_tensor.sum(-1).cpu().tolist()
+                            raw_prompts = batch.non_tensor_batch.get("raw_prompt", None)
+                            if raw_prompts is not None:
+                                raw_prompts_list = raw_prompts.tolist()
+                            else:
+                                raw_prompts_list = ["" for _ in outputs]
+                            gts = [
+                                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None)
+                                if hasattr(item, "non_tensor_batch")
+                                else None
+                                for item in batch
+                            ]
+                            if not any(gts):
+                                gts = [
+                                    item.non_tensor_batch.get("answer", None) if hasattr(item, "non_tensor_batch") else None
+                                    for item in batch
+                                ]
+                            self._maybe_log_sample_table(
+                                split="train",
+                                raw_prompts=raw_prompts_list,
+                                outputs=outputs,
+                                gts=gts,
+                                scores=scores,
+                            )
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:

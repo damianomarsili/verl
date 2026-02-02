@@ -23,15 +23,78 @@ from verl.utils.net_utils import get_free_port
 logger = logging.getLogger(__file__)
 
 
-def get_max_position_embeddings(hf_config) -> int:
-    max_len = getattr(hf_config, "max_position_embeddings", None)
+def get_max_position_embeddings(hf_config, tokenizer=None) -> int:
+    def _normalize_len(value):
+        if value is None:
+            return None
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return None
+        if value <= 0:
+            return None
+        if value > 10_000_000:
+            return None
+        return value
+
+    def _pick(obj, names):
+        if obj is None:
+            return None
+        for name in names:
+            if hasattr(obj, name):
+                value = _normalize_len(getattr(obj, name))
+                if value is not None:
+                    return value
+        return None
+
+    def _pick_dict(obj, names):
+        for name in names:
+            if name in obj:
+                value = _normalize_len(obj[name])
+                if value is not None:
+                    return value
+        return None
+
+    primary_candidates = [
+        "max_position_embeddings",
+        "max_seq_len",
+        "max_sequence_length",
+        "seq_length",
+        "max_model_len",
+        "model_max_length",
+        "n_positions",
+        "n_ctx",
+    ]
+    fallback_candidates = ["max_length"]
+
+    max_len = _pick(hf_config, primary_candidates)
     if max_len is None:
-        text_config = getattr(hf_config, "text_config", None)
-        if text_config is not None:
-            max_len = getattr(text_config, "max_position_embeddings", None)
+        for attr in ("text_config", "language_config", "llm_config"):
+            max_len = _pick(getattr(hf_config, attr, None), primary_candidates)
+            if max_len is not None:
+                break
+
+    if max_len is None and isinstance(hf_config, dict):
+        max_len = _pick_dict(hf_config, primary_candidates)
 
     if max_len is None:
-        raise ValueError("max_position_embeddings not found in HFModelConfig!")
+        max_len = _pick(hf_config, fallback_candidates)
+        if max_len is None:
+            for attr in ("text_config", "language_config", "llm_config"):
+                max_len = _pick(getattr(hf_config, attr, None), fallback_candidates)
+                if max_len is not None:
+                    break
+        if max_len is None and isinstance(hf_config, dict):
+            max_len = _pick_dict(hf_config, fallback_candidates)
+
+    if max_len is None and tokenizer is not None:
+        max_len = _normalize_len(getattr(tokenizer, "model_max_length", None))
+
+    if max_len is None:
+        raise ValueError(
+            "max_position_embeddings not found in HF config. "
+            "Set actor_rollout_ref.rollout.max_model_len explicitly."
+        )
     return int(max_len)
 
 

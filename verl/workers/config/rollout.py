@@ -159,6 +159,8 @@ class RolloutConfig(BaseConfig):
     enforce_eager: bool = True
     cudagraph_capture_sizes: Optional[list] = None
     free_cache_engine: bool = True
+    # Optionally sleep rollout engines before updating weights (useful for large KV caches)
+    sleep_before_update: bool = False
     data_parallel_size: int = 1
     expert_parallel_size: int = 1
     tensor_model_parallel_size: int = 2

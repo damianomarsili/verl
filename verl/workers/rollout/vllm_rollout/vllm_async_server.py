@@ -112,7 +112,9 @@ class vLLMHttpServer:
 
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
-        max_position_embeddings = get_max_position_embeddings(self.model_config.hf_config)
+        max_position_embeddings = get_max_position_embeddings(
+            self.model_config.hf_config, tokenizer=self.model_config.tokenizer
+        )
         if self.config.max_model_len is None:
             self.config.max_model_len = max_position_embeddings
         else:
@@ -121,6 +123,13 @@ class vLLMHttpServer:
                     f"max_model_len ({self.config.max_model_len}) should be less than or equal to "
                     f"max_position_embeddings ({max_position_embeddings})"
                 )
+        logger.info(
+            "vLLM init: max_model_len=%s max_num_seqs=%s max_num_batched_tokens=%s gpu_memory_utilization=%s",
+            self.config.max_model_len,
+            self.config.max_num_seqs,
+            self.config.max_num_batched_tokens,
+            self.config.gpu_memory_utilization,
+        )
 
         self.rollout_mode = rollout_mode
         self.workers = workers

@@ -34,7 +34,7 @@ from transformers import AutoProcessor, AutoTokenizer
 from verl.experimental.agent_loop.prometheus_utils import update_prometheus_config
 from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.experimental.reward_loop import RewardLoopWorker
-from verl.protocol import DataProto
+from verl.protocol import DataProto, pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.chat_template import initialize_system_prompt
@@ -543,11 +543,43 @@ class AgentLoopWorker:
         #   e.g., [0,0,0,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,0,0,0,0]
 
         # TODO(wuxibin): remove padding and use tensordict.
+        prompt_ids = output.prompt_ids
+        response_ids = output.response_ids
+        response_mask = output.response_mask
+        response_logprobs_list = output.response_logprobs
+        routed_experts_raw = output.routed_experts
+        orig_prompt_len = len(prompt_ids)
+        orig_response_len = len(response_ids)
+
+        max_prompt_length = self.config.actor_rollout_ref.rollout.prompt_length
+        if len(prompt_ids) > max_prompt_length:
+            logger.warning(
+                "Prompt length %s exceeds prompt_length %s; truncating from the left.",
+                len(prompt_ids),
+                max_prompt_length,
+            )
+            prompt_ids = prompt_ids[-max_prompt_length:]
+
+        max_response_length = self.config.actor_rollout_ref.rollout.response_length
+        if len(response_ids) > max_response_length:
+            response_ids = response_ids[:max_response_length]
+        if len(response_mask) > max_response_length:
+            response_mask = response_mask[:max_response_length]
+        if response_logprobs_list is not None and len(response_logprobs_list) > max_response_length:
+            response_logprobs_list = response_logprobs_list[:max_response_length]
+
+        if routed_experts_raw is not None:
+            target_len = len(prompt_ids) + len(response_ids)
+            if routed_experts_raw.shape[0] != target_len:
+                start = max(0, orig_prompt_len - len(prompt_ids))
+                end = start + target_len
+                if end <= routed_experts_raw.shape[0]:
+                    routed_experts_raw = routed_experts_raw[start:end]
         self.tokenizer.padding_side = "left"
         prompt_output = self.tokenizer.pad(
-            {"input_ids": output.prompt_ids},
+            {"input_ids": prompt_ids},
             padding="max_length",
-            max_length=self.config.actor_rollout_ref.rollout.prompt_length,
+            max_length=max_prompt_length,
             return_tensors="pt",
             return_attention_mask=True,
         )
@@ -557,9 +589,9 @@ class AgentLoopWorker:
 
         self.tokenizer.padding_side = "right"
         response_output = self.tokenizer.pad(
-            {"input_ids": output.response_ids},
+            {"input_ids": response_ids},
             padding="max_length",
-            max_length=self.config.actor_rollout_ref.rollout.response_length,
+            max_length=max_response_length,
             return_tensors="pt",
             return_attention_mask=True,
         )
@@ -568,9 +600,9 @@ class AgentLoopWorker:
             response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
 
         response_mask_output = self.tokenizer.pad(
-            {"input_ids": output.response_mask},
+            {"input_ids": response_mask},
             padding="max_length",
-            max_length=self.config.actor_rollout_ref.rollout.response_length,
+            max_length=max_response_length,
             return_tensors="pt",
             return_attention_mask=False,
         )
@@ -578,28 +610,28 @@ class AgentLoopWorker:
             response_mask_output["input_ids"] = response_mask_output["input_ids"].unsqueeze(0)
 
         response_logprobs = None
-        if output.response_logprobs is not None:
-            pad_size = self.config.actor_rollout_ref.rollout.response_length - len(output.response_logprobs)
-            response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
+        if response_logprobs_list is not None:
+            pad_size = max_response_length - len(response_logprobs_list)
+            response_logprobs = torch.tensor(response_logprobs_list + [0.0] * pad_size).unsqueeze(0)
 
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
         attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
         input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
 
         routed_experts = None
-        if output.routed_experts is not None:
+        if routed_experts_raw is not None:
             total_length = input_ids.shape[1]
-            length, layer_num, topk_num = output.routed_experts.shape
-            if isinstance(output.routed_experts, np.ndarray):
-                experts_tensor = torch.from_numpy(output.routed_experts)
-            elif isinstance(output.routed_experts, torch.Tensor):
-                experts_tensor = output.routed_experts
+            length, layer_num, topk_num = routed_experts_raw.shape
+            if isinstance(routed_experts_raw, np.ndarray):
+                experts_tensor = torch.from_numpy(routed_experts_raw)
+            elif isinstance(routed_experts_raw, torch.Tensor):
+                experts_tensor = routed_experts_raw
             else:
-                raise TypeError(f"Unsupported type for routed_experts: {type(output.routed_experts)}")
+                raise TypeError(f"Unsupported type for routed_experts: {type(routed_experts_raw)}")
             routed_experts = torch.zeros(1, total_length, layer_num, topk_num, dtype=experts_tensor.dtype)
 
             # Calculate start position: left padding means original prompt starts at the end
-            start_pos = prompt_output["input_ids"].shape[1] - len(output.prompt_ids)
+            start_pos = prompt_output["input_ids"].shape[1] - len(prompt_ids)
             end_pos = min(start_pos + length, total_length)
 
             # Add boundary checks for robustness
@@ -958,7 +990,13 @@ class AgentLoopManager:
         if self.reward_model_manager:
             self.reward_model_manager.wake_up()
 
-        chunkes = prompts.chunk(len(self.agent_loop_workers))
+        size_divisor = len(self.agent_loop_workers)
+        if len(prompts) % size_divisor != 0:
+            prompts_padded, pad_size = pad_dataproto_to_divisor(prompts, size_divisor)
+        else:
+            prompts_padded, pad_size = prompts, 0
+
+        chunkes = prompts_padded.chunk(size_divisor)
         outputs = ray.get(
             [
                 worker.generate_sequences.remote(chunk)
@@ -966,6 +1004,8 @@ class AgentLoopManager:
             ]
         )
         output = DataProto.concat(outputs)
+        if pad_size:
+            output = unpad_dataproto(output, pad_size=pad_size)
         if self.reward_model_manager:
             self.reward_model_manager.sleep()
 

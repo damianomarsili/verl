@@ -445,7 +445,7 @@ def create_rl_sampler(data_config, dataset):
     from collections import deque
 
     import torch
-    from torch.utils.data import SequentialSampler
+    from torch.utils.data import SequentialSampler, Sampler
 
     # torch.utils.data.RandomSampler could not recover properly
     from torchdata.stateful_dataloader.sampler import RandomSampler

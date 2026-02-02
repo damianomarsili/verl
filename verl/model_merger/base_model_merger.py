@@ -188,6 +188,32 @@ class BaseModelMerger(ABC):
         )
 
     def get_transformers_auto_model_class(self):
+        def _vision2seq_class():
+            try:
+                import transformers
+                from packaging import version
+            except ImportError:
+                from transformers import __version__ as transformers_version
+
+                class _Dummy:
+                    __version__ = transformers_version
+
+                transformers = _Dummy()
+                from packaging import version  # type: ignore
+
+            if version.parse(transformers.__version__) >= version.parse("4.54.0"):
+                try:
+                    from transformers import AutoModelForImageTextToText
+
+                    return AutoModelForImageTextToText
+                except ImportError:
+                    from transformers import AutoModelForVision2Seq
+
+                    return AutoModelForVision2Seq
+            from transformers import AutoModelForVision2Seq
+
+            return AutoModelForVision2Seq
+
         has_remote_code = hasattr(self.model_config, "auto_map") and any(
             self.model_config.architectures[0] in val for val in self.model_config.auto_map.values()
         )
@@ -201,20 +227,7 @@ class BaseModelMerger(ABC):
                 case "AutoModelForTokenClassification":
                     return AutoModelForTokenClassification
                 case "AutoModelForVision2Seq":
-                    # Handle different transformers versions for Vision2Seq models
-                    import transformers
-                    from packaging import version
-
-                    if version.parse(transformers.__version__) >= version.parse("4.54.0"):
-                        # transformers >= 4.54.0 uses AutoModelForImageTextToText
-                        from transformers import AutoModelForImageTextToText
-
-                        return AutoModelForImageTextToText
-                    else:
-                        # transformers < 4.54.0 uses AutoModelForVision2Seq
-                        from transformers import AutoModelForVision2Seq
-
-                        return AutoModelForVision2Seq
+                    return _vision2seq_class()
                 case _:
                     raise NotImplementedError(f"Unknown auto class {auto_class}")
         else:
@@ -223,7 +236,7 @@ class BaseModelMerger(ABC):
             elif "ForCausalLM" in self.model_config.architectures[0]:
                 return AutoModelForCausalLM
             elif "ForConditionalGeneration" in self.model_config.architectures[0]:
-                return AutoModelForVision2Seq
+                return _vision2seq_class()
 
             raise NotImplementedError(f"Unknown architecture {self.model_config.architectures}")
 

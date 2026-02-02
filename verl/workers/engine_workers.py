@@ -596,6 +596,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             return
 
         set_expandable_segments(False)
+        if self.config.rollout.get("sleep_before_update", False) and self.config.rollout.free_cache_engine:
+            await self.rollout.release()
         # 1. resume weights and update weights
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["weights"])

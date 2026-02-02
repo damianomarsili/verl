@@ -168,7 +168,9 @@ class SGLangHttpServer:
 
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
-        max_position_embeddings = get_max_position_embeddings(self.model_config.hf_config)
+        max_position_embeddings = get_max_position_embeddings(
+            self.model_config.hf_config, tokenizer=self.model_config.tokenizer
+        )
         if self.config.max_model_len is None:
             self.config.max_model_len = max_position_embeddings
         else:

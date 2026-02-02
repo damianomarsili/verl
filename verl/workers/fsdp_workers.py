@@ -678,6 +678,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         """Context switch hybridengine to rollout mode."""
         aggressive_empty_cache(force_sync=True)
 
+        if self.config.rollout.sleep_before_update and self.config.rollout.free_cache_engine:
+            logger.info("rollout_mode: releasing vLLM cache before update (sleep_before_update=true)")
+            await self.rollout.release()
+            aggressive_empty_cache(force_sync=True)
+            log_gpu_memory_usage("After rollout release", logger=logger)
+
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
