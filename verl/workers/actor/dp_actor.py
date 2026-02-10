@@ -526,6 +526,17 @@ class DataParallelPPOActor(BasePPOActor):
         # Include rollout_log_probs for computing rollout_corr metrics in bypass mode
         if "rollout_log_probs" in data.batch.keys():
             select_keys.append("rollout_log_probs")
+        sttv_objective_keys = [
+            "sttv_adv_answer",
+            "sttv_mask_answer",
+            "sttv_adv_loc",
+            "sttv_mask_loc",
+            "sttv_adv_loc_verifier",
+            "sttv_mask_loc_verifier",
+        ]
+        for key in sttv_objective_keys:
+            if key in data.batch.keys():
+                select_keys.append(key)
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = []
@@ -541,6 +552,11 @@ class DataParallelPPOActor(BasePPOActor):
         mini_batches = data.split(self.config.ppo_mini_batch_size)
 
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
+        sttv_multi_objective_enable = bool(data.meta_info.get("sttv_multi_objective_enable", False))
+        sttv_multi_objective_weights = data.meta_info.get("sttv_multi_objective_weights", {})
+        sttv_weight_answer = float(sttv_multi_objective_weights.get("answer", 1.0))
+        sttv_weight_loc = float(sttv_multi_objective_weights.get("loc", 1.0))
+        sttv_weight_loc_verifier = float(sttv_multi_objective_weights.get("loc_verifier", 1.0))
 
         metrics = {
             "actor/pg_loss": 0.0,
@@ -603,18 +619,63 @@ class DataParallelPPOActor(BasePPOActor):
                     # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
                     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
+                    response_mask_for_regularizers = response_mask
 
-                    # Compute policy loss (any function is expected to return 2 values)
-                    pg_loss, pg_metrics = policy_loss_fn(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        loss_agg_mode=loss_agg_mode,
-                        config=self.config,
-                        rollout_is_weights=rollout_is_weights,
-                    )
-                    micro_batch_metrics.update(pg_metrics)
+                    if (
+                        sttv_multi_objective_enable
+                        and "sttv_adv_answer" in model_inputs
+                        and "sttv_mask_answer" in model_inputs
+                        and "sttv_adv_loc" in model_inputs
+                        and "sttv_mask_loc" in model_inputs
+                        and "sttv_adv_loc_verifier" in model_inputs
+                        and "sttv_mask_loc_verifier" in model_inputs
+                    ):
+                        objective_specs = [
+                            ("answer", "sttv_adv_answer", "sttv_mask_answer", sttv_weight_answer),
+                            ("loc", "sttv_adv_loc", "sttv_mask_loc", sttv_weight_loc),
+                            (
+                                "loc_verifier",
+                                "sttv_adv_loc_verifier",
+                                "sttv_mask_loc_verifier",
+                                sttv_weight_loc_verifier,
+                            ),
+                        ]
+                        # Keep a differentiable zero so backward is valid when all objective masks are empty.
+                        pg_loss = log_prob.sum() * 0.0
+                        for objective_name, adv_key, mask_key, objective_weight in objective_specs:
+                            objective_mask = model_inputs[mask_key]
+                            if float(objective_mask.sum().item()) <= 0:
+                                micro_batch_metrics[f"actor/pg_loss_{objective_name}"] = 0.0
+                                continue
+                            objective_advantages = model_inputs[adv_key]
+                            objective_pg_loss, objective_pg_metrics = policy_loss_fn(
+                                old_log_prob=old_log_prob,
+                                log_prob=log_prob,
+                                advantages=objective_advantages,
+                                response_mask=objective_mask,
+                                loss_agg_mode=loss_agg_mode,
+                                config=self.config,
+                                rollout_is_weights=rollout_is_weights,
+                            )
+                            pg_loss = pg_loss + objective_pg_loss * objective_weight
+                            micro_batch_metrics[f"actor/pg_loss_{objective_name}"] = objective_pg_loss.detach().item()
+                        response_mask_for_regularizers = (
+                            (model_inputs["sttv_mask_answer"] > 0)
+                            | (model_inputs["sttv_mask_loc"] > 0)
+                            | (model_inputs["sttv_mask_loc_verifier"] > 0)
+                        ).to(dtype=response_mask.dtype)
+                    else:
+                        # Compute policy loss (any function is expected to return 2 values)
+                        pg_loss, pg_metrics = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                        )
+                        micro_batch_metrics.update(pg_metrics)
 
                     # Skip if using bypass_mode loss (metrics already computed in pg_metrics)
                     rollout_log_prob = model_inputs.get("rollout_log_probs", None)
@@ -626,24 +687,33 @@ class DataParallelPPOActor(BasePPOActor):
                         rollout_corr_metrics = compute_rollout_corr_metrics_from_logprobs(
                             log_prob=log_prob,
                             rollout_log_prob=rollout_log_prob,
-                            response_mask=response_mask,
+                            response_mask=response_mask_for_regularizers,
                         )
                         micro_batch_metrics.update(rollout_corr_metrics)
 
                     policy_loss = pg_loss
-                    if calculate_entropy and entropy is not None:
-                        entropy_agg = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                    has_active_regularizer_tokens = float(response_mask_for_regularizers.sum().item()) > 0
+                    if calculate_entropy and entropy is not None and has_active_regularizer_tokens:
+                        entropy_agg = agg_loss(
+                            loss_mat=entropy,
+                            loss_mask=response_mask_for_regularizers,
+                            loss_agg_mode=loss_agg_mode,
+                        )
                         micro_batch_metrics["actor/entropy"] = entropy_agg.detach().item()
                         if entropy_coeff != 0:
                             policy_loss -= entropy_agg * entropy_coeff
 
-                    if self.config.use_kl_loss:
+                    if self.config.use_kl_loss and has_active_regularizer_tokens:
                         ref_log_prob = model_inputs["ref_log_prob"]
                         # compute kl loss
                         kld = kl_penalty(
                             logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
                         )
-                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        kl_loss = agg_loss(
+                            loss_mat=kld,
+                            loss_mask=response_mask_for_regularizers,
+                            loss_agg_mode=loss_agg_mode,
+                        )
 
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                         metrics["actor/kl_loss"] += kl_loss.detach().item() * loss_scale_factor

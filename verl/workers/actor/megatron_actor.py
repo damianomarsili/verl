@@ -373,6 +373,17 @@ class MegatronPPOActor(BasePPOActor):
         # Include rollout_log_probs for computing rollout_corr metrics in bypass mode
         if "rollout_log_probs" in data.batch.keys():
             select_keys.append("rollout_log_probs")
+        sttv_objective_keys = [
+            "sttv_adv_answer",
+            "sttv_mask_answer",
+            "sttv_adv_loc",
+            "sttv_mask_loc",
+            "sttv_adv_loc_verifier",
+            "sttv_mask_loc_verifier",
+        ]
+        for key in sttv_objective_keys:
+            if key in data.batch.keys():
+                select_keys.append(key)
         self.has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         # router replay
         if self.enable_routing_replay:
@@ -504,20 +515,71 @@ class MegatronPPOActor(BasePPOActor):
                 loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
                 policy_loss_fn = get_policy_loss_fn(loss_mode)
+                response_mask_for_regularizers = response_mask
 
                 # Extract pre-computed rollout correction weights if present
                 # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                 rollout_is_weights = data.get("rollout_is_weights", None)
-                pg_loss, pg_metrics = policy_loss_fn(
-                    old_log_prob=old_log_prob,
-                    log_prob=log_prob,
-                    advantages=advantages,
-                    response_mask=response_mask,
-                    loss_agg_mode=loss_agg_mode,
-                    config=self.config,
-                    rollout_is_weights=rollout_is_weights,
-                )
-                stats.update(pg_metrics)
+                sttv_multi_objective_enable = bool(meta_info.get("sttv_multi_objective_enable", False))
+                sttv_weights = meta_info.get("sttv_multi_objective_weights", {})
+                sttv_weight_answer = float(sttv_weights.get("answer", 1.0))
+                sttv_weight_loc = float(sttv_weights.get("loc", 1.0))
+                sttv_weight_loc_verifier = float(sttv_weights.get("loc_verifier", 1.0))
+
+                if (
+                    sttv_multi_objective_enable
+                    and "sttv_adv_answer" in data
+                    and "sttv_mask_answer" in data
+                    and "sttv_adv_loc" in data
+                    and "sttv_mask_loc" in data
+                    and "sttv_adv_loc_verifier" in data
+                    and "sttv_mask_loc_verifier" in data
+                ):
+                    objective_specs = [
+                        ("answer", "sttv_adv_answer", "sttv_mask_answer", sttv_weight_answer),
+                        ("loc", "sttv_adv_loc", "sttv_mask_loc", sttv_weight_loc),
+                        (
+                            "loc_verifier",
+                            "sttv_adv_loc_verifier",
+                            "sttv_mask_loc_verifier",
+                            sttv_weight_loc_verifier,
+                        ),
+                    ]
+                    # Keep a differentiable zero so backward is valid when all objective masks are empty.
+                    pg_loss = log_prob.sum() * 0.0
+                    for objective_name, adv_key, mask_key, objective_weight in objective_specs:
+                        objective_mask = data[mask_key].to(bool)
+                        if float(objective_mask.sum().item()) <= 0:
+                            stats[f"actor/pg_loss_{objective_name}"] = 0.0
+                            continue
+                        objective_advantages = data[adv_key]
+                        objective_pg_loss, objective_pg_metrics = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=objective_advantages,
+                            response_mask=objective_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                        )
+                        pg_loss = pg_loss + objective_pg_loss * objective_weight
+                        stats[f"actor/pg_loss_{objective_name}"] = objective_pg_loss.detach().item()
+                    response_mask_for_regularizers = (
+                        (data["sttv_mask_answer"] > 0)
+                        | (data["sttv_mask_loc"] > 0)
+                        | (data["sttv_mask_loc_verifier"] > 0)
+                    ).to(bool)
+                else:
+                    pg_loss, pg_metrics = policy_loss_fn(
+                        old_log_prob=old_log_prob,
+                        log_prob=log_prob,
+                        advantages=advantages,
+                        response_mask=response_mask,
+                        loss_agg_mode=loss_agg_mode,
+                        config=self.config,
+                        rollout_is_weights=rollout_is_weights,
+                    )
+                    stats.update(pg_metrics)
 
                 # Skip if using bypass_mode loss (metrics already computed in pg_metrics)
                 rollout_log_prob = data.get("rollout_log_probs", None)
@@ -529,7 +591,7 @@ class MegatronPPOActor(BasePPOActor):
                     rollout_corr_metrics = compute_rollout_corr_metrics_from_logprobs(
                         log_prob=log_prob,
                         rollout_log_prob=rollout_log_prob,
-                        response_mask=response_mask,
+                        response_mask=response_mask_for_regularizers,
                     )
                     stats.update(rollout_corr_metrics)
 
@@ -539,20 +601,32 @@ class MegatronPPOActor(BasePPOActor):
             if calculate_entropy:
                 entropy = output["entropy"][:, -response_length - 1 : -1].contiguous()
                 if not forward_only:
-                    entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-                    entropy_coeff = meta_info["entropy_coeff"]
-                    policy_loss = pg_loss - entropy_coeff * entropy_loss
+                    has_active_regularizer_tokens = float(response_mask_for_regularizers.sum().item()) > 0
+                    if has_active_regularizer_tokens:
+                        entropy_loss = agg_loss(
+                            loss_mat=entropy,
+                            loss_mask=response_mask_for_regularizers,
+                            loss_agg_mode=loss_agg_mode,
+                        )
+                        entropy_coeff = meta_info["entropy_coeff"]
+                        policy_loss = policy_loss - entropy_coeff * entropy_loss
+                        stats["actor/entropy"] = entropy_loss.detach().item()
                 else:
                     ret_entropy = entropy
 
             if forward_only:
                 policy_loss = torch.tensor(1.0, device=device)
             else:
-                if self.config.use_kl_loss:
+                has_active_regularizer_tokens = float(response_mask_for_regularizers.sum().item()) > 0
+                if self.config.use_kl_loss and has_active_regularizer_tokens:
                     ref_log_prob = data["ref_log_prob"]
                     # compute kl loss
                     kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
-                    kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode)
+                    kl_loss = agg_loss(
+                        loss_mat=kld,
+                        loss_mask=response_mask_for_regularizers,
+                        loss_agg_mode=self.config.loss_agg_mode,
+                    )
 
                     policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                     metrics["actor/kl_loss"] = kl_loss.detach().item()
@@ -683,6 +757,8 @@ class MegatronPPOActor(BasePPOActor):
                     "clip_ratio": self.config.clip_ratio,
                     "entropy_coeff": self.config.entropy_coeff,
                     "clip_ratio_c": clip_ratio_c,
+                    "sttv_multi_objective_enable": bool(data.meta_info.get("sttv_multi_objective_enable", False)),
+                    "sttv_multi_objective_weights": data.meta_info.get("sttv_multi_objective_weights", {}),
                 }
 
             if RouterReplayHelper.is_r2_record_action(self.tf_config, vp_rank):

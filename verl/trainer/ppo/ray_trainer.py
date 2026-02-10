@@ -24,13 +24,15 @@ import re
 import uuid
 from collections import defaultdict
 from copy import deepcopy
+from io import BytesIO
 from pprint import pprint
-from typing import Any, Optional
+from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
 import ray
 import torch
 from omegaconf import OmegaConf, open_dict
+from PIL import Image
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
@@ -57,8 +59,9 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
-from verl.utils.import_utils import load_class_from_fqn
+from verl.utils.import_utils import load_class_from_fqn, load_extern_object
 from verl.utils.metric import reduce_metrics
+from verl.utils.model import compute_position_id_with_mask
 from verl.utils.py_functional import rename_dict
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
@@ -69,6 +72,8 @@ from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_pad
 
 
 ANSWER_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.IGNORECASE | re.DOTALL)
+STTV_AUX_MM_CHUNK_SIZE = 8
+STTV_PAD_RATIO_WARN_THRESHOLD = 0.1
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -621,6 +626,956 @@ class RayPPOTrainer:
 
         table = wandb.Table(columns=columns, data=rows)
         wandb.log({f"{split}/samples": table}, step=self.global_steps)
+
+    def _is_sttv_multi_objective_enabled(self) -> bool:
+        cfg = self.config.algorithm.get("sttv_multi_objective", {})
+        return bool(cfg.get("enable", False))
+
+    def _get_sttv_multi_objective_weights(self) -> dict[str, float]:
+        cfg = self.config.algorithm.get("sttv_multi_objective", {})
+        return {
+            "answer": float(cfg.get("answer_weight", 1.0)),
+            "loc": float(cfg.get("loc_weight", 1.0)),
+            "loc_verifier": float(cfg.get("loc_verifier_weight", 1.0)),
+        }
+
+    def _load_sttv_reward_functions(self) -> dict[str, Optional[Callable[..., Any]]]:
+        if hasattr(self, "_sttv_reward_fn_cache"):
+            return self._sttv_reward_fn_cache
+
+        reward_cfg = self.config.get("custom_reward_function") or {}
+        module_path = reward_cfg.get("path")
+        loc_fn_name = reward_cfg.get("loc_call_name", "compute_loc_call_rewards_batched")
+        loc_verifier_fn_name = reward_cfg.get("loc_verifier_name", "compute_loc_verifier_rewards_batched")
+        reward_fns: dict[str, Optional[Callable[..., Any]]] = {
+            "loc": None,
+            "loc_verifier": None,
+        }
+        if module_path:
+            for key, fn_name in (("loc", loc_fn_name), ("loc_verifier", loc_verifier_fn_name)):
+                try:
+                    reward_fns[key] = load_extern_object(module_path=module_path, object_name=fn_name)
+                except Exception as exc:
+                    print(f"[sttv] Optional reward fn '{fn_name}' not loaded from {module_path}: {exc}")
+
+        self._sttv_reward_fn_cache = reward_fns
+        return reward_fns
+
+    def _extract_sttv_mask_tensor(
+        self,
+        batch: DataProto,
+        field_name: str,
+        *,
+        fallback_to_response_mask: bool = False,
+    ) -> torch.Tensor:
+        response_mask = batch.batch["response_mask"]
+        bsz, response_len = response_mask.shape
+        mask = torch.zeros_like(response_mask)
+
+        raw_masks = batch.non_tensor_batch.get(field_name)
+        if raw_masks is None:
+            return response_mask.clone() if fallback_to_response_mask else mask
+
+        for row_idx in range(min(len(raw_masks), bsz)):
+            raw_row = raw_masks[row_idx]
+            if raw_row is None:
+                continue
+            if isinstance(raw_row, torch.Tensor):
+                row_values = raw_row.detach().cpu().tolist()
+            elif isinstance(raw_row, np.ndarray):
+                row_values = raw_row.tolist()
+            else:
+                row_values = list(raw_row)
+            if not row_values:
+                continue
+            row_tensor = torch.tensor(row_values, dtype=mask.dtype, device=mask.device)
+            take = min(response_len, row_tensor.numel())
+            if take > 0:
+                mask[row_idx, :take] = row_tensor[:take]
+
+        return mask * response_mask.to(mask.dtype)
+
+    def _extract_reward_context(
+        self,
+        batch: DataProto,
+        *,
+        include_solution_strs: bool = True,
+    ) -> tuple[list[str], list[str], list[str], list[dict[str, Any]]]:
+        bsz = len(batch)
+        data_sources_raw = batch.non_tensor_batch.get("data_source")
+        if isinstance(data_sources_raw, np.ndarray):
+            data_sources = [str(x) for x in data_sources_raw.tolist()]
+        elif data_sources_raw is None:
+            data_sources = ["unknown"] * bsz
+        else:
+            data_sources = [str(x) for x in list(data_sources_raw)]
+        if len(data_sources) < bsz:
+            data_sources.extend(["unknown"] * (bsz - len(data_sources)))
+
+        if include_solution_strs:
+            solution_strs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in batch.batch["responses"]]
+        else:
+            solution_strs = [""] * bsz
+
+        ground_truths: list[str] = []
+        extra_infos: list[dict[str, Any]] = []
+        for item in batch:
+            reward_model = item.non_tensor_batch.get("reward_model", {})
+            ground_truth = ""
+            if isinstance(reward_model, dict):
+                raw_gt = reward_model.get("ground_truth", "")
+                if raw_gt is not None:
+                    ground_truth = str(raw_gt)
+            ground_truths.append(ground_truth)
+
+            extra_info = item.non_tensor_batch.get("extra_info", {})
+            if not isinstance(extra_info, dict):
+                extra_info = {}
+            merged_extra = dict(extra_info)
+            if isinstance(reward_model, dict):
+                for key, value in reward_model.items():
+                    if key == "ground_truth":
+                        continue
+                    merged_extra.setdefault(key, value)
+            extra_infos.append(merged_extra)
+
+        return data_sources, solution_strs, ground_truths, extra_infos
+
+    def _normalize_per_sample_call_rewards(
+        self,
+        raw_rewards: Any,
+        call_records_per_sample: Sequence[list[dict[str, Any]]],
+    ) -> list[list[float]]:
+        expected_per_sample = [len(records) for records in call_records_per_sample]
+        default_rewards = [[0.0] * n for n in expected_per_sample]
+
+        if raw_rewards is None:
+            return default_rewards
+        if isinstance(raw_rewards, np.ndarray):
+            raw_rewards = raw_rewards.tolist()
+        if not isinstance(raw_rewards, (list, tuple)):
+            return default_rewards
+
+        # Preferred shape: List[List[float]] with batch-aligned outer dimension.
+        if len(raw_rewards) == len(call_records_per_sample):
+            normalized: list[list[float]] = []
+            for sample_rewards, expected_n in zip(raw_rewards, expected_per_sample, strict=True):
+                if expected_n == 0:
+                    normalized.append([])
+                    continue
+                if isinstance(sample_rewards, np.ndarray):
+                    sample_rewards = sample_rewards.tolist()
+                if isinstance(sample_rewards, (list, tuple)):
+                    row = [float(x) for x in sample_rewards[:expected_n]]
+                    if len(row) < expected_n:
+                        row.extend([0.0] * (expected_n - len(row)))
+                    normalized.append(row)
+                    continue
+                if sample_rewards is None:
+                    normalized.append([0.0] * expected_n)
+                    continue
+                normalized.append([float(sample_rewards)] * expected_n)
+            return normalized
+
+        # Fallback shape: flattened rewards over all calls.
+        if all(not isinstance(x, (list, tuple, np.ndarray, dict)) for x in raw_rewards):
+            total_calls = sum(expected_per_sample)
+            flat = [float(x) for x in raw_rewards[:total_calls]]
+            if len(flat) < total_calls:
+                flat.extend([0.0] * (total_calls - len(flat)))
+            cursor = 0
+            normalized = []
+            for expected_n in expected_per_sample:
+                normalized.append(flat[cursor : cursor + expected_n])
+                cursor += expected_n
+            return normalized
+
+        return default_rewards
+
+    def _normalize_flat_rewards(self, raw_rewards: Any, expected_len: int) -> list[float]:
+        if expected_len <= 0:
+            return []
+        if raw_rewards is None:
+            return [0.0] * expected_len
+        if isinstance(raw_rewards, np.ndarray):
+            raw_rewards = raw_rewards.tolist()
+        if isinstance(raw_rewards, (list, tuple)):
+            flat: list[float] = []
+            for value in raw_rewards:
+                if isinstance(value, (list, tuple, np.ndarray)):
+                    if len(value) == 0:
+                        flat.append(0.0)
+                    else:
+                        flat.append(float(list(value)[0]))
+                elif value is None:
+                    flat.append(0.0)
+                else:
+                    flat.append(float(value))
+            flat = flat[:expected_len]
+            if len(flat) < expected_len:
+                flat.extend([0.0] * (expected_len - len(flat)))
+            return flat
+        try:
+            scalar = float(raw_rewards)
+        except Exception:
+            scalar = 0.0
+        return [scalar] * expected_len
+
+    def _relocate_scalar_scores_to_mask(
+        self,
+        token_level_scores: torch.Tensor,
+        objective_mask: torch.Tensor,
+        fallback_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        relocated = torch.zeros_like(token_level_scores)
+        sample_scores = token_level_scores.sum(dim=-1)
+        _, response_len = token_level_scores.shape
+        for row_idx in range(token_level_scores.shape[0]):
+            active = torch.nonzero(objective_mask[row_idx] > 0, as_tuple=False)
+            if active.numel() > 0:
+                endpoint = int(active[-1, 0].item())
+            else:
+                fallback = torch.nonzero(fallback_mask[row_idx] > 0, as_tuple=False)
+                endpoint = int(fallback[-1, 0].item()) if fallback.numel() > 0 else response_len - 1
+            relocated[row_idx, endpoint] = sample_scores[row_idx]
+        return relocated
+
+    def _compute_sttv_loc_call_reward_tensor(
+        self,
+        batch: DataProto,
+        reward_fn: Optional[Callable[..., Any]],
+    ) -> tuple[torch.Tensor, int]:
+        response_mask = batch.batch["response_mask"]
+        response_len = response_mask.shape[1]
+        loc_rewards = torch.zeros_like(response_mask, dtype=torch.float32)
+
+        raw_calls = batch.non_tensor_batch.get("sttv_loc_calls")
+        if raw_calls is None:
+            return loc_rewards, 0
+
+        loc_call_records: list[list[dict[str, Any]]] = []
+        for row in raw_calls:
+            if isinstance(row, np.ndarray):
+                row = row.tolist()
+            if not isinstance(row, (list, tuple)):
+                loc_call_records.append([])
+                continue
+            loc_call_records.append([entry for entry in row if isinstance(entry, dict)])
+
+        total_calls = sum(len(records) for records in loc_call_records)
+        if total_calls == 0:
+            return loc_rewards, 0
+
+        reward_values = [[0.0] * len(records) for records in loc_call_records]
+        if reward_fn is not None:
+            data_sources, _, ground_truths, extra_infos = self._extract_reward_context(
+                batch, include_solution_strs=False
+            )
+            solution_strs = [""] * len(batch)
+            uids_raw = batch.non_tensor_batch.get("uid", np.array(["unknown"] * len(batch), dtype=object))
+            if isinstance(uids_raw, np.ndarray):
+                uids = [str(x) for x in uids_raw.tolist()]
+            else:
+                uids = [str(x) for x in list(uids_raw)]
+            if len(uids) < len(batch):
+                uids.extend(["unknown"] * (len(batch) - len(uids)))
+
+            verifier_calls_raw = batch.non_tensor_batch.get("sttv_loc_verifier_calls")
+            loc_verifier_call_records: list[list[dict[str, Any]]] = []
+            if verifier_calls_raw is None:
+                loc_verifier_call_records = [[] for _ in range(len(batch))]
+            else:
+                for row in verifier_calls_raw:
+                    if isinstance(row, np.ndarray):
+                        row = row.tolist()
+                    if not isinstance(row, (list, tuple)):
+                        loc_verifier_call_records.append([])
+                        continue
+                    loc_verifier_call_records.append([entry for entry in row if isinstance(entry, dict)])
+                if len(loc_verifier_call_records) < len(batch):
+                    loc_verifier_call_records.extend([[] for _ in range(len(batch) - len(loc_verifier_call_records))])
+            try:
+                raw_reward_values = reward_fn(
+                    data_sources=data_sources,
+                    loc_call_records=loc_call_records,
+                    solution_strs=solution_strs,
+                    ground_truths=ground_truths,
+                    extra_infos=extra_infos,
+                    uids=uids,
+                    loc_verifier_call_records=loc_verifier_call_records,
+                )
+            except TypeError:
+                raw_reward_values = reward_fn(data_sources, loc_call_records, solution_strs, ground_truths, extra_infos)
+            reward_values = self._normalize_per_sample_call_rewards(raw_reward_values, loc_call_records)
+
+        for row_idx, (call_records, call_rewards) in enumerate(zip(loc_call_records, reward_values, strict=True)):
+            for call_record, reward in zip(call_records, call_rewards, strict=True):
+                start = int(call_record.get("token_start", 0))
+                end = int(call_record.get("token_end", 0))
+                if end <= start:
+                    continue
+                start = max(0, min(response_len - 1, start))
+                end = max(start + 1, min(response_len, end))
+                endpoint = end - 1
+                loc_rewards[row_idx, endpoint] += float(reward)
+
+        return loc_rewards, total_calls
+
+    def _deserialize_sttv_images(self, serialized_images: Any) -> list[Image.Image]:
+        if not isinstance(serialized_images, (list, tuple)):
+            return []
+        images: list[Image.Image] = []
+        for image_blob in serialized_images:
+            if not isinstance(image_blob, dict):
+                continue
+            image_bytes = image_blob.get("bytes")
+            if image_bytes is None:
+                continue
+            try:
+                images.append(Image.open(BytesIO(image_bytes)).convert("RGB"))
+            except Exception:
+                continue
+        return images
+
+    def _compute_aux_multi_modal_inputs(
+        self,
+        text: str,
+        images: list[Image.Image],
+    ) -> dict[str, torch.Tensor]:
+        if self.processor is None or not images:
+            return {}
+        multi_modal_inputs = self.processor(
+            text=[text],
+            images=images,
+            return_tensors="pt",
+            do_sample_frames=False,
+        )
+        multi_modal_inputs.pop("input_ids", None)
+        multi_modal_inputs.pop("attention_mask", None)
+        multi_modal_inputs = dict(multi_modal_inputs.convert_to_tensors("pt"))
+        image_grid_thw = multi_modal_inputs.get("image_grid_thw")
+        if image_grid_thw is not None:
+            images_seqlens = torch.repeat_interleave(image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0])
+            multi_modal_inputs["images_seqlens"] = images_seqlens
+        return multi_modal_inputs
+
+    def _split_aux_batched_processor_output(
+        self,
+        batched_outputs: dict[str, torch.Tensor],
+        image_counts: list[int],
+    ) -> list[dict[str, torch.Tensor]]:
+        batch_size = len(image_counts)
+        total_images = sum(image_counts)
+        per_item_outputs: list[dict[str, torch.Tensor]] = [{} for _ in range(batch_size)]
+
+        image_grid_thw_all = batched_outputs.get("image_grid_thw")
+        per_item_patch_counts: list[int] | None = None
+        if isinstance(image_grid_thw_all, torch.Tensor):
+            per_item_patch_counts = []
+            grid_cursor = 0
+            for image_count in image_counts:
+                if image_count <= 0:
+                    per_item_patch_counts.append(0)
+                    continue
+                item_grid = image_grid_thw_all[grid_cursor : grid_cursor + image_count]
+                patch_count = int((item_grid[:, 0] * item_grid[:, 1] * item_grid[:, 2]).sum().item())
+                per_item_patch_counts.append(patch_count)
+                grid_cursor += image_count
+
+        for key, value in batched_outputs.items():
+            if not isinstance(value, torch.Tensor):
+                continue
+            if value.dim() == 0:
+                for item in per_item_outputs:
+                    item[key] = value.clone()
+                continue
+            if value.shape[0] == batch_size:
+                for idx in range(batch_size):
+                    per_item_outputs[idx][key] = value[idx : idx + 1].contiguous()
+                continue
+            if total_images > 0 and value.shape[0] == total_images:
+                cursor = 0
+                for idx, image_count in enumerate(image_counts):
+                    per_item_outputs[idx][key] = value[cursor : cursor + image_count].contiguous()
+                    cursor += image_count
+                continue
+            if (
+                key in {"pixel_values", "pixel_values_videos"}
+                and per_item_patch_counts is not None
+                and value.shape[0] == sum(per_item_patch_counts)
+            ):
+                cursor = 0
+                for idx, patch_count in enumerate(per_item_patch_counts):
+                    per_item_outputs[idx][key] = value[cursor : cursor + patch_count].contiguous()
+                    cursor += patch_count
+                continue
+            raise ValueError(
+                f"Unsupported batched multimodal tensor shape for key '{key}': "
+                f"{tuple(value.shape)} with batch_size={batch_size}, total_images={total_images}"
+            )
+
+        for item in per_item_outputs:
+            image_grid_thw = item.get("image_grid_thw")
+            if image_grid_thw is not None:
+                images_seqlens = torch.repeat_interleave(
+                    image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0]
+                )
+                item["images_seqlens"] = images_seqlens
+        return per_item_outputs
+
+    def _compute_aux_multi_modal_inputs_batched(
+        self,
+        texts: list[str],
+        images_per_row: list[list[Image.Image]],
+        chunk_size: int = STTV_AUX_MM_CHUNK_SIZE,
+    ) -> tuple[list[dict[str, torch.Tensor]], int]:
+        if self.processor is None:
+            return ([{} for _ in texts], 0)
+
+        outputs: list[dict[str, torch.Tensor]] = [{} for _ in texts]
+        fallback_rows = 0
+        for start in range(0, len(texts), max(1, int(chunk_size))):
+            end = min(len(texts), start + max(1, int(chunk_size)))
+            chunk_texts = texts[start:end]
+            chunk_images = images_per_row[start:end]
+            image_counts = [len(images) for images in chunk_images]
+            try:
+                batched_multi_modal_inputs = self.processor(
+                    text=chunk_texts,
+                    images=chunk_images,
+                    return_tensors="pt",
+                    do_sample_frames=False,
+                )
+                batched_multi_modal_inputs.pop("input_ids", None)
+                batched_multi_modal_inputs.pop("attention_mask", None)
+                batched_multi_modal_inputs = dict(batched_multi_modal_inputs.convert_to_tensors("pt"))
+                chunk_outputs = self._split_aux_batched_processor_output(
+                    batched_outputs=batched_multi_modal_inputs,
+                    image_counts=image_counts,
+                )
+                for idx, chunk_output in enumerate(chunk_outputs):
+                    outputs[start + idx] = chunk_output
+            except Exception:
+                fallback_rows += end - start
+                for local_idx, (text, images) in enumerate(zip(chunk_texts, chunk_images, strict=True)):
+                    outputs[start + local_idx] = self._compute_aux_multi_modal_inputs(text=text, images=images)
+
+        return outputs, fallback_rows
+
+    def _compute_aux_position_ids(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        multi_modal_inputs: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        if self.processor is None or ("image_grid_thw" not in multi_modal_inputs and "video_grid_thw" not in multi_modal_inputs):
+            return compute_position_id_with_mask(attention_mask)
+
+        image_grid_thw = multi_modal_inputs.get("image_grid_thw")
+        video_grid_thw = multi_modal_inputs.get("video_grid_thw")
+        vision_position_ids, _ = self.processor.get_rope_index(
+            input_ids=input_ids,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            attention_mask=attention_mask,
+        )
+        vision_position_ids = vision_position_ids.transpose(0, 1)  # (3, 1, seq_len) -> (1, 3, seq_len)
+
+        valid_mask = attention_mask[0].bool()
+        text_position_ids = torch.ones((1, input_ids.shape[1]), dtype=torch.long)
+        text_position_ids[0, valid_mask] = torch.arange(valid_mask.sum().item())
+        text_position_ids = text_position_ids.unsqueeze(0)
+        return torch.cat((text_position_ids, vision_position_ids), dim=1)
+
+    def _build_sttv_loc_verifier_aux_batch(
+        self, batch: DataProto
+    ) -> tuple[Optional[DataProto], dict[str, float]]:
+        verifier_calls_raw = batch.non_tensor_batch.get("sttv_loc_verifier_calls")
+        if verifier_calls_raw is None:
+            return None, {
+                "sttv/aux_prompt_len": 0.0,
+                "sttv/aux_response_len": 0.0,
+                "sttv/aux_rows_dropped_no_images": 0.0,
+                "sttv/aux_multimodal_fallback_rows": 0.0,
+            }
+
+        max_prompt_len = int(self.config.actor_rollout_ref.rollout.prompt_length)
+        max_response_len = int(self.config.actor_rollout_ref.rollout.response_length)
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else 0
+
+        data_sources, _, ground_truths, extra_infos = self._extract_reward_context(
+            batch, include_solution_strs=False
+        )
+
+        aux_rows: list[dict[str, Any]] = []
+        dropped_no_images = 0
+
+        for row_idx in range(len(batch)):
+            uid = str(batch.non_tensor_batch["uid"][row_idx])
+            call_list = verifier_calls_raw[row_idx]
+            if isinstance(call_list, np.ndarray):
+                call_list = call_list.tolist()
+            if not isinstance(call_list, (list, tuple)):
+                continue
+
+            for call_record in call_list:
+                if not isinstance(call_record, dict):
+                    continue
+
+                prompt_text = str(call_record.get("verifier_prompt_text", "") or "")
+                output_text = str(call_record.get("verifier_output_text", "") or "")
+
+                prompt_token_ids = list(call_record.get("verifier_prompt_token_ids", []) or [])
+                if len(prompt_token_ids) == 0:
+                    if prompt_text:
+                        prompt_token_ids = self.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+
+                output_token_ids = list(call_record.get("verifier_output_token_ids", []) or [])
+                if len(output_token_ids) == 0:
+                    if output_text:
+                        output_token_ids = self.tokenizer(output_text, add_special_tokens=False)["input_ids"]
+                if len(output_token_ids) == 0:
+                    continue
+
+                if len(prompt_token_ids) > max_prompt_len:
+                    prompt_token_ids = prompt_token_ids[-max_prompt_len:]
+                if len(output_token_ids) > max_response_len:
+                    output_token_ids = output_token_ids[:max_response_len]
+
+                images = self._deserialize_sttv_images(call_record.get("verifier_images", []))
+                if self.processor is not None and len(images) == 0:
+                    # Verifier calls in VLM mode require image tensors for image placeholder tokens.
+                    dropped_no_images += 1
+                    continue
+
+                call_index = int(call_record.get("call_index", -1))
+                if not prompt_text and prompt_token_ids:
+                    prompt_text = self.tokenizer.decode(prompt_token_ids, skip_special_tokens=True)
+                if not output_text and output_token_ids:
+                    output_text = self.tokenizer.decode(output_token_ids, skip_special_tokens=True)
+                aux_rows.append(
+                    {
+                        "uid": uid,
+                        "call_index": call_index,
+                        "call_record": call_record,
+                        "data_source": str(data_sources[row_idx]),
+                        "ground_truth": str(ground_truths[row_idx]),
+                        "extra_info": extra_infos[row_idx],
+                        "prompt_token_ids": prompt_token_ids,
+                        "output_token_ids": output_token_ids,
+                        "prompt_text": prompt_text,
+                        "output_text": output_text,
+                        "images": images,
+                    }
+                )
+
+        if len(aux_rows) == 0:
+            return None, {
+                "sttv/aux_prompt_len": 0.0,
+                "sttv/aux_response_len": 0.0,
+                "sttv/aux_rows_dropped_no_images": float(dropped_no_images),
+                "sttv/aux_multimodal_fallback_rows": 0.0,
+            }
+
+        aux_prompt_len = min(max_prompt_len, max(1, max(len(row["prompt_token_ids"]) for row in aux_rows)))
+        aux_response_len = min(max_response_len, max(1, max(len(row["output_token_ids"]) for row in aux_rows)))
+
+        prompts: list[torch.Tensor] = []
+        responses: list[torch.Tensor] = []
+        response_masks: list[torch.Tensor] = []
+        input_ids_all: list[torch.Tensor] = []
+        attention_masks: list[torch.Tensor] = []
+        aux_texts: list[str] = []
+        aux_images: list[list[Image.Image]] = []
+
+        aux_uids: list[str] = []
+        parent_uids: list[str] = []
+        call_indices: list[int] = []
+        call_records: list[dict[str, Any]] = []
+        aux_data_sources: list[str] = []
+        aux_ground_truths: list[str] = []
+        aux_extra_infos: list[dict[str, Any]] = []
+
+        for row in aux_rows:
+            prompt_token_ids = row["prompt_token_ids"]
+            output_token_ids = row["output_token_ids"]
+
+            prompt_tensor = torch.full((aux_prompt_len,), pad_token_id, dtype=torch.long)
+            prompt_attention = torch.zeros((aux_prompt_len,), dtype=torch.long)
+            if prompt_token_ids:
+                prompt_tensor[-len(prompt_token_ids) :] = torch.tensor(prompt_token_ids, dtype=torch.long)
+                prompt_attention[-len(prompt_token_ids) :] = 1
+
+            response_tensor = torch.full((aux_response_len,), pad_token_id, dtype=torch.long)
+            response_attention = torch.zeros((aux_response_len,), dtype=torch.long)
+            response_tensor[: len(output_token_ids)] = torch.tensor(output_token_ids, dtype=torch.long)
+            response_attention[: len(output_token_ids)] = 1
+
+            input_ids = torch.cat([prompt_tensor, response_tensor], dim=0)
+            attention_mask = torch.cat([prompt_attention, response_attention], dim=0)
+            response_mask = response_attention.clone()
+
+            prompts.append(prompt_tensor)
+            responses.append(response_tensor)
+            response_masks.append(response_mask)
+            input_ids_all.append(input_ids)
+            attention_masks.append(attention_mask)
+            aux_texts.append(self.tokenizer.decode(input_ids, skip_special_tokens=True))
+            aux_images.append(row["images"])
+
+            uid = row["uid"]
+            call_index = int(row["call_index"])
+            aux_uids.append(f"{uid}::locv::{call_index}")
+            parent_uids.append(uid)
+            call_indices.append(call_index)
+            call_records.append(row["call_record"])
+            aux_data_sources.append(row["data_source"])
+            aux_ground_truths.append(row["ground_truth"])
+            aux_extra_infos.append(row["extra_info"])
+
+        if self.processor is not None:
+            multi_modal_inputs_list, fallback_rows = self._compute_aux_multi_modal_inputs_batched(
+                texts=aux_texts,
+                images_per_row=aux_images,
+            )
+        else:
+            multi_modal_inputs_list = [{} for _ in aux_rows]
+            fallback_rows = 0
+
+        position_ids_all: list[torch.Tensor] = []
+        for input_ids, attention_mask, multi_modal_inputs in zip(
+            input_ids_all, attention_masks, multi_modal_inputs_list, strict=True
+        ):
+            position_ids = self._compute_aux_position_ids(
+                input_ids.unsqueeze(0),
+                attention_mask.unsqueeze(0),
+                multi_modal_inputs,
+            ).squeeze(0)
+            position_ids_all.append(position_ids)
+
+        tensors = {
+            "prompts": torch.stack(prompts, dim=0),
+            "responses": torch.stack(responses, dim=0),
+            "response_mask": torch.stack(response_masks, dim=0),
+            "input_ids": torch.stack(input_ids_all, dim=0),
+            "attention_mask": torch.stack(attention_masks, dim=0),
+            "position_ids": torch.stack(position_ids_all, dim=0),
+        }
+        non_tensors: dict[str, np.ndarray] = {
+            "uid": np.array(aux_uids, dtype=object),
+            "sttv_parent_uid": np.array(parent_uids, dtype=object),
+            "sttv_loc_call_index": np.array(call_indices, dtype=np.int32),
+            "sttv_loc_verifier_call_record": np.array(call_records, dtype=object),
+            "data_source": np.array(aux_data_sources, dtype=object),
+            "sttv_ground_truth": np.array(aux_ground_truths, dtype=object),
+            "sttv_extra_info": np.array(aux_extra_infos, dtype=object),
+            "multi_modal_inputs": np.array(multi_modal_inputs_list, dtype=object),
+        }
+        aux_batch = DataProto.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=deepcopy(batch.meta_info))
+        aux_metrics = {
+            "sttv/aux_prompt_len": float(aux_prompt_len),
+            "sttv/aux_response_len": float(aux_response_len),
+            "sttv/aux_rows_dropped_no_images": float(dropped_no_images),
+            "sttv/aux_multimodal_fallback_rows": float(fallback_rows),
+        }
+        return aux_batch, aux_metrics
+
+    def _compute_sttv_loc_verifier_reward_tensor(
+        self,
+        aux_batch: Optional[DataProto],
+        reward_fn: Optional[Callable[..., Any]],
+    ) -> tuple[Optional[torch.Tensor], int]:
+        if aux_batch is None or len(aux_batch) == 0:
+            return None, 0
+
+        response_mask = aux_batch.batch["response_mask"]
+        verifier_rewards = torch.zeros_like(response_mask, dtype=torch.float32)
+        total_calls = len(aux_batch)
+
+        reward_values = [0.0] * total_calls
+        if reward_fn is not None:
+            call_records_raw = aux_batch.non_tensor_batch.get("sttv_loc_verifier_call_record", np.array([], dtype=object))
+            call_records = call_records_raw.tolist() if isinstance(call_records_raw, np.ndarray) else list(call_records_raw)
+            parent_uids_raw = aux_batch.non_tensor_batch.get(
+                "sttv_parent_uid",
+                np.array(["unknown"] * len(aux_batch), dtype=object),
+            )
+            parent_uids = (
+                [str(x) for x in parent_uids_raw.tolist()]
+                if isinstance(parent_uids_raw, np.ndarray)
+                else [str(x) for x in list(parent_uids_raw)]
+            )
+            if len(parent_uids) < len(aux_batch):
+                parent_uids.extend(["unknown"] * (len(aux_batch) - len(parent_uids)))
+            data_sources_raw = aux_batch.non_tensor_batch.get("data_source", np.array(["unknown"] * len(aux_batch), dtype=object))
+            data_sources = data_sources_raw.tolist() if isinstance(data_sources_raw, np.ndarray) else list(data_sources_raw)
+            ground_truths_raw = aux_batch.non_tensor_batch.get(
+                "sttv_ground_truth",
+                np.array([""] * len(aux_batch), dtype=object),
+            )
+            ground_truths = ground_truths_raw.tolist() if isinstance(ground_truths_raw, np.ndarray) else list(ground_truths_raw)
+            extra_infos_raw = aux_batch.non_tensor_batch.get(
+                "sttv_extra_info",
+                np.array([{}] * len(aux_batch), dtype=object),
+            )
+            extra_infos = extra_infos_raw.tolist() if isinstance(extra_infos_raw, np.ndarray) else list(extra_infos_raw)
+            solution_strs = [""] * len(call_records)
+            try:
+                raw_rewards = reward_fn(
+                    data_sources=data_sources,
+                    loc_verifier_call_records=call_records,
+                    solution_strs=solution_strs,
+                    ground_truths=ground_truths,
+                    extra_infos=extra_infos,
+                    parent_uids=parent_uids,
+                )
+            except TypeError:
+                raw_rewards = reward_fn(data_sources, call_records, solution_strs, ground_truths, extra_infos)
+            reward_values = self._normalize_flat_rewards(raw_rewards, expected_len=total_calls)
+
+        for row_idx, reward in enumerate(reward_values):
+            response_len = int(response_mask[row_idx].sum().item())
+            if response_len <= 0:
+                continue
+            endpoint = response_len - 1
+            verifier_rewards[row_idx, endpoint] = float(reward)
+
+        return verifier_rewards, total_calls
+
+    def _compute_sttv_grpo_advantages(
+        self,
+        token_level_rewards: torch.Tensor,
+        objective_mask: torch.Tensor,
+        group_index: np.ndarray,
+        norm_adv_by_std_in_grpo: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        objective_rewards = token_level_rewards * objective_mask
+        return core_algos.compute_grpo_outcome_advantage(
+            token_level_rewards=objective_rewards,
+            response_mask=objective_mask,
+            index=group_index,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        )
+
+    def _compose_sttv_actor_batch(self, main_batch: DataProto, aux_batch: Optional[DataProto]) -> DataProto:
+        tensor_keys = [
+            "prompts",
+            "responses",
+            "response_mask",
+            "input_ids",
+            "attention_mask",
+            "position_ids",
+            "old_log_probs",
+            "advantages",
+            "sttv_adv_answer",
+            "sttv_mask_answer",
+            "sttv_adv_loc",
+            "sttv_mask_loc",
+            "sttv_adv_loc_verifier",
+            "sttv_mask_loc_verifier",
+        ]
+        if "ref_log_prob" in main_batch.batch:
+            tensor_keys.append("ref_log_prob")
+
+        main_tensors = {key: main_batch.batch[key] for key in tensor_keys if key in main_batch.batch}
+        non_tensor_keys = ["uid", "multi_modal_inputs"]
+        main_non_tensors = {}
+        for key in non_tensor_keys:
+            if key in main_batch.non_tensor_batch:
+                main_non_tensors[key] = main_batch.non_tensor_batch[key]
+            else:
+                main_non_tensors[key] = np.array([None] * len(main_batch), dtype=object)
+        main_actor_batch = DataProto.from_dict(
+            tensors=main_tensors,
+            non_tensors=main_non_tensors,
+            meta_info=deepcopy(main_batch.meta_info),
+        )
+        if aux_batch is None or len(aux_batch) == 0:
+            return main_actor_batch
+
+        main_prompt_len = int(main_tensors["prompts"].shape[-1]) if "prompts" in main_tensors else 0
+        main_response_len = int(main_tensors["responses"].shape[-1]) if "responses" in main_tensors else 0
+        aux_prompt_len = int(aux_batch.batch["prompts"].shape[-1]) if "prompts" in aux_batch.batch else 0
+        aux_response_len = int(aux_batch.batch["responses"].shape[-1]) if "responses" in aux_batch.batch else 0
+
+        response_tensor_keys = {
+            "responses",
+            "response_mask",
+            "old_log_probs",
+            "advantages",
+            "sttv_adv_answer",
+            "sttv_mask_answer",
+            "sttv_adv_loc",
+            "sttv_mask_loc",
+            "sttv_adv_loc_verifier",
+            "sttv_mask_loc_verifier",
+            "ref_log_prob",
+        }
+        full_seq_tensor_keys = {"input_ids", "attention_mask", "position_ids"}
+
+        def _align_aux_tensor(key: str, aux_tensor: torch.Tensor, template: torch.Tensor) -> torch.Tensor:
+            if tuple(aux_tensor.shape[1:]) == tuple(template.shape[1:]):
+                return aux_tensor.to(dtype=template.dtype, device=template.device)
+
+            target = torch.zeros(
+                (len(aux_batch),) + tuple(template.shape[1:]),
+                dtype=template.dtype,
+                device=template.device,
+            )
+            src = aux_tensor.to(dtype=template.dtype, device=template.device)
+
+            if key == "prompts":
+                copy_len = min(src.shape[-1], target.shape[-1], aux_prompt_len, main_prompt_len)
+                if copy_len > 0:
+                    target[..., -copy_len:] = src[..., -copy_len:]
+                return target
+
+            if key in response_tensor_keys:
+                copy_len = min(src.shape[-1], target.shape[-1], aux_response_len, main_response_len)
+                if copy_len > 0:
+                    target[..., :copy_len] = src[..., :copy_len]
+                return target
+
+            if key in full_seq_tensor_keys:
+                prompt_copy_len = min(aux_prompt_len, main_prompt_len)
+                if prompt_copy_len > 0:
+                    target[..., main_prompt_len - prompt_copy_len : main_prompt_len] = src[
+                        ..., aux_prompt_len - prompt_copy_len : aux_prompt_len
+                    ]
+                response_copy_len = min(aux_response_len, main_response_len)
+                if response_copy_len > 0:
+                    target[..., main_prompt_len : main_prompt_len + response_copy_len] = src[
+                        ..., aux_prompt_len : aux_prompt_len + response_copy_len
+                    ]
+                return target
+
+            raise RuntimeError(
+                f"Unsupported aux/main tensor shape mismatch for key '{key}': "
+                f"aux={tuple(aux_tensor.shape[1:])}, main={tuple(template.shape[1:])}"
+            )
+
+        aux_tensors: dict[str, torch.Tensor] = {}
+        for key, template in main_tensors.items():
+            if key in aux_batch.batch:
+                aux_tensors[key] = _align_aux_tensor(key, aux_batch.batch[key], template)
+            else:
+                aux_tensors[key] = torch.zeros(
+                    (len(aux_batch),) + tuple(template.shape[1:]),
+                    dtype=template.dtype,
+                    device=template.device,
+                )
+
+        aux_non_tensors: dict[str, np.ndarray] = {}
+        for key in non_tensor_keys:
+            if key in aux_batch.non_tensor_batch:
+                aux_non_tensors[key] = aux_batch.non_tensor_batch[key]
+            else:
+                aux_non_tensors[key] = np.array([None] * len(aux_batch), dtype=object)
+
+        aux_actor_batch = DataProto.from_dict(
+            tensors=aux_tensors,
+            non_tensors=aux_non_tensors,
+            meta_info=deepcopy(main_batch.meta_info),
+        )
+
+        merged = DataProto.concat([main_actor_batch, aux_actor_batch])
+        merged.meta_info = deepcopy(main_batch.meta_info)
+        return merged
+
+    def _get_actor_dp_size(self) -> int:
+        return self._get_dp_size(self.actor_rollout_wg, "actor")
+
+    def _prepare_batch_for_log_prob(self, batch: DataProto) -> DataProto:
+        """Keep only fields required by actor/ref compute_log_prob to minimize dispatch payload."""
+        tensor_keys = ["responses", "input_ids", "attention_mask", "position_ids", "prompts", "response_mask"]
+        selected_tensor_keys = [key for key in tensor_keys if key in batch.batch]
+        non_tensor_keys = [key for key in ("uid", "multi_modal_inputs") if key in batch.non_tensor_batch]
+        return batch.select(batch_keys=selected_tensor_keys, non_tensor_batch_keys=non_tensor_keys)
+
+    def _compute_old_log_prob_with_padding(self, batch: DataProto) -> tuple[DataProto, float]:
+        dp_size = self._get_actor_dp_size()
+        log_prob_batch = self._prepare_batch_for_log_prob(batch)
+        padded_batch, pad_size = pad_dataproto_to_divisor(log_prob_batch, dp_size)
+        old_log_prob, mfu = self._compute_old_log_prob(padded_batch)
+        old_log_prob = unpad_dataproto(old_log_prob, pad_size=pad_size)
+        return old_log_prob, mfu
+
+    def _can_merge_old_log_prob_batches(self, main_batch: DataProto, aux_batch: Optional[DataProto]) -> bool:
+        if aux_batch is None or len(aux_batch) == 0:
+            return False
+        if "multi_modal_inputs" not in main_batch.non_tensor_batch or "multi_modal_inputs" not in aux_batch.non_tensor_batch:
+            return False
+        required_keys = ("responses", "input_ids", "attention_mask", "position_ids")
+        for key in required_keys:
+            if key not in main_batch.batch or key not in aux_batch.batch:
+                return False
+            main_shape = tuple(main_batch.batch[key].shape[1:])
+            aux_shape = tuple(aux_batch.batch[key].shape[1:])
+            if main_shape != aux_shape:
+                return False
+        return True
+
+    def _compute_main_aux_old_log_prob(
+        self, main_batch: DataProto, aux_batch: Optional[DataProto]
+    ) -> tuple[DataProto, Optional[DataProto], float, bool]:
+        if not self._can_merge_old_log_prob_batches(main_batch, aux_batch):
+            main_old_log_prob, mfu = self._compute_old_log_prob_with_padding(main_batch)
+            aux_old_log_prob = None
+            if aux_batch is not None and len(aux_batch) > 0:
+                aux_old_log_prob, _ = self._compute_old_log_prob_with_padding(aux_batch)
+            return main_old_log_prob, aux_old_log_prob, mfu, False
+
+        merged_log_prob_batch = DataProto.concat(
+            [self._prepare_batch_for_log_prob(main_batch), self._prepare_batch_for_log_prob(aux_batch)]
+        )
+        merged_old_log_prob, mfu = self._compute_old_log_prob_with_padding(merged_log_prob_batch)
+        main_rows = len(main_batch)
+        main_old_log_prob = merged_old_log_prob[:main_rows]
+        aux_old_log_prob = merged_old_log_prob[main_rows:]
+        return main_old_log_prob, aux_old_log_prob, mfu, True
+
+    def _compute_ref_log_prob_with_padding(self, batch: DataProto) -> DataProto:
+        dp_size = self._get_actor_dp_size()
+        log_prob_batch = self._prepare_batch_for_log_prob(batch)
+        padded_batch, pad_size = pad_dataproto_to_divisor(log_prob_batch, dp_size)
+        ref_log_prob = self._compute_ref_log_prob(padded_batch)
+        ref_log_prob = unpad_dataproto(ref_log_prob, pad_size=pad_size)
+        return ref_log_prob
+
+    def _pad_actor_batch_for_update(self, actor_batch: DataProto) -> tuple[DataProto, int]:
+        dp_size = self._get_actor_dp_size()
+        # Keep dispatch and local PPO minibatching aligned:
+        # global batch size must be divisible by (dp_size * local_ppo_mini_batch_size).
+        local_ppo_mini = int(self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size", 1))
+        rollout_n = int(self.config.actor_rollout_ref.rollout.n)
+        if local_ppo_mini <= 0:
+            local_ppo_mini = 1
+        global_ppo_divisor = max(1, local_ppo_mini * rollout_n)
+        target_divisor = int(np.lcm(dp_size, global_ppo_divisor))
+
+        padded_batch, pad_size = pad_dataproto_to_divisor(actor_batch, target_divisor)
+        if pad_size == 0:
+            return padded_batch, 0
+
+        # Neutralize padded rows so they do not contribute to policy/entropy/KL losses.
+        start = len(actor_batch)
+        end = len(padded_batch)
+        zero_tensor_keys = [
+            "response_mask",
+            "advantages",
+            "sttv_adv_answer",
+            "sttv_mask_answer",
+            "sttv_adv_loc",
+            "sttv_mask_loc",
+            "sttv_adv_loc_verifier",
+            "sttv_mask_loc_verifier",
+        ]
+        for key in zero_tensor_keys:
+            if key in padded_batch.batch:
+                padded_batch.batch[key][start:end] = 0
+        return padded_batch, pad_size
 
     def _compute_or_extract_reward(
         self,
@@ -1641,6 +2596,20 @@ class RayPPOTrainer:
                                 batch, reward_fn=self.reward_fn, reward_for_val=False
                             )
 
+                    sttv_multi_objective_enabled = self._is_sttv_multi_objective_enabled()
+                    aux_batch: Optional[DataProto] = None
+                    aux_old_log_prob: Optional[DataProto] = None
+                    if sttv_multi_objective_enabled:
+                        if self.config.algorithm.adv_estimator != AdvantageEstimator.GRPO:
+                            raise ValueError("STTV multi-objective currently supports only GRPO adv_estimator.")
+                        if self.config.algorithm.use_kl_in_reward:
+                            raise ValueError(
+                                "STTV multi-objective currently does not support algorithm.use_kl_in_reward=True."
+                            )
+                        aux_batch, aux_batch_metrics = self._build_sttv_loc_verifier_aux_batch(batch)
+                        if aux_batch_metrics:
+                            metrics.update(aux_batch_metrics)
+
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
                     # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
@@ -1657,7 +2626,14 @@ class RayPPOTrainer:
                         )
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
-                            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                            old_log_prob_merged = False
+                            if sttv_multi_objective_enabled and aux_batch is not None and len(aux_batch) > 0:
+                                old_log_prob, aux_old_log_prob, old_log_prob_mfu, old_log_prob_merged = (
+                                    self._compute_main_aux_old_log_prob(batch, aux_batch)
+                                )
+                                metrics["sttv/old_log_prob_merged"] = float(old_log_prob_merged)
+                            else:
+                                old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
                             actor_config = self.config.actor_rollout_ref.actor
@@ -1673,6 +2649,8 @@ class RayPPOTrainer:
                             }
                             metrics.update(old_log_prob_metrics)
                             old_log_prob.batch.pop("entropys")
+                            if aux_old_log_prob is not None and "entropys" in aux_old_log_prob.batch:
+                                aux_old_log_prob.batch.pop("entropys")
                             if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
                                 router_mode = getattr(
                                     self.config.actor_rollout_ref.actor.router_replay, "mode", "disabled"
@@ -1702,12 +2680,29 @@ class RayPPOTrainer:
                             values = self._compute_values(batch)
                             batch = batch.union(values)
 
+                    actor_train_batch = batch
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                        batch.batch["token_level_scores"] = reward_tensor
+
+                        if sttv_multi_objective_enabled:
+                            # Answer objective score is scalar outcome score relocated to the answer mask endpoint.
+                            answer_mask = self._extract_sttv_mask_tensor(
+                                batch,
+                                "sttv_answer_mask",
+                                fallback_to_response_mask=True,
+                            )
+                            answer_scores = self._relocate_scalar_scores_to_mask(
+                                token_level_scores=reward_tensor,
+                                objective_mask=answer_mask,
+                                fallback_mask=batch.batch["response_mask"],
+                            )
+                            batch.batch["token_level_scores"] = answer_scores
+                        else:
+                            answer_mask = batch.batch["response_mask"]
+                            batch.batch["token_level_scores"] = reward_tensor
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
@@ -1743,7 +2738,7 @@ class RayPPOTrainer:
                             )
 
                         # compute rewards. apply_kl_penalty if available
-                        if self.config.algorithm.use_kl_in_reward:
+                        if self.config.algorithm.use_kl_in_reward and not sttv_multi_objective_enabled:
                             batch, kl_metrics = apply_kl_penalty(
                                 batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
                             )
@@ -1771,15 +2766,100 @@ class RayPPOTrainer:
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
 
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
+                        if sttv_multi_objective_enabled:
+                            sttv_reward_fns = self._load_sttv_reward_functions()
+
+                            # Objective 1: answer correctness.
+                            answer_advantages, answer_returns = self._compute_sttv_grpo_advantages(
+                                token_level_rewards=batch.batch["token_level_rewards"],
+                                objective_mask=answer_mask,
+                                group_index=batch.non_tensor_batch["uid"],
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                            )
+                            batch.batch["advantages"] = answer_advantages
+                            batch.batch["returns"] = answer_returns
+                            batch.batch["sttv_adv_answer"] = answer_advantages
+                            batch.batch["sttv_mask_answer"] = answer_mask
+
+                            # Objective 3: loc calls.
+                            loc_mask = self._extract_sttv_mask_tensor(batch, "sttv_loc_mask")
+                            loc_score_tensor, total_loc_calls = self._compute_sttv_loc_call_reward_tensor(
+                                batch,
+                                sttv_reward_fns.get("loc"),
+                            )
+                            loc_advantages, _ = self._compute_sttv_grpo_advantages(
+                                token_level_rewards=loc_score_tensor,
+                                objective_mask=loc_mask,
+                                group_index=batch.non_tensor_batch["uid"],
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                            )
+                            batch.batch["sttv_adv_loc"] = loc_advantages
+                            batch.batch["sttv_mask_loc"] = loc_mask
+                            batch.batch["sttv_adv_loc_verifier"] = torch.zeros_like(answer_advantages)
+                            batch.batch["sttv_mask_loc_verifier"] = torch.zeros_like(answer_mask)
+                            metrics["sttv/loc_call_count"] = float(total_loc_calls)
+
+                            # Objective 2: verifier calls after <loc> (separate aux sub-batch).
+                            aux_rows = len(aux_batch) if aux_batch is not None else 0
+                            total_loc_verifier_calls = 0
+                            if aux_batch is not None and aux_rows > 0:
+                                if aux_old_log_prob is None:
+                                    aux_old_log_prob, _ = self._compute_old_log_prob_with_padding(aux_batch)
+                                if "entropys" in aux_old_log_prob.batch:
+                                    aux_old_log_prob.batch.pop("entropys")
+                                aux_batch = aux_batch.union(aux_old_log_prob)
+
+                                need_aux_ref_log_prob = self.use_reference_policy and bool(
+                                    self.config.actor_rollout_ref.actor.get("use_kl_loss", False)
+                                )
+                                if need_aux_ref_log_prob:
+                                    aux_ref_log_prob = self._compute_ref_log_prob_with_padding(aux_batch)
+                                    aux_batch = aux_batch.union(aux_ref_log_prob)
+
+                                aux_verifier_scores, total_loc_verifier_calls = self._compute_sttv_loc_verifier_reward_tensor(
+                                    aux_batch,
+                                    sttv_reward_fns.get("loc_verifier"),
+                                )
+                                aux_verifier_mask = aux_batch.batch["response_mask"].to(dtype=answer_mask.dtype)
+                                if aux_verifier_scores is None:
+                                    aux_verifier_advantages = torch.zeros_like(aux_verifier_mask, dtype=torch.float32)
+                                else:
+                                    aux_verifier_advantages, _ = self._compute_sttv_grpo_advantages(
+                                        token_level_rewards=aux_verifier_scores,
+                                        objective_mask=aux_verifier_mask,
+                                        group_index=aux_batch.non_tensor_batch["uid"],
+                                        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                    )
+
+                                aux_batch.batch["advantages"] = aux_verifier_advantages
+                                aux_batch.batch["sttv_adv_answer"] = torch.zeros_like(aux_verifier_advantages)
+                                aux_batch.batch["sttv_mask_answer"] = torch.zeros_like(aux_verifier_mask)
+                                aux_batch.batch["sttv_adv_loc"] = torch.zeros_like(aux_verifier_advantages)
+                                aux_batch.batch["sttv_mask_loc"] = torch.zeros_like(aux_verifier_mask)
+                                aux_batch.batch["sttv_adv_loc_verifier"] = aux_verifier_advantages
+                                aux_batch.batch["sttv_mask_loc_verifier"] = aux_verifier_mask
+
+                            metrics["sttv/loc_verifier_aux_rows"] = float(aux_rows)
+                            metrics["sttv/loc_verifier_call_count"] = float(total_loc_verifier_calls)
+
+                            actor_train_batch = self._compose_sttv_actor_batch(batch, aux_batch)
+                            actor_train_batch.meta_info.update(
+                                {
+                                    "sttv_multi_objective_enable": True,
+                                    "sttv_multi_objective_weights": self._get_sttv_multi_objective_weights(),
+                                }
+                            )
+                        else:
+                            batch = compute_advantage(
+                                batch,
+                                adv_estimator=self.config.algorithm.adv_estimator,
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                config=self.config.algorithm,
+                            )
+                            actor_train_batch = batch
 
                     # update critic
                     if self.use_critic:
@@ -1792,7 +2872,23 @@ class RayPPOTrainer:
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
-                            actor_output = self._update_actor(batch)
+                            actor_train_batch_for_update, actor_pad_size = self._pad_actor_batch_for_update(
+                                actor_train_batch
+                            )
+                            padded_batch_size = max(1, len(actor_train_batch_for_update))
+                            pad_ratio = float(actor_pad_size) / float(padded_batch_size)
+                            metrics["sttv/actor_update_pad_size"] = float(actor_pad_size)
+                            metrics["sttv/actor_update_pad_ratio"] = pad_ratio
+                            if pad_ratio > float(
+                                self.config.algorithm.get("sttv_multi_objective", {}).get(
+                                    "pad_ratio_warn_threshold", STTV_PAD_RATIO_WARN_THRESHOLD
+                                )
+                            ):
+                                print(
+                                    "[sttv] Warning: high actor update padding ratio "
+                                    f"{pad_ratio:.3f} (pad={actor_pad_size}, batch={padded_batch_size})"
+                                )
+                            actor_output = self._update_actor(actor_train_batch_for_update)
 
                         # update weights from trainer to rollout
                         with marked_timer("update_weights", timing_raw, color="red"):

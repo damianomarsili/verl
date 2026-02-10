@@ -171,6 +171,16 @@ class SttvAgentLoop(AgentLoopBase):
             return Image.open(BytesIO(image["bytes"])).convert("RGB")
         raise TypeError(f"Unsupported image type: {type(image)}")
 
+    def _serialize_image_bytes(self, image: Image.Image) -> dict[str, Any]:
+        buffer = BytesIO()
+        image.convert("RGB").save(buffer, format="PNG")
+        return {
+            "bytes": buffer.getvalue(),
+            "format": "PNG",
+            "width": image.width,
+            "height": image.height,
+        }
+
     def _normalize_images(self, images: Optional[list[Any]]) -> list[Image.Image]:
         if not images:
             return []
@@ -297,6 +307,75 @@ class SttvAgentLoop(AgentLoopBase):
         if not matches:
             return ""
         return matches[-1].strip()
+
+    def _extract_loc_token_spans(
+        self,
+        chunk: str,
+        *,
+        chunk_start: int,
+        chunk_token_count: int,
+    ) -> list[dict[str, Any]]:
+        """Extract token spans for <loc> calls in one assistant chunk.
+
+        Uses char-level span to token-level conversion; falls back to chunk-level
+        when an exact match cannot be established.
+        """
+        spans: list[dict[str, Any]] = []
+        if chunk_token_count <= 0:
+            return spans
+
+        def _encode_len(text: str) -> int:
+            if not text:
+                return 0
+            return len(self.tokenizer(text, add_special_tokens=False)["input_ids"])
+
+        loc_matches = list(re.finditer(r"(?is)<loc>.*?</loc>", chunk))
+        if not loc_matches and "<loc>" in chunk.lower():
+            loc_matches = [None]
+
+        if not loc_matches:
+            return spans
+
+        for match in loc_matches:
+            if match is None:
+                token_start = chunk_start
+                token_end = chunk_start + chunk_token_count
+                spans.append(
+                    {
+                        "token_start": token_start,
+                        "token_end": token_end,
+                        "text": chunk,
+                        "span_type": "chunk_fallback",
+                    }
+                )
+                continue
+
+            prefix = chunk[: match.start()]
+            loc_text = chunk[match.start() : match.end()]
+            prefix_tokens = _encode_len(prefix)
+            loc_tokens = _encode_len(loc_text)
+            token_start = chunk_start + prefix_tokens
+            token_end = token_start + max(1, loc_tokens)
+
+            chunk_end = chunk_start + chunk_token_count
+            if token_start >= chunk_end:
+                token_start = chunk_start
+                token_end = chunk_end
+                span_type = "chunk_fallback"
+            else:
+                token_end = min(token_end, chunk_end)
+                span_type = "exact"
+
+            spans.append(
+                {
+                    "token_start": token_start,
+                    "token_end": token_end,
+                    "text": loc_text,
+                    "span_type": span_type,
+                }
+            )
+
+        return spans
 
     def _split_image_prefix(self, chunk: str) -> Tuple[int, str]:
         match = re.match(r"\s*image_(\d+)\s*,\s*(.*)", chunk, flags=re.IGNORECASE)
@@ -498,6 +577,25 @@ class SttvAgentLoop(AgentLoopBase):
         max_new_tokens: int = 256,
         metrics: Optional[dict[str, Any]] = None,
     ) -> Tuple[str, list[int], list[float]]:
+        chunk, token_ids, log_probs, _ = await self._generate_once_with_prompt_ids(
+            messages=messages,
+            images=images,
+            sampling_params=sampling_params,
+            stop_sequences=stop_sequences,
+            max_new_tokens=max_new_tokens,
+            metrics=metrics,
+        )
+        return chunk, token_ids, log_probs
+
+    async def _generate_once_with_prompt_ids(
+        self,
+        messages: list[dict[str, object]],
+        images: list[Image.Image],
+        sampling_params: dict[str, Any],
+        stop_sequences: Optional[list[str]] = None,
+        max_new_tokens: int = 256,
+        metrics: Optional[dict[str, Any]] = None,
+    ) -> Tuple[str, list[int], list[float], list[int]]:
         prompt_ids = await self.apply_chat_template(messages, images=images)
         if stop_sequences:
             sampling_params = dict(sampling_params)
@@ -512,9 +610,9 @@ class SttvAgentLoop(AgentLoopBase):
         )
         chunk = self.tokenizer.decode(output.token_ids, skip_special_tokens=True)
         log_probs = output.log_probs or []
-        if metrics is not None and metrics.get("num_preempted") is None:
+        if metrics is not None and metrics.get("num_preempted", -1) == -1:
             metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
-        return chunk, output.token_ids, log_probs
+        return chunk, output.token_ids, log_probs, prompt_ids
 
     async def _append_user_message(
         self,
@@ -524,7 +622,7 @@ class SttvAgentLoop(AgentLoopBase):
         response_mask: list[int],
         response_logprobs: Optional[list[float]],
         images: Optional[list[Image.Image]] = None,
-    ) -> None:
+    ) -> int:
         add_messages = [{"role": "user", "content": [{"type": "text", "text": text}]}]
         messages.extend(add_messages)
         extra_prompt_ids = await self.apply_chat_template(
@@ -534,6 +632,7 @@ class SttvAgentLoop(AgentLoopBase):
         response_mask.extend([0] * len(extra_prompt_ids))
         if response_logprobs is not None:
             response_logprobs.extend([0.0] * len(extra_prompt_ids))
+        return len(extra_prompt_ids)
 
     def _append_injected_text(
         self,
@@ -542,13 +641,14 @@ class SttvAgentLoop(AgentLoopBase):
         train_prompt_ids: list[int],
         response_mask: list[int],
         response_logprobs: Optional[list[float]],
-    ) -> None:
+    ) -> int:
         output_chunks.append(text)
         token_ids = self.tokenizer(text, add_special_tokens=False)["input_ids"]
         train_prompt_ids.extend(token_ids)
         response_mask.extend([1] * len(token_ids))
         if response_logprobs is not None:
             response_logprobs.extend([0.0] * len(token_ids))
+        return len(token_ids)
 
     def _append_assistant_tokens(
         self,
@@ -559,7 +659,7 @@ class SttvAgentLoop(AgentLoopBase):
         response_mask: list[int],
         response_logprobs: Optional[list[float]],
         log_probs: list[float],
-    ) -> None:
+    ) -> int:
         output_chunks.append(chunk)
         train_prompt_ids.extend(token_ids)
         response_mask.extend([1] * len(token_ids))
@@ -568,6 +668,7 @@ class SttvAgentLoop(AgentLoopBase):
                 response_logprobs.extend(log_probs)
             else:
                 response_logprobs.extend([0.0] * len(token_ids))
+        return len(token_ids)
 
     async def _build_verifier_messages(
         self,
@@ -575,7 +676,7 @@ class SttvAgentLoop(AgentLoopBase):
         overlays: list[Image.Image],
         prompt: str,
         metrics: dict[str, Any],
-    ) -> str:
+    ) -> Tuple[str, list[int], list[int], list[dict[str, Any]]]:
         resized_originals = [self._resize_longest_side(img, self.verifier_image_side) for img in originals]
         resized_overlays = [self._resize_longest_side(img, self.verifier_image_side) for img in overlays]
 
@@ -589,14 +690,15 @@ class SttvAgentLoop(AgentLoopBase):
         messages = [{"role": "user", "content": content}]
 
         sampling_params = {"temperature": 0.0, "top_p": 1.0, "top_k": -1, "logprobs": False}
-        text, _, _ = await self._generate_once(
-            messages,
+        text, output_ids, _, prompt_ids = await self._generate_once_with_prompt_ids(
+            messages=messages,
             images=verifier_images,
             sampling_params=sampling_params,
             max_new_tokens=self.verifier_max_new_tokens,
             metrics=metrics,
         )
-        return text
+        serialized_images = [self._serialize_image_bytes(image) for image in verifier_images]
+        return text, prompt_ids, output_ids, serialized_images
 
     async def _run_self_verifier(
         self,
@@ -630,6 +732,11 @@ class SttvAgentLoop(AgentLoopBase):
         train_prompt_ids = list(initial_prompt_ids)
         response_mask: list[int] = []
         response_logprobs: Optional[list[float]] = [] if sampling_params.get("logprobs") else None
+        sttv_answer_mask: list[int] = []
+        sttv_loc_mask: list[int] = []
+        sttv_loc_calls: list[dict[str, Any]] = []
+        sttv_loc_verifier_calls: list[dict[str, Any]] = []
+        loc_call_counter = 0
 
         output_chunks: list[str] = []
         failures = 0
@@ -668,9 +775,70 @@ class SttvAgentLoop(AgentLoopBase):
                 cleaned = "Please adjust the coordinates to match the correct object"
             return f"That looks incorrect. {cleaned}. Please try again and update your prediction."
 
+        def _extend_objective_masks(answer_value: int, loc_value: int, count: int) -> None:
+            if count <= 0:
+                return
+            sttv_answer_mask.extend([answer_value] * count)
+            sttv_loc_mask.extend([loc_value] * count)
+
+        async def _append_user_turn(text: str) -> None:
+            appended = await self._append_user_message(
+                messages,
+                text,
+                train_prompt_ids,
+                response_mask,
+                response_logprobs,
+            )
+            _extend_objective_masks(answer_value=0, loc_value=0, count=appended)
+
+        def _append_verifier_injection(text: str) -> None:
+            appended = self._append_injected_text(
+                output_chunks,
+                text,
+                train_prompt_ids,
+                response_mask,
+                response_logprobs,
+            )
+            # Verifier injections are treated as non-answer/tool-like tokens.
+            _extend_objective_masks(answer_value=0, loc_value=0, count=appended)
+
+        def _append_assistant_turn(chunk: str, token_ids: list[int], log_probs: list[float]) -> None:
+            nonlocal loc_call_counter
+            chunk_start = len(response_mask)
+            appended = self._append_assistant_tokens(
+                output_chunks,
+                chunk,
+                token_ids,
+                train_prompt_ids,
+                response_mask,
+                response_logprobs,
+                log_probs,
+            )
+            _extend_objective_masks(answer_value=1, loc_value=0, count=appended)
+            for loc_span in self._extract_loc_token_spans(
+                chunk,
+                chunk_start=chunk_start,
+                chunk_token_count=appended,
+            ):
+                span_start = max(0, int(loc_span["token_start"]))
+                span_end = min(len(sttv_loc_mask), int(loc_span["token_end"]))
+                if span_end <= span_start:
+                    continue
+                sttv_loc_mask[span_start:span_end] = [1] * (span_end - span_start)
+                sttv_loc_calls.append(
+                    {
+                        "call_index": loc_call_counter,
+                        "token_start": span_start,
+                        "token_end": span_end,
+                        "text": loc_span.get("text", chunk),
+                        "span_type": loc_span.get("span_type", "chunk_fallback"),
+                    }
+                )
+                loc_call_counter += 1
+
         async def _inject_final_answer(prompt_prefix: str, max_new_tokens: int) -> str:
             nonlocal total_generated_tokens, assistant_turns, user_turns
-            await self._append_user_message(messages, prompt_prefix, train_prompt_ids, response_mask, response_logprobs)
+            await _append_user_turn(prompt_prefix)
             user_turns += 1
             chunk, token_ids, log_probs = await self._generate_once(
                 messages,
@@ -682,20 +850,23 @@ class SttvAgentLoop(AgentLoopBase):
             )
             total_generated_tokens += len(token_ids)
             assistant_turns += 1
-            self._append_assistant_tokens(
-                output_chunks,
-                chunk,
-                token_ids,
-                train_prompt_ids,
-                response_mask,
-                response_logprobs,
-                log_probs,
-            )
+            _append_assistant_turn(chunk, token_ids, log_probs)
             messages.append({"role": "assistant", "content": [{"type": "text", "text": chunk}]})
             return "".join(output_chunks)
 
         def _return_output() -> AgentLoopOutput:
             response_ids = train_prompt_ids[len(initial_prompt_ids) :]
+            max_response_len = min(len(response_ids), self.response_length)
+            clipped_loc_calls: list[dict[str, Any]] = []
+            for call in sttv_loc_calls:
+                token_start = max(0, int(call.get("token_start", 0)))
+                token_end = min(max_response_len, int(call.get("token_end", 0)))
+                if token_end <= token_start:
+                    continue
+                clipped = dict(call)
+                clipped["token_start"] = token_start
+                clipped["token_end"] = token_end
+                clipped_loc_calls.append(clipped)
             return AgentLoopOutput(
                 prompt_ids=initial_prompt_ids,
                 response_ids=response_ids[: self.response_length],
@@ -704,7 +875,12 @@ class SttvAgentLoop(AgentLoopBase):
                 multi_modal_data={"images": images} if images else {},
                 num_turns=user_turns + assistant_turns,
                 metrics=metrics,
-                extra_fields={},
+                extra_fields={
+                    "sttv_answer_mask": sttv_answer_mask[: self.response_length],
+                    "sttv_loc_mask": sttv_loc_mask[: self.response_length],
+                    "sttv_loc_calls": clipped_loc_calls,
+                    "sttv_loc_verifier_calls": sttv_loc_verifier_calls,
+                },
             )
 
         async def _run_self_verifier_once() -> Tuple[str, str, str]:
@@ -724,40 +900,16 @@ class SttvAgentLoop(AgentLoopBase):
             verdict, verifier_feedback, _ = await _run_self_verifier_once()
             if verdict == "correct":
                 self_verify_failures = 0
-                self._append_injected_text(
-                    output_chunks,
-                    "<verifier>self-verifier: correct</verifier>",
-                    train_prompt_ids,
-                    response_mask,
-                    response_logprobs,
-                )
+                _append_verifier_injection("<verifier>self-verifier: correct</verifier>")
                 return True
             self_verify_failures += 1
             if self_verify_failures >= self.verifier_max_attempts:
-                self._append_injected_text(
-                    output_chunks,
-                    "<verifier>self-verifier: max attempts reached</verifier>",
-                    train_prompt_ids,
-                    response_mask,
-                    response_logprobs,
-                )
+                _append_verifier_injection("<verifier>self-verifier: max attempts reached</verifier>")
                 return True
             feedback_text = self._format_self_verifier_feedback(verdict, verifier_feedback)
             if feedback_text:
-                self._append_injected_text(
-                    output_chunks,
-                    f"<verifier>{feedback_text}</verifier>",
-                    train_prompt_ids,
-                    response_mask,
-                    response_logprobs,
-                )
-                await self._append_user_message(
-                    messages,
-                    feedback_text,
-                    train_prompt_ids,
-                    response_mask,
-                    response_logprobs,
-                )
+                _append_verifier_injection(f"<verifier>{feedback_text}</verifier>")
+                await _append_user_turn(feedback_text)
                 user_turns += 1
                 solution_start_index = len(output_chunks)
                 return False
@@ -796,15 +948,7 @@ class SttvAgentLoop(AgentLoopBase):
 
             total_generated_tokens += len(token_ids)
             assistant_turns += 1
-            self._append_assistant_tokens(
-                output_chunks,
-                chunk,
-                token_ids,
-                train_prompt_ids,
-                response_mask,
-                response_logprobs,
-                log_probs,
-            )
+            _append_assistant_turn(chunk, token_ids, log_probs)
             messages.append({"role": "assistant", "content": [{"type": "text", "text": chunk}]})
 
             if total_generated_tokens >= max_total_tokens:
@@ -832,24 +976,12 @@ class SttvAgentLoop(AgentLoopBase):
             if not loc_payload:
                 if "<loc>" in chunk:
                     failures += 1
-                    self._append_injected_text(
-                        output_chunks,
-                        f"<verifier>{empty_loc_prompt}</verifier>",
-                        train_prompt_ids,
-                        response_mask,
-                        response_logprobs,
-                    )
+                    _append_verifier_injection(f"<verifier>{empty_loc_prompt}</verifier>")
                     if failures >= max_failed_loc_rounds:
                         if await _inject_and_verify(final_fail_prompt, count_step=True):
                             return _return_output()
                         continue
-                    await self._append_user_message(
-                        messages,
-                        empty_loc_prompt,
-                        train_prompt_ids,
-                        response_mask,
-                        response_logprobs,
-                    )
+                    await _append_user_turn(empty_loc_prompt)
                     continue
                 if self.depth_enabled and ("<depth>" in chunk or "<reason>" in chunk):
                     continue
@@ -864,24 +996,12 @@ class SttvAgentLoop(AgentLoopBase):
 
             if self._has_missing_label(loc_payload):
                 failures += 1
-                self._append_injected_text(
-                    output_chunks,
-                    f"<verifier>{missing_label_prompt}</verifier>",
-                    train_prompt_ids,
-                    response_mask,
-                    response_logprobs,
-                )
+                _append_verifier_injection(f"<verifier>{missing_label_prompt}</verifier>")
                 if failures >= max_failed_loc_rounds:
                     if await _inject_and_verify(final_fail_prompt, count_step=True):
                         return _return_output()
                     continue
-                await self._append_user_message(
-                    messages,
-                    missing_label_prompt,
-                    train_prompt_ids,
-                    response_mask,
-                    response_logprobs,
-                )
+                await _append_user_turn(missing_label_prompt)
                 continue
 
             normalized_payload = re.sub(r"\\s+", "", loc_payload)
@@ -894,67 +1014,33 @@ class SttvAgentLoop(AgentLoopBase):
                         return _return_output()
                     continue
 
-                self._append_injected_text(
-                    output_chunks,
-                    f"<verifier>{verifier_message}</verifier>",
-                    train_prompt_ids,
-                    response_mask,
-                    response_logprobs,
-                )
-                await self._append_user_message(
-                    messages,
+                _append_verifier_injection(f"<verifier>{verifier_message}</verifier>")
+                await _append_user_turn(
                     (
-                        f"{verifier_message}\\nYou repeated the same <loc> coordinates. "
+                        f"{verifier_message}\nYou repeated the same <loc> coordinates. "
                         "You must change them. Output only a corrected <loc> step."
-                    ),
-                    train_prompt_ids,
-                    response_mask,
-                    response_logprobs,
+                    )
                 )
                 continue
 
             entries = self._parse_loc_entries(loc_payload)
             if not entries:
                 failures += 1
-                self._append_injected_text(
-                    output_chunks,
-                    f"<verifier>{generic_format_prompt}</verifier>",
-                    train_prompt_ids,
-                    response_mask,
-                    response_logprobs,
-                )
+                _append_verifier_injection(f"<verifier>{generic_format_prompt}</verifier>")
                 if failures >= max_failed_loc_rounds:
                     if await _inject_and_verify(final_fail_prompt, count_step=True):
                         return _return_output()
                     continue
-                await self._append_user_message(
-                    messages,
-                    generic_format_prompt,
-                    train_prompt_ids,
-                    response_mask,
-                    response_logprobs,
-                )
+                await _append_user_turn(generic_format_prompt)
                 continue
             if self.instruction_mode == "box" and self._has_invalid_box(entries):
                 failures += 1
-                self._append_injected_text(
-                    output_chunks,
-                    f"<verifier>{generic_format_prompt}</verifier>",
-                    train_prompt_ids,
-                    response_mask,
-                    response_logprobs,
-                )
+                _append_verifier_injection(f"<verifier>{generic_format_prompt}</verifier>")
                 if failures >= max_failed_loc_rounds:
                     if await _inject_and_verify(final_fail_prompt, count_step=True):
                         return _return_output()
                     continue
-                await self._append_user_message(
-                    messages,
-                    generic_format_prompt,
-                    train_prompt_ids,
-                    response_mask,
-                    response_logprobs,
-                )
+                await _append_user_turn(generic_format_prompt)
                 continue
 
             entries_by_image: dict[int, list[LocEntry]] = {}
@@ -974,8 +1060,25 @@ class SttvAgentLoop(AgentLoopBase):
                 overlays.append(overlay)
 
             verifier_prompt = self._build_verifier_prompt(entries, len(images))
-            verifier_output = await self._build_verifier_messages(originals, overlays, verifier_prompt, metrics)
+            verifier_output, verifier_prompt_ids, verifier_output_ids, verifier_images = await self._build_verifier_messages(
+                originals,
+                overlays,
+                verifier_prompt,
+                metrics,
+            )
             verdict, _, verifier_feedback = self._parse_verifier_answer(verifier_output)
+            current_loc_call_index = sttv_loc_calls[-1]["call_index"] if sttv_loc_calls else -1
+            if current_loc_call_index >= 0:
+                sttv_loc_verifier_calls.append(
+                    {
+                        "call_index": int(current_loc_call_index),
+                        "verifier_prompt_text": verifier_prompt,
+                        "verifier_output_text": verifier_output,
+                        "verifier_prompt_token_ids": verifier_prompt_ids,
+                        "verifier_output_token_ids": verifier_output_ids,
+                        "verifier_images": verifier_images,
+                    }
+                )
 
             if verdict == "correct":
                 verifier_message = "That looks correct, you can proceed."
@@ -983,25 +1086,13 @@ class SttvAgentLoop(AgentLoopBase):
                 feedback_text = verifier_feedback or "adjust the coordinates to match the correct object."
                 verifier_message = _format_incorrect_message(feedback_text)
 
-            self._append_injected_text(
-                output_chunks,
-                f"<verifier>{verifier_message}</verifier>",
-                train_prompt_ids,
-                response_mask,
-                response_logprobs,
-            )
+            _append_verifier_injection(f"<verifier>{verifier_message}</verifier>")
             if verdict == "correct":
                 step_count += 1
                 if step_count >= self.max_steps:
                     await _inject_final_answer(f"{verifier_message}\n{final_answer_prompt}", self.max_final_answer_tokens)
                     return _return_output()
-                await self._append_user_message(
-                    messages,
-                    verifier_message,
-                    train_prompt_ids,
-                    response_mask,
-                    response_logprobs,
-                )
+                await _append_user_turn(verifier_message)
                 retry_expected = False
                 retry_payload = ""
                 last_verifier_feedback = ""
@@ -1016,14 +1107,10 @@ class SttvAgentLoop(AgentLoopBase):
                     return _return_output()
                 continue
 
-            await self._append_user_message(
-                messages,
+            await _append_user_turn(
                 (
                     f"{verifier_message}\nUse the verifier feedback above to correct your "
                     "last <loc> step. You must change at least one coordinate and should not repeat "
                     "the same <loc>. Output only a corrected <loc> step."
-                ),
-                train_prompt_ids,
-                response_mask,
-                response_logprobs,
+                )
             )
