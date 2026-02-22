@@ -32,7 +32,7 @@ import numpy as np
 import ray
 import torch
 from omegaconf import OmegaConf, open_dict
-from PIL import Image
+from PIL import Image, ImageDraw
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
@@ -498,7 +498,7 @@ class RayPPOTrainer:
         if close_match:
             content_end = content_start + close_match.start()
             return text[content_start:content_end].strip()
-        next_tag = re.search(r"(?is)<(reason|depth|loc|verifier|answer)>", text[content_start:])
+        next_tag = re.search(r"(?is)<(reason|depth|bbox_2d|verifier|answer)>", text[content_start:])
         if next_tag:
             content_end = content_start + next_tag.start()
             return text[content_start:content_end].strip()
@@ -560,6 +560,31 @@ class RayPPOTrainer:
             return [0]
         return indices
 
+    def _coerce_wandb_table_cell(self, value: Any, *, wandb_module: Any | None = None) -> Any:
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu()
+            if value.ndim == 0:
+                return value.item()
+            value = value.tolist()
+        if isinstance(value, np.ndarray):
+            value = value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, Image.Image):
+            if wandb_module is not None:
+                return wandb_module.Image(value)
+            return value
+        if value is not None and value.__class__.__module__.startswith("wandb"):
+            return value
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, (list, tuple, dict)):
+            try:
+                return json.dumps(value, ensure_ascii=False)
+            except Exception:
+                return str(value)
+        return str(value)
+
     def _maybe_log_sample_table(
         self,
         split: str,
@@ -567,6 +592,7 @@ class RayPPOTrainer:
         outputs: list[str],
         gts: list[object],
         scores: list[float],
+        extra_columns: Optional[dict[str, list[Any]]] = None,
     ) -> None:
         loggers = self.config.trainer.logger
         if isinstance(loggers, str):
@@ -588,6 +614,20 @@ class RayPPOTrainer:
         if n <= 0:
             return
 
+        normalized_extra_columns: dict[str, list[Any]] = {}
+        if extra_columns:
+            for key, values in extra_columns.items():
+                if isinstance(values, np.ndarray):
+                    values = values.tolist()
+                elif isinstance(values, tuple):
+                    values = list(values)
+                elif not isinstance(values, list):
+                    values = [values] * n
+                trimmed = values[:n]
+                if len(trimmed) < n:
+                    trimmed.extend([None] * (n - len(trimmed)))
+                normalized_extra_columns[str(key)] = trimmed
+
         indices = self._select_sample_indices(n, fraction)
 
         import wandb
@@ -602,6 +642,7 @@ class RayPPOTrainer:
             "ground_truth",
             "reward",
         ]
+        columns.extend(normalized_extra_columns.keys())
         rows = []
         for idx in indices:
             raw_prompt = raw_prompts[idx]
@@ -611,18 +652,24 @@ class RayPPOTrainer:
             image_value = self._format_image_for_wandb(image_entry)
             output_text = outputs[idx]
             final_answer = self._extract_final_answer(output_text)
-            rows.append(
-                [
-                    self.global_steps,
-                    split,
-                    query,
-                    image_value,
-                    output_text,
-                    final_answer,
-                    gts[idx],
-                    scores[idx],
-                ]
-            )
+            row = [
+                self.global_steps,
+                split,
+                query,
+                image_value,
+                output_text,
+                final_answer,
+                gts[idx],
+                scores[idx],
+            ]
+            for col_name in normalized_extra_columns.keys():
+                row.append(
+                    self._coerce_wandb_table_cell(
+                        normalized_extra_columns[col_name][idx],
+                        wandb_module=wandb,
+                    )
+                )
+            rows.append(row)
 
         table = wandb.Table(columns=columns, data=rows)
         wandb.log({f"{split}/samples": table}, step=self.global_steps)
@@ -660,6 +707,40 @@ class RayPPOTrainer:
 
         self._sttv_reward_fn_cache = reward_fns
         return reward_fns
+
+    def _coerce_sttv_bool(self, value: Any, default: bool) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        normalized = str(value).strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+        return default
+
+    def _get_sttv_reward_kwargs(self) -> dict[str, Any]:
+        reward_cfg = self.config.get("custom_reward_function") or {}
+
+        def _coerce_float(name: str, default: float) -> float:
+            raw = reward_cfg.get(name, default)
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                return default
+
+        return {
+            "sttv_sam3_confidence_threshold": _coerce_float("sttv_sam3_confidence_threshold", 0.5),
+            "sttv_sam3_device": str(reward_cfg.get("sttv_sam3_device", "cuda") or "cuda"),
+            "sttv_sam3_checkpoint_path": str(reward_cfg.get("sttv_sam3_checkpoint_path", "") or ""),
+            "sttv_sam3_load_from_hf": self._coerce_sttv_bool(
+                reward_cfg.get("sttv_sam3_load_from_hf", True),
+                True,
+            ),
+        }
 
     def _extract_sttv_mask_tensor(
         self,
@@ -740,6 +821,507 @@ class RayPPOTrainer:
             extra_infos.append(merged_extra)
 
         return data_sources, solution_strs, ground_truths, extra_infos
+
+    def _normalize_call_records_per_sample(
+        self,
+        raw_calls: Any,
+        *,
+        batch_size: int,
+    ) -> list[list[dict[str, Any]]]:
+        per_sample: list[list[dict[str, Any]]] = []
+        if raw_calls is None:
+            return [[] for _ in range(batch_size)]
+        for row in raw_calls:
+            if isinstance(row, np.ndarray):
+                row = row.tolist()
+            if not isinstance(row, (list, tuple)):
+                per_sample.append([])
+                continue
+            per_sample.append([entry for entry in row if isinstance(entry, dict)])
+        if len(per_sample) < batch_size:
+            per_sample.extend([[] for _ in range(batch_size - len(per_sample))])
+        return per_sample[:batch_size]
+
+    def _resize_image_for_log(self, image: Image.Image, max_side: int = 512) -> Image.Image:
+        width, height = image.size
+        longest = max(width, height)
+        if longest <= max_side:
+            return image
+        scale = float(max_side) / float(longest)
+        new_width = max(1, int(round(width * scale)))
+        new_height = max(1, int(round(height * scale)))
+        return image.resize((new_width, new_height))
+
+    def _concat_images_h(self, images: list[Image.Image]) -> Optional[Image.Image]:
+        if len(images) == 0:
+            return None
+        widths = [img.width for img in images]
+        heights = [img.height for img in images]
+        canvas = Image.new("RGB", (sum(widths), max(heights)), color=(255, 255, 255))
+        offset_x = 0
+        for image in images:
+            canvas.paste(image, (offset_x, 0))
+            offset_x += image.width
+        return canvas
+
+    def _draw_box_with_label(
+        self,
+        draw: ImageDraw.ImageDraw,
+        box_xyxy: Any,
+        *,
+        label: str,
+        outline: tuple[int, int, int],
+        image_size: Optional[tuple[int, int]] = None,
+    ) -> None:
+        if not isinstance(box_xyxy, (list, tuple)) or len(box_xyxy) < 4:
+            return
+        try:
+            x1, y1, x2, y2 = (float(box_xyxy[0]), float(box_xyxy[1]), float(box_xyxy[2]), float(box_xyxy[3]))
+        except Exception:
+            return
+        left = min(x1, x2)
+        top = min(y1, y2)
+        right = max(x1, x2)
+        bottom = max(y1, y2)
+        line_width = 8
+        if image_size is not None:
+            try:
+                min_side = float(min(int(image_size[0]), int(image_size[1])))
+                line_width = max(8, int(round(min_side * 0.016)))
+            except (TypeError, ValueError):
+                line_width = 8
+        draw.rectangle((left, top, right, bottom), outline=outline, width=line_width)
+        if label:
+            text_x = left + float(max(2, line_width // 2))
+            text_y = top + float(max(2, line_width // 2))
+            draw.text((text_x, text_y), label, fill=outline)
+
+    def _extract_original_images_from_verifier_call(self, verifier_call: dict[str, Any]) -> list[Image.Image]:
+        decoded_images = self._deserialize_sttv_images(verifier_call.get("verifier_images", []))
+        if len(decoded_images) == 0:
+            return []
+        originals = [image for idx, image in enumerate(decoded_images) if idx % 2 == 0]
+        return originals if len(originals) > 0 else decoded_images
+
+    def _decode_prompt_image_entry(self, image_entry: Any) -> Optional[Image.Image]:
+        if isinstance(image_entry, Image.Image):
+            return image_entry.convert("RGB")
+        if isinstance(image_entry, dict):
+            image_obj = image_entry.get("image")
+            if isinstance(image_obj, Image.Image):
+                return image_obj.convert("RGB")
+            image_bytes = image_entry.get("bytes")
+            if isinstance(image_bytes, (bytes, bytearray)):
+                try:
+                    return Image.open(BytesIO(image_bytes)).convert("RGB")
+                except Exception:
+                    return None
+            image_path = image_entry.get("path")
+            if image_path:
+                try:
+                    return Image.open(str(image_path)).convert("RGB")
+                except Exception:
+                    return None
+            return None
+        if isinstance(image_entry, (bytes, bytearray)):
+            try:
+                return Image.open(BytesIO(image_entry)).convert("RGB")
+            except Exception:
+                return None
+        return None
+
+    def _extract_original_images_from_raw_prompt(self, raw_prompt: Any) -> list[Image.Image]:
+        if isinstance(raw_prompt, np.ndarray):
+            raw_prompt = raw_prompt.tolist()
+        if not isinstance(raw_prompt, (list, tuple)):
+            return []
+        for message in raw_prompt:
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                break
+            images: list[Image.Image] = []
+            for item in content:
+                if not isinstance(item, dict) or item.get("type") != "image":
+                    continue
+                image = self._decode_prompt_image_entry(item)
+                if image is not None:
+                    images.append(image)
+            return images
+        return []
+
+    def _box_1000_to_xyxy_pixels(self, box_1000: Any, image: Image.Image) -> Optional[tuple[float, float, float, float]]:
+        if not isinstance(box_1000, (list, tuple)) or len(box_1000) < 4:
+            return None
+        width, height = image.size
+        if width <= 0 or height <= 0:
+            return None
+        try:
+            x1, y1, x2, y2 = (float(box_1000[0]), float(box_1000[1]), float(box_1000[2]), float(box_1000[3]))
+        except (TypeError, ValueError):
+            return None
+
+        def _scale(x: float, y: float) -> tuple[float, float]:
+            x_px = max(0, min(width - 1, int(round((x / 1000.0) * width))))
+            y_px = max(0, min(height - 1, int(round((y / 1000.0) * height))))
+            return float(x_px), float(y_px)
+
+        left_top = _scale(x1, y1)
+        right_bottom = _scale(x2, y2)
+        return (
+            float(min(left_top[0], right_bottom[0])),
+            float(min(left_top[1], right_bottom[1])),
+            float(max(left_top[0], right_bottom[0])),
+            float(max(left_top[1], right_bottom[1])),
+        )
+
+    def _extract_loc_box_xyxy_from_diagnostic(
+        self,
+        diagnostic: dict[str, Any],
+        image: Image.Image,
+    ) -> Optional[tuple[float, float, float, float]]:
+        predicted_box_xyxy = diagnostic.get("predicted_box_xyxy")
+        if isinstance(predicted_box_xyxy, (list, tuple)) and len(predicted_box_xyxy) >= 4:
+            try:
+                return (
+                    float(predicted_box_xyxy[0]),
+                    float(predicted_box_xyxy[1]),
+                    float(predicted_box_xyxy[2]),
+                    float(predicted_box_xyxy[3]),
+                )
+            except (TypeError, ValueError):
+                pass
+
+        predicted_box_1000 = diagnostic.get("predicted_box_1000")
+        if predicted_box_1000 is None:
+            predicted_box_1000 = diagnostic.get("matched_loc_box_1000")
+        return self._box_1000_to_xyxy_pixels(predicted_box_1000, image)
+
+    def _extract_sam3_boxes_from_diagnostic(self, diagnostic: dict[str, Any]) -> list[Any]:
+        boxes: list[Any] = []
+        sam3_boxes = diagnostic.get("sam3_boxes_xyxy")
+        if isinstance(sam3_boxes, (list, tuple)):
+            for sam3_box in sam3_boxes:
+                if isinstance(sam3_box, (list, tuple)) and len(sam3_box) >= 4:
+                    boxes.append(sam3_box)
+        sam3_box_single = diagnostic.get("sam3_box_xyxy")
+        if isinstance(sam3_box_single, (list, tuple)) and len(sam3_box_single) >= 4:
+            boxes.append(sam3_box_single)
+        return boxes
+
+    def _build_sttv_loc_and_sam3_plots(
+        self,
+        *,
+        verifier_calls: list[dict[str, Any]],
+        loc_calls: list[dict[str, Any]],
+        raw_prompt: Any,
+    ) -> tuple[Optional[Image.Image], Optional[Image.Image]]:
+        verifier_diag_calls: list[dict[str, Any]] = []
+        for call in verifier_calls:
+            eval_result = call.get("sttv_sam3_eval")
+            if isinstance(eval_result, dict) and isinstance(eval_result.get("prediction_diagnostics"), list):
+                verifier_diag_calls.append(call)
+
+        diagnostic_calls: list[dict[str, Any]] = []
+        originals: list[Image.Image] = []
+        if len(verifier_diag_calls) > 0:
+            diagnostic_calls = verifier_diag_calls
+            for call in reversed(verifier_diag_calls):
+                originals = self._extract_original_images_from_verifier_call(call)
+                if len(originals) > 0:
+                    break
+        else:
+            loc_diag_calls: list[dict[str, Any]] = []
+            for call in loc_calls:
+                eval_result = call.get("sttv_sam3_eval")
+                if isinstance(eval_result, dict) and isinstance(eval_result.get("prediction_diagnostics"), list):
+                    loc_diag_calls.append(call)
+            if len(loc_diag_calls) == 0:
+                return None, None
+            diagnostic_calls = loc_diag_calls
+            originals = self._extract_original_images_from_raw_prompt(raw_prompt)
+
+        if len(originals) == 0:
+            originals = self._extract_original_images_from_raw_prompt(raw_prompt)
+        if len(originals) == 0:
+            return None, None
+
+        diagnostics: list[dict[str, Any]] = []
+        for call in diagnostic_calls:
+            eval_result = call.get("sttv_sam3_eval", {})
+            if not isinstance(eval_result, dict):
+                continue
+            call_diagnostics = eval_result.get("prediction_diagnostics", [])
+            if not isinstance(call_diagnostics, list):
+                continue
+            for diagnostic in call_diagnostics:
+                if isinstance(diagnostic, dict):
+                    diagnostics.append(diagnostic)
+        if len(diagnostics) == 0:
+            return None, None
+
+        diagnostics_by_image: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for diagnostic in diagnostics:
+            try:
+                image_index = int(diagnostic.get("image_index", 1))
+            except (TypeError, ValueError):
+                image_index = 1
+            diagnostics_by_image[image_index].append(diagnostic)
+
+        loc_panels: list[Image.Image] = []
+        sam3_panels: list[Image.Image] = []
+        for image_index, image in enumerate(originals, start=1):
+            loc_image = image.copy()
+            sam3_image = image.copy()
+            loc_draw = ImageDraw.Draw(loc_image)
+            sam3_draw = ImageDraw.Draw(sam3_image)
+            for diagnostic in diagnostics_by_image.get(image_index, []):
+                label = str(diagnostic.get("label", "obj"))
+                loc_box_xyxy = self._extract_loc_box_xyxy_from_diagnostic(diagnostic, image)
+                self._draw_box_with_label(
+                    loc_draw,
+                    loc_box_xyxy,
+                    label=f"loc:{label}",
+                    outline=(220, 20, 20),
+                    image_size=image.size,
+                )
+                sam3_boxes = self._extract_sam3_boxes_from_diagnostic(diagnostic)
+                for box_idx, sam3_box in enumerate(sam3_boxes):
+                    self._draw_box_with_label(
+                        sam3_draw,
+                        sam3_box,
+                        label=f"sam3:{label}:{box_idx + 1}",
+                        outline=(20, 140, 20),
+                        image_size=image.size,
+                    )
+            loc_panels.append(self._resize_image_for_log(loc_image))
+            sam3_panels.append(self._resize_image_for_log(sam3_image))
+
+        return self._concat_images_h(loc_panels), self._concat_images_h(sam3_panels)
+
+    def _build_sttv_loc_reward_plot(
+        self,
+        loc_call_entries: list[dict[str, Any]],
+    ) -> Optional[Image.Image]:
+        if len(loc_call_entries) == 0:
+            return None
+        sorted_entries = sorted(
+            loc_call_entries,
+            key=lambda row: int(row.get("call_index", -1)),
+        )
+        bar_width = 34
+        left_pad = 24
+        right_pad = 12
+        top_pad = 22
+        bottom_pad = 34
+        width = max(220, left_pad + right_pad + bar_width * len(sorted_entries))
+        height = 180
+        baseline_y = height - bottom_pad
+        image = Image.new("RGB", (width, height), color=(255, 255, 255))
+        draw = ImageDraw.Draw(image)
+        draw.text((left_pad, 4), "loc reward per call", fill=(0, 0, 0))
+        draw.line((left_pad, baseline_y, width - right_pad, baseline_y), fill=(0, 0, 0), width=1)
+
+        for idx, entry in enumerate(sorted_entries):
+            try:
+                reward = float(entry.get("loc_reward", 0.0))
+            except (TypeError, ValueError):
+                reward = 0.0
+            reward = max(-1.0, min(1.0, reward))
+            bar_height = int(round(abs(reward) * 92.0))
+            x0 = left_pad + idx * bar_width + 5
+            x1 = x0 + bar_width - 10
+            if reward >= 0:
+                y0 = baseline_y - bar_height
+                y1 = baseline_y
+                color = (30, 140, 30)
+            else:
+                y0 = baseline_y
+                y1 = baseline_y + bar_height
+                color = (200, 40, 40)
+            draw.rectangle((x0, y0, x1, y1), fill=color, outline=(0, 0, 0))
+            call_index = int(entry.get("call_index", -1))
+            draw.text((x0, baseline_y + 2), f"c{call_index}", fill=(0, 0, 0))
+            draw.text((x0, max(0, y0 - 14)), f"{reward:.2f}", fill=(0, 0, 0))
+
+        return image
+
+    def _aggregate_sttv_aux_rewards_by_parent_row(
+        self,
+        *,
+        batch_size: int,
+        aux_batch: Optional[DataProto],
+        aux_scores: Optional[torch.Tensor],
+    ) -> list[float]:
+        aggregated = [0.0] * batch_size
+        if aux_batch is None or aux_scores is None or len(aux_batch) == 0:
+            return aggregated
+        scalar_scores = aux_scores.sum(dim=-1).detach().cpu().tolist()
+        parent_rows_raw = aux_batch.non_tensor_batch.get("sttv_parent_row_index")
+        if parent_rows_raw is None:
+            return aggregated
+        if isinstance(parent_rows_raw, np.ndarray):
+            parent_rows = parent_rows_raw.tolist()
+        else:
+            parent_rows = list(parent_rows_raw)
+        for row_idx_raw, score in zip(parent_rows, scalar_scores, strict=False):
+            try:
+                row_idx = int(row_idx_raw)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= row_idx < batch_size:
+                aggregated[row_idx] += float(score)
+        return aggregated
+
+    def _collect_sttv_sample_log_columns(
+        self,
+        *,
+        batch: DataProto,
+        answer_rewards: list[float],
+        loc_rewards: list[float],
+        loc_verifier_rewards: list[float],
+        global_rewards: list[float],
+        weights: dict[str, float],
+        raw_prompts: Optional[list[object]] = None,
+    ) -> dict[str, list[Any]]:
+        batch_size = len(batch)
+        answer_weight = float(weights.get("answer", 1.0))
+        loc_weight = float(weights.get("loc", 1.0))
+        loc_verifier_weight = float(weights.get("loc_verifier", 1.0))
+        answer_rewards_weighted = [float(answer_weight * reward) for reward in answer_rewards]
+        loc_rewards_weighted = [float(loc_weight * reward) for reward in loc_rewards]
+        loc_verifier_rewards_weighted = [float(loc_verifier_weight * reward) for reward in loc_verifier_rewards]
+        loc_calls_per_sample = self._normalize_call_records_per_sample(
+            batch.non_tensor_batch.get("sttv_loc_calls"),
+            batch_size=batch_size,
+        )
+        verifier_calls_per_sample = self._normalize_call_records_per_sample(
+            batch.non_tensor_batch.get("sttv_loc_verifier_calls"),
+            batch_size=batch_size,
+        )
+
+        loc_outputs_normalized: list[list[dict[str, Any]]] = []
+        sam3_outputs: list[list[dict[str, Any]]] = []
+        loc_call_rewards: list[list[dict[str, Any]]] = []
+        loc_plots: list[Optional[Image.Image]] = []
+        sam3_plots: list[Optional[Image.Image]] = []
+        loc_reward_plots: list[Optional[Image.Image]] = []
+        for sample_idx in range(batch_size):
+            loc_call_entries: list[dict[str, Any]] = []
+            for call in loc_calls_per_sample[sample_idx]:
+                loc_call_entries.append(
+                    {
+                        "call_index": int(call.get("call_index", -1)),
+                        "token_start": int(call.get("token_start", -1)),
+                        "token_end": int(call.get("token_end", -1)),
+                        "loc_reward": float(call.get("sttv_loc_reward", 0.0)),
+                    }
+                )
+            loc_call_rewards.append(loc_call_entries)
+            loc_reward_plots.append(self._build_sttv_loc_reward_plot(loc_call_entries))
+
+            normalized_entries: list[dict[str, Any]] = []
+            sam3_entries: list[dict[str, Any]] = []
+            for verifier_call in verifier_calls_per_sample[sample_idx]:
+                eval_result = verifier_call.get("sttv_sam3_eval", {})
+                if not isinstance(eval_result, dict):
+                    continue
+                call_index = int(verifier_call.get("call_index", -1))
+                prediction_diagnostics = eval_result.get("prediction_diagnostics", [])
+                if not isinstance(prediction_diagnostics, (list, tuple)):
+                    continue
+                for pred in prediction_diagnostics:
+                    if not isinstance(pred, dict):
+                        continue
+                    box_1000 = pred.get("predicted_box_1000")
+                    if box_1000 is None:
+                        box_1000 = pred.get("matched_loc_box_1000")
+                    sam3_boxes = pred.get("sam3_boxes_xyxy")
+                    if not isinstance(sam3_boxes, (list, tuple)):
+                        sam3_box_single = pred.get("sam3_box_xyxy")
+                        sam3_boxes = [sam3_box_single] if sam3_box_single is not None else []
+                    normalized_entries.append(
+                        {
+                            "call_index": call_index,
+                            "image_index": int(pred.get("image_index", 1)),
+                            "label": str(pred.get("label", "")),
+                            "box_1000": box_1000,
+                        }
+                    )
+                    sam3_entries.append(
+                        {
+                            "call_index": call_index,
+                            "image_index": int(pred.get("image_index", 1)),
+                            "label": str(pred.get("label", "")),
+                            "sam3_boxes_xyxy": sam3_boxes,
+                            "best_iou": float(pred.get("best_iou", 0.0)),
+                            "matched": bool(pred.get("matched", False)),
+                        }
+                    )
+            if len(sam3_entries) == 0:
+                for loc_call in loc_calls_per_sample[sample_idx]:
+                    eval_result = loc_call.get("sttv_sam3_eval", {})
+                    if not isinstance(eval_result, dict):
+                        continue
+                    call_index = int(loc_call.get("call_index", -1))
+                    prediction_diagnostics = eval_result.get("prediction_diagnostics", [])
+                    if not isinstance(prediction_diagnostics, (list, tuple)):
+                        continue
+                    for pred in prediction_diagnostics:
+                        if not isinstance(pred, dict):
+                            continue
+                        box_1000 = pred.get("predicted_box_1000")
+                        if box_1000 is None:
+                            box_1000 = pred.get("matched_loc_box_1000")
+                        sam3_boxes = pred.get("sam3_boxes_xyxy")
+                        if not isinstance(sam3_boxes, (list, tuple)):
+                            sam3_box_single = pred.get("sam3_box_xyxy")
+                            sam3_boxes = [sam3_box_single] if sam3_box_single is not None else []
+                        normalized_entries.append(
+                            {
+                                "call_index": call_index,
+                                "image_index": int(pred.get("image_index", 1)),
+                                "label": str(pred.get("label", "")),
+                                "box_1000": box_1000,
+                            }
+                        )
+                        sam3_entries.append(
+                            {
+                                "call_index": call_index,
+                                "image_index": int(pred.get("image_index", 1)),
+                                "label": str(pred.get("label", "")),
+                                "sam3_boxes_xyxy": sam3_boxes,
+                                "best_iou": float(pred.get("best_iou", 0.0)),
+                                "matched": bool(pred.get("matched", False)),
+                            }
+                        )
+            loc_outputs_normalized.append(normalized_entries)
+            sam3_outputs.append(sam3_entries)
+            raw_prompt = raw_prompts[sample_idx] if raw_prompts is not None and sample_idx < len(raw_prompts) else None
+            loc_plot, sam3_plot = self._build_sttv_loc_and_sam3_plots(
+                verifier_calls=verifier_calls_per_sample[sample_idx],
+                loc_calls=loc_calls_per_sample[sample_idx],
+                raw_prompt=raw_prompt,
+            )
+            loc_plots.append(loc_plot)
+            sam3_plots.append(sam3_plot)
+
+        return {
+            "sttv_answer_reward": answer_rewards,
+            "sttv_loc_reward": loc_rewards,
+            "sttv_loc_verifier_reward": loc_verifier_rewards,
+            "sttv_answer_reward_weighted": answer_rewards_weighted,
+            "sttv_loc_reward_weighted": loc_rewards_weighted,
+            "sttv_loc_verifier_reward_weighted": loc_verifier_rewards_weighted,
+            "sttv_global_reward": global_rewards,
+            "sttv_loc_plot": loc_plots,
+            "sttv_sam3_plot": sam3_plots,
+            "sttv_loc_reward_plot": loc_reward_plots,
+            "sttv_loc_outputs_norm": loc_outputs_normalized,
+            "sttv_sam3_outputs": sam3_outputs,
+            "sttv_loc_call_rewards": loc_call_rewards,
+        }
 
     def _normalize_per_sample_call_rewards(
         self,
@@ -844,6 +1426,7 @@ class RayPPOTrainer:
         self,
         batch: DataProto,
         reward_fn: Optional[Callable[..., Any]],
+        reward_kwargs: Optional[dict[str, Any]] = None,
     ) -> tuple[torch.Tensor, int]:
         response_mask = batch.batch["response_mask"]
         response_len = response_mask.shape[1]
@@ -872,6 +1455,16 @@ class RayPPOTrainer:
                 batch, include_solution_strs=False
             )
             solution_strs = [""] * len(batch)
+            raw_prompts_raw = batch.non_tensor_batch.get("raw_prompt")
+            if isinstance(raw_prompts_raw, np.ndarray):
+                raw_prompts = raw_prompts_raw.tolist()
+            elif raw_prompts_raw is None:
+                raw_prompts = [None] * len(batch)
+            else:
+                raw_prompts = list(raw_prompts_raw)
+            if len(raw_prompts) < len(batch):
+                raw_prompts.extend([None] * (len(batch) - len(raw_prompts)))
+
             uids_raw = batch.non_tensor_batch.get("uid", np.array(["unknown"] * len(batch), dtype=object))
             if isinstance(uids_raw, np.ndarray):
                 uids = [str(x) for x in uids_raw.tolist()]
@@ -902,7 +1495,9 @@ class RayPPOTrainer:
                     ground_truths=ground_truths,
                     extra_infos=extra_infos,
                     uids=uids,
+                    raw_prompts=raw_prompts,
                     loc_verifier_call_records=loc_verifier_call_records,
+                    **(reward_kwargs or {}),
                 )
             except TypeError:
                 raw_reward_values = reward_fn(data_sources, loc_call_records, solution_strs, ground_truths, extra_infos)
@@ -1157,6 +1752,7 @@ class RayPPOTrainer:
                     output_text = self.tokenizer.decode(output_token_ids, skip_special_tokens=True)
                 aux_rows.append(
                     {
+                        "parent_row_index": row_idx,
                         "uid": uid,
                         "call_index": call_index,
                         "call_record": call_record,
@@ -1192,6 +1788,7 @@ class RayPPOTrainer:
 
         aux_uids: list[str] = []
         parent_uids: list[str] = []
+        parent_row_indices: list[int] = []
         call_indices: list[int] = []
         call_records: list[dict[str, Any]] = []
         aux_data_sources: list[str] = []
@@ -1229,6 +1826,7 @@ class RayPPOTrainer:
             call_index = int(row["call_index"])
             aux_uids.append(f"{uid}::locv::{call_index}")
             parent_uids.append(uid)
+            parent_row_indices.append(int(row["parent_row_index"]))
             call_indices.append(call_index)
             call_records.append(row["call_record"])
             aux_data_sources.append(row["data_source"])
@@ -1266,6 +1864,7 @@ class RayPPOTrainer:
         non_tensors: dict[str, np.ndarray] = {
             "uid": np.array(aux_uids, dtype=object),
             "sttv_parent_uid": np.array(parent_uids, dtype=object),
+            "sttv_parent_row_index": np.array(parent_row_indices, dtype=np.int32),
             "sttv_loc_call_index": np.array(call_indices, dtype=np.int32),
             "sttv_loc_verifier_call_record": np.array(call_records, dtype=object),
             "data_source": np.array(aux_data_sources, dtype=object),
@@ -1286,6 +1885,7 @@ class RayPPOTrainer:
         self,
         aux_batch: Optional[DataProto],
         reward_fn: Optional[Callable[..., Any]],
+        reward_kwargs: Optional[dict[str, Any]] = None,
     ) -> tuple[Optional[torch.Tensor], int]:
         if aux_batch is None or len(aux_batch) == 0:
             return None, 0
@@ -1330,6 +1930,7 @@ class RayPPOTrainer:
                     ground_truths=ground_truths,
                     extra_infos=extra_infos,
                     parent_uids=parent_uids,
+                    **(reward_kwargs or {}),
                 )
             except TypeError:
                 raw_rewards = reward_fn(data_sources, call_records, solution_strs, ground_truths, extra_infos)
@@ -2707,12 +3308,12 @@ class RayPPOTrainer:
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
+                        sample_table_context: Optional[dict[str, list[Any]]] = None
                         # Log a sample table from training batches to wandb if enabled.
                         if float(self.config.trainer.get("log_sample_fraction", 0.0)) > 0:
                             outputs = self.tokenizer.batch_decode(
                                 batch.batch["responses"], skip_special_tokens=True
                             )
-                            scores = reward_tensor.sum(-1).cpu().tolist()
                             raw_prompts = batch.non_tensor_batch.get("raw_prompt", None)
                             if raw_prompts is not None:
                                 raw_prompts_list = raw_prompts.tolist()
@@ -2723,19 +3324,25 @@ class RayPPOTrainer:
                                 if hasattr(item, "non_tensor_batch")
                                 else None
                                 for item in batch
-                            ]
+                                ]
                             if not any(gts):
                                 gts = [
                                     item.non_tensor_batch.get("answer", None) if hasattr(item, "non_tensor_batch") else None
                                     for item in batch
                                 ]
-                            self._maybe_log_sample_table(
-                                split="train",
-                                raw_prompts=raw_prompts_list,
-                                outputs=outputs,
-                                gts=gts,
-                                scores=scores,
-                            )
+                            sample_table_context = {
+                                "raw_prompts": raw_prompts_list,
+                                "outputs": outputs,
+                                "gts": gts,
+                            }
+                            if not sttv_multi_objective_enabled:
+                                self._maybe_log_sample_table(
+                                    split="train",
+                                    raw_prompts=raw_prompts_list,
+                                    outputs=outputs,
+                                    gts=gts,
+                                    scores=reward_tensor.sum(-1).cpu().tolist(),
+                                )
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward and not sttv_multi_objective_enabled:
@@ -2768,6 +3375,7 @@ class RayPPOTrainer:
 
                         if sttv_multi_objective_enabled:
                             sttv_reward_fns = self._load_sttv_reward_functions()
+                            sttv_reward_kwargs = self._get_sttv_reward_kwargs()
 
                             # Objective 1: answer correctness.
                             answer_advantages, answer_returns = self._compute_sttv_grpo_advantages(
@@ -2786,6 +3394,7 @@ class RayPPOTrainer:
                             loc_score_tensor, total_loc_calls = self._compute_sttv_loc_call_reward_tensor(
                                 batch,
                                 sttv_reward_fns.get("loc"),
+                                reward_kwargs=sttv_reward_kwargs,
                             )
                             loc_advantages, _ = self._compute_sttv_grpo_advantages(
                                 token_level_rewards=loc_score_tensor,
@@ -2799,9 +3408,10 @@ class RayPPOTrainer:
                             batch.batch["sttv_mask_loc_verifier"] = torch.zeros_like(answer_mask)
                             metrics["sttv/loc_call_count"] = float(total_loc_calls)
 
-                            # Objective 2: verifier calls after <loc> (separate aux sub-batch).
+                            # Objective 2: verifier calls after <bbox_2d> (separate aux sub-batch).
                             aux_rows = len(aux_batch) if aux_batch is not None else 0
                             total_loc_verifier_calls = 0
+                            aux_verifier_scores: Optional[torch.Tensor] = None
                             if aux_batch is not None and aux_rows > 0:
                                 if aux_old_log_prob is None:
                                     aux_old_log_prob, _ = self._compute_old_log_prob_with_padding(aux_batch)
@@ -2819,6 +3429,7 @@ class RayPPOTrainer:
                                 aux_verifier_scores, total_loc_verifier_calls = self._compute_sttv_loc_verifier_reward_tensor(
                                     aux_batch,
                                     sttv_reward_fns.get("loc_verifier"),
+                                    reward_kwargs=sttv_reward_kwargs,
                                 )
                                 aux_verifier_mask = aux_batch.batch["response_mask"].to(dtype=answer_mask.dtype)
                                 if aux_verifier_scores is None:
@@ -2849,6 +3460,74 @@ class RayPPOTrainer:
                                     "sttv_multi_objective_weights": self._get_sttv_multi_objective_weights(),
                                 }
                             )
+                            answer_rewards = reward_tensor.sum(-1).detach().cpu().tolist()
+                            loc_rewards = loc_score_tensor.sum(-1).detach().cpu().tolist()
+                            loc_verifier_rewards = self._aggregate_sttv_aux_rewards_by_parent_row(
+                                batch_size=len(batch),
+                                aux_batch=aux_batch,
+                                aux_scores=aux_verifier_scores if aux_batch is not None else None,
+                            )
+                            weights = self._get_sttv_multi_objective_weights()
+                            metrics["sttv/reward_weight_answer"] = float(weights["answer"])
+                            metrics["sttv/reward_weight_loc"] = float(weights["loc"])
+                            metrics["sttv/reward_weight_loc_verifier"] = float(weights["loc_verifier"])
+                            answer_rewards_weighted = [
+                                float(weights["answer"]) * float(answer_reward) for answer_reward in answer_rewards
+                            ]
+                            loc_rewards_weighted = [float(weights["loc"]) * float(loc_reward) for loc_reward in loc_rewards]
+                            loc_verifier_rewards_weighted = [
+                                float(weights["loc_verifier"]) * float(loc_verifier_reward)
+                                for loc_verifier_reward in loc_verifier_rewards
+                            ]
+                            global_rewards = [
+                                answer_weighted + loc_weighted + loc_verifier_weighted
+                                for answer_weighted, loc_weighted, loc_verifier_weighted in zip(
+                                    answer_rewards_weighted,
+                                    loc_rewards_weighted,
+                                    loc_verifier_rewards_weighted,
+                                    strict=True,
+                                )
+                            ]
+                            metrics["sttv/reward_answer_mean"] = (
+                                float(np.mean(answer_rewards)) if len(answer_rewards) > 0 else 0.0
+                            )
+                            metrics["sttv/reward_loc_mean"] = float(np.mean(loc_rewards)) if len(loc_rewards) > 0 else 0.0
+                            metrics["sttv/reward_loc_verifier_mean"] = (
+                                float(np.mean(loc_verifier_rewards)) if len(loc_verifier_rewards) > 0 else 0.0
+                            )
+                            metrics["sttv/reward_global_mean"] = (
+                                float(np.mean(global_rewards)) if len(global_rewards) > 0 else 0.0
+                            )
+                            metrics["sttv/reward_answer_weighted_mean"] = (
+                                float(np.mean(answer_rewards_weighted)) if len(answer_rewards_weighted) > 0 else 0.0
+                            )
+                            metrics["sttv/reward_loc_weighted_mean"] = (
+                                float(np.mean(loc_rewards_weighted)) if len(loc_rewards_weighted) > 0 else 0.0
+                            )
+                            metrics["sttv/reward_loc_verifier_weighted_mean"] = (
+                                float(np.mean(loc_verifier_rewards_weighted))
+                                if len(loc_verifier_rewards_weighted) > 0
+                                else 0.0
+                            )
+
+                            if sample_table_context is not None:
+                                sttv_extra_columns = self._collect_sttv_sample_log_columns(
+                                    batch=batch,
+                                    answer_rewards=answer_rewards,
+                                    loc_rewards=loc_rewards,
+                                    loc_verifier_rewards=loc_verifier_rewards,
+                                    global_rewards=global_rewards,
+                                    weights=weights,
+                                    raw_prompts=sample_table_context["raw_prompts"],
+                                )
+                                self._maybe_log_sample_table(
+                                    split="train_sttv",
+                                    raw_prompts=sample_table_context["raw_prompts"],
+                                    outputs=sample_table_context["outputs"],
+                                    gts=sample_table_context["gts"],
+                                    scores=global_rewards,
+                                    extra_columns=sttv_extra_columns,
+                                )
                         else:
                             batch = compute_advantage(
                                 batch,

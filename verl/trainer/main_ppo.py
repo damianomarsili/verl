@@ -32,6 +32,19 @@ from verl.utils.device import auto_set_device, is_cuda_available
 from verl.utils.import_utils import load_extern_object
 
 
+def _task_runner_runtime_env(config) -> dict:
+    """Build optional runtime_env overrides for the TaskRunner actor.
+
+    STTV SAM3 reward executes inside TaskRunner. If the actor has no GPU reservation,
+    Ray sets CUDA_VISIBLE_DEVICES to empty by default, which makes torch.cuda unavailable.
+    """
+    reward_cfg = config.get("custom_reward_function") or {}
+    sam3_device = str(reward_cfg.get("sttv_sam3_device", "") or "").strip().lower()
+    if not sam3_device.startswith("cuda"):
+        return {}
+    return {"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}}
+
+
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
     """Main entry point for PPO training with Hydra configuration management.
@@ -85,6 +98,8 @@ def run_ppo(config, task_runner_class=None) -> None:
 
     # Create a remote instance of the TaskRunner class, and
     # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
+    task_runner_runtime_env = _task_runner_runtime_env(config)
+
     if (
         is_cuda_available
         and config.global_profiler.tool == "nsys"
@@ -99,11 +114,18 @@ def run_ppo(config, task_runner_class=None) -> None:
         nsight_options = OmegaConf.to_container(
             config.global_profiler.global_tool_config.nsys.controller_nsight_options
         )
-        runner = task_runner_class.options(
-            runtime_env={"nsight": nsight_options}
-        ).remote()
+        runtime_env = {"nsight": nsight_options}
+        if task_runner_runtime_env:
+            runtime_env = OmegaConf.merge(
+                OmegaConf.create(runtime_env), OmegaConf.create(task_runner_runtime_env)
+            )
+            runtime_env = OmegaConf.to_container(runtime_env, resolve=True)
+        runner = task_runner_class.options(runtime_env=runtime_env).remote()
     else:
-        runner = task_runner_class.remote()
+        if task_runner_runtime_env:
+            runner = task_runner_class.options(runtime_env=task_runner_runtime_env).remote()
+        else:
+            runner = task_runner_class.remote()
     ray.get(runner.run.remote(config))
 
     # [Optional] get the path of the timeline trace file from the configuration, default to None

@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -37,20 +38,15 @@ from verl.utils.profiler import simple_timer
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
-VERIFIER_BOX_RULES = """- The target object is the main content of the box.
-- The box covers most of the object.
-- The box is not wildly oversized"""
-
-VERIFIER_POINT_RULES = """- The point is fully enclosed on the target object."""
-
-POINT_COLOR = (0, 0, 255)
 BOX_COLOR = (0, 0, 255)
 BOX_FILL_RGBA = (0, 0, 255, 25)
-POINT_ALPHA = 150
 FONT_SCALE = 0.022
-POINT_RADIUS_SCALE = 0.012
 BOX_OUTLINE_SCALE = 0.005
 LABEL_PADDING = 2
+BBOX_2D_ENTRY_PATTERN = re.compile(
+    r'^\s*label\s*=\s*"(?P<label>[^"\n]+?)"\s*,\s*\[(?P<coords>[^\]]+)\]\s*$',
+    flags=re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -72,7 +68,7 @@ class SttvAgentLoop(AgentLoopBase):
         depth_enabled: bool = False,
         max_image_side: int = 768,
         verifier_image_side: int = 1024,
-        verifier_max_attempts: int = 3,
+        loc_verifier_rounds: int = 3,
         verifier_max_new_tokens: int = 96,
         max_steps: int = 8,
         max_new_tokens_per_chunk: int = 256,
@@ -86,15 +82,14 @@ class SttvAgentLoop(AgentLoopBase):
         self.response_length = config.actor_rollout_ref.rollout.response_length
 
         self.instruction_mode = instruction_mode.lower()
-        if self.instruction_mode not in {"point", "box"}:
-            raise ValueError(f"instruction_mode must be 'point' or 'box', got {instruction_mode}")
+        if self.instruction_mode != "box":
+            raise ValueError(f"Only box mode is supported; got instruction_mode={instruction_mode}")
         self.depth_enabled = self._coerce_bool(depth_enabled)
 
         self.max_image_side = int(max_image_side)
         self.verifier_image_side = int(verifier_image_side)
-        self.verifier_max_attempts = int(verifier_max_attempts)
+        self.loc_verifier_rounds = max(0, int(loc_verifier_rounds))
         self.verifier_max_new_tokens = int(verifier_max_new_tokens)
-        self.self_verifier_max_new_tokens = int(verifier_max_new_tokens)
 
         self.max_steps = int(max_steps)
         self.max_new_tokens_per_chunk = int(max_new_tokens_per_chunk)
@@ -104,19 +99,14 @@ class SttvAgentLoop(AgentLoopBase):
         if self.depth_enabled:
             prompt_file = prompts_dir / "sttv_verifier_depth.txt"
         else:
-            prompt_file = prompts_dir / "sttv_verifier.txt"
+            prompt_file = prompts_dir / "sttv_no_verifier_single_turn.txt"
         self.prompt_template = self._read_prompt_file(prompt_file)
-        self.instruction_text = self._read_prompt_file(
-            prompts_dir / ("instructions_pt.txt" if self.instruction_mode == "point" else "instructions_box.txt")
-        )
+        self.instruction_text = self._read_prompt_file(prompts_dir / "instructions_box.txt")
         self.depth_instruction_text = None
         if self.depth_enabled:
-            depth_file = prompts_dir / (
-                "instructions_depth_pt.txt" if self.instruction_mode == "point" else "instructions_depth_box.txt"
-            )
+            depth_file = prompts_dir / "instructions_depth_box.txt"
             self.depth_instruction_text = self._read_prompt_file(depth_file)
         self.verifier_template = self._read_prompt_file(prompts_dir / "verifier_instructions.txt")
-        self.self_verifier_template = self._read_prompt_file(prompts_dir / "self_verifier_instructions.txt")
 
     def _coerce_bool(self, value: Any) -> bool:
         if isinstance(value, bool):
@@ -237,35 +227,6 @@ class SttvAgentLoop(AgentLoopBase):
             return right - left, bottom - top
         return font.getsize(text)
 
-    def _overlay_points(self, image: Image.Image, entries: list[LocEntry]) -> Image.Image:
-        base = image.copy().convert("RGBA")
-        overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
-        draw = ImageDraw.Draw(overlay)
-        font = self._load_font(base)
-
-        width, height = base.size
-        radius = max(6, int(min(width, height) * POINT_RADIUS_SCALE))
-        idx = 1
-        for entry in entries:
-            x, y = self._scale_point(entry.coords[0], entry.coords[1], width, height)
-            draw.ellipse(
-                (x - radius, y - radius, x + radius, y + radius),
-                fill=(POINT_COLOR[0], POINT_COLOR[1], POINT_COLOR[2], POINT_ALPHA),
-                outline=POINT_COLOR,
-            )
-            label = f"{idx}:{entry.label}" if entry.label else str(idx)
-            text_w, text_h = self._measure_text(draw, label, font)
-            text_x = min(width - text_w - LABEL_PADDING, max(0, x + radius + LABEL_PADDING))
-            text_y = min(height - text_h - LABEL_PADDING, max(0, y - text_h - LABEL_PADDING))
-            draw.rectangle(
-                (text_x - LABEL_PADDING, text_y - LABEL_PADDING, text_x + text_w + LABEL_PADDING, text_y + text_h),
-                fill=(255, 255, 255, 200),
-            )
-            draw.text((text_x, text_y), label, fill=POINT_COLOR, font=font)
-            idx += 1
-
-        return Image.alpha_composite(base, overlay).convert("RGB")
-
     def _overlay_boxes(self, image: Image.Image, entries: list[LocEntry]) -> Image.Image:
         base = image.copy().convert("RGBA")
         overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
@@ -302,11 +263,13 @@ class SttvAgentLoop(AgentLoopBase):
 
         return Image.alpha_composite(base, overlay).convert("RGB")
 
-    def _extract_last_loc_payload(self, text: str) -> str:
-        matches = re.findall(r"(?is)<loc>(.*?)</loc>", text)
-        if not matches:
-            return ""
-        return matches[-1].strip()
+    def _extract_bbox_2d_payloads(self, text: str) -> list[str]:
+        if not text:
+            return []
+        payloads: list[str] = []
+        for raw_payload in re.findall(r"(?is)<bbox_2d>(.*?)</bbox_2d>", text):
+            payloads.append(str(raw_payload).strip())
+        return payloads
 
     def _extract_loc_token_spans(
         self,
@@ -315,7 +278,7 @@ class SttvAgentLoop(AgentLoopBase):
         chunk_start: int,
         chunk_token_count: int,
     ) -> list[dict[str, Any]]:
-        """Extract token spans for <loc> calls in one assistant chunk.
+        """Extract token spans for <bbox_2d> calls in one assistant chunk.
 
         Uses char-level span to token-level conversion; falls back to chunk-level
         when an exact match cannot be established.
@@ -329,11 +292,40 @@ class SttvAgentLoop(AgentLoopBase):
                 return 0
             return len(self.tokenizer(text, add_special_tokens=False)["input_ids"])
 
-        loc_matches = list(re.finditer(r"(?is)<loc>.*?</loc>", chunk))
-        if not loc_matches and "<loc>" in chunk.lower():
+        loc_matches = list(re.finditer(r"(?is)<bbox_2d>.*?</bbox_2d>", chunk))
+        if not loc_matches and "<bbox_2d>" in chunk.lower():
             loc_matches = [None]
 
         if not loc_matches:
+            return spans
+
+        # Strict single-block format: if multiple blocks appear in one chunk,
+        # treat them as one invalid span for one tool-call record.
+        if len(loc_matches) > 1:
+            first = loc_matches[0]
+            last = loc_matches[-1]
+            prefix = chunk[: first.start()]
+            loc_text = chunk[first.start() : last.end()]
+            prefix_tokens = _encode_len(prefix)
+            loc_tokens = _encode_len(loc_text)
+            token_start = chunk_start + prefix_tokens
+            token_end = token_start + max(1, loc_tokens)
+            chunk_end = chunk_start + chunk_token_count
+            if token_start >= chunk_end:
+                token_start = chunk_start
+                token_end = chunk_end
+                span_type = "chunk_fallback"
+            else:
+                token_end = min(token_end, chunk_end)
+                span_type = "merged_multi_block"
+            spans.append(
+                {
+                    "token_start": token_start,
+                    "token_end": token_end,
+                    "text": loc_text,
+                    "span_type": span_type,
+                }
+            )
             return spans
 
         for match in loc_matches:
@@ -377,57 +369,40 @@ class SttvAgentLoop(AgentLoopBase):
 
         return spans
 
-    def _split_image_prefix(self, chunk: str) -> Tuple[int, str]:
-        match = re.match(r"\s*image_(\d+)\s*,\s*(.*)", chunk, flags=re.IGNORECASE)
-        if match:
-            return int(match.group(1)), match.group(2).strip()
-        return 1, chunk.strip()
-
-    def _parse_loc_entries(self, payload: str) -> list[LocEntry]:
+    def _parse_bbox_2d_entries(self, payload: str) -> list[LocEntry]:
         entries: list[LocEntry] = []
-        chunks = [chunk.strip() for chunk in re.split(r"\s*;\s*", payload) if chunk.strip()]
-        last_label = ""
-        last_label_by_image: dict[int, str] = {}
-        for chunk in chunks:
-            image_idx, remainder = self._split_image_prefix(chunk)
-            if not remainder:
+        nonempty_line_count = 0
+        for raw_line in payload.splitlines():
+            line = raw_line.strip()
+            if not line:
                 continue
-            if ":" in remainder:
-                label, coords = remainder.split(":", 1)
-                label = label.strip()
-                last_label = label
-                last_label_by_image[image_idx] = label
-            else:
-                label = last_label_by_image.get(image_idx, last_label)
-                coords = remainder
-                if not label:
-                    continue
-            numbers = re.findall(r"-?\d+(?:\.\d+)?", coords)
-            if self.instruction_mode == "point" and len(numbers) >= 2:
-                coords_tuple = (float(numbers[0]), float(numbers[1]))
-            elif self.instruction_mode == "box" and len(numbers) >= 4:
-                coords_tuple = tuple(float(n) for n in numbers[:4])
-            else:
-                continue
-            entries.append(LocEntry(image_index=image_idx, label=label, coords=coords_tuple))
+            nonempty_line_count += 1
+            match = BBOX_2D_ENTRY_PATTERN.fullmatch(line)
+            if match is None:
+                return []
+
+            label = match.group("label").strip()
+            if not label:
+                return []
+
+            numbers = re.findall(r"-?\d+(?:\.\d+)?", match.group("coords"))
+            if len(numbers) != 4:
+                return []
+            coords_tuple = tuple(float(n) for n in numbers[:4])
+
+            entries.append(LocEntry(image_index=1, label=label, coords=coords_tuple))
+        if nonempty_line_count == 0:
+            return []
         return entries
 
     def _has_missing_label(self, payload: str) -> bool:
-        chunks = [chunk.strip() for chunk in re.split(r"\s*;\s*", payload) if chunk.strip()]
-        last_label = ""
-        last_label_by_image: dict[int, str] = {}
-        for chunk in chunks:
-            image_idx, remainder = self._split_image_prefix(chunk)
-            if not remainder:
+        for raw_line in payload.splitlines():
+            line = raw_line.strip()
+            if not line:
                 continue
-            if ":" in remainder:
-                label, _ = remainder.split(":", 1)
-                label = label.strip()
-                last_label = label
-                last_label_by_image[image_idx] = label
-                continue
-            label = last_label_by_image.get(image_idx, last_label)
-            if not label:
+            has_coords = bool(re.search(r"\[[^\]]*\]", line))
+            has_label = bool(re.search(r'(?i)\blabel\s*=\s*"', line))
+            if has_coords and not has_label:
                 return True
         return False
 
@@ -446,127 +421,55 @@ class SttvAgentLoop(AgentLoopBase):
 
         lines: list[str] = []
         for i, entry in enumerate(entries, 1):
-            prefix = f"image_{entry.image_index}," if image_count > 1 else ""
-            if self.instruction_mode == "box":
-                x1, y1, x2, y2 = entry.coords[:4]
-                lines.append(f"{i}) {prefix}{entry.label}:{int(x1)},{int(y1)},{int(x2)},{int(y2)}")
-            else:
-                x, y = entry.coords[:2]
-                lines.append(f"{i}) {prefix}{entry.label}:{int(x)},{int(y)}")
+            prefix = f"image_{entry.image_index}, " if image_count > 1 else ""
+            x1, y1, x2, y2 = entry.coords[:4]
+            lines.append(f'{i}) {prefix}label="{entry.label}", [{int(x1)}, {int(y1)}, {int(x2)}, {int(y2)}]')
 
         preds_str = "\n".join(lines) if lines else "(none)"
-        mode_word = "box" if self.instruction_mode == "box" else "point"
-        rules = VERIFIER_BOX_RULES if self.instruction_mode == "box" else VERIFIER_POINT_RULES
-        return self.verifier_template.format(
-            mode_word=mode_word,
-            targets=targets_str,
-            preds=preds_str,
-            rules=rules,
-        )
+        return self.verifier_template.format(targets=targets_str, preds=preds_str)
 
-    def _build_self_verifier_prompt(self, query: str, transcript: str) -> str:
-        return self.self_verifier_template.format(query=query.strip(), steps=transcript.strip())
+    def _parse_verifier_feedback(self, text: str) -> tuple[float, str, str]:
+        cleaned = text.replace("<|im_end|>", "").strip()
+        pq_score = 0.0
+        corrections = ""
+        payload_obj: Any = None
 
-    def _parse_verifier_answer(self, text: str) -> Tuple[str, str, str]:
-        text = text.replace("<|im_end|>", "").strip()
-        match = re.search(r"(?is)<answer>(.*?)</answer>", text)
-        cleaned = text.strip()
-        if not match:
-            return "incorrect", cleaned, cleaned
-
-        answer_text = match.group(1).strip()
-        tail = text[match.end() :].strip()
-        verdict_lower = answer_text.lower()
-
-        if verdict_lower.startswith("correct"):
-            return "correct", cleaned, ""
-
-        verdict = "incorrect"
-        if verdict_lower.startswith("incorrect"):
-            feedback = re.sub(r"(?is)^incorrect[:\\s-]*", "", answer_text).strip()
-        else:
-            feedback = answer_text.strip()
-
-        if tail:
-            feedback = f"{feedback} {tail}".strip() if feedback else tail
-        return verdict, cleaned, feedback
-
-    def _parse_self_verifier_answer(self, text: str) -> Tuple[str, str, str]:
-        text = text.replace("<|im_end|>", "").strip()
-        match = re.search(r"(?is)<answer>(.*?)</answer>", text)
-        cleaned = text.strip()
-        if not match:
-            return "incorrect", cleaned, cleaned
-
-        answer_text = match.group(1).strip()
-        tail = text[match.end() :].strip()
-        verdict_lower = answer_text.lower()
-
-        if verdict_lower.startswith(("valid", "correct")):
-            return "correct", cleaned, ""
-
-        verdict = "incorrect"
-        if verdict_lower.startswith("invalid"):
-            feedback = re.sub(r"(?is)^invalid[:\\s-]*", "", answer_text).strip()
-        elif verdict_lower.startswith("incorrect"):
-            feedback = re.sub(r"(?is)^incorrect[:\\s-]*", "", answer_text).strip()
-        else:
-            feedback = answer_text.strip()
-
-        if tail:
-            feedback = f"{feedback} {tail}".strip() if feedback else tail
-        return verdict, cleaned, feedback
-
-    def _format_self_verifier_feedback(self, verdict: str, feedback: str) -> str:
-        if verdict != "incorrect":
-            return ""
-        cleaned = feedback.strip()
+        candidates: list[str] = []
+        fenced_match = re.search(r"(?is)```(?:json)?\s*(\{.*?\})\s*```", cleaned)
+        if fenced_match:
+            candidates.append(fenced_match.group(1).strip())
+        brace_match = re.search(r"(?is)\{.*\}", cleaned)
+        if brace_match:
+            candidates.append(brace_match.group(0).strip())
         if cleaned:
-            cleaned = cleaned.rstrip(".!?")
-        if not cleaned:
-            cleaned = "please review your reasoning and update the final answer"
-        return f"I'm not happy with your solution. Here is some feedback: {cleaned}. Please retry with this feedback."
+            candidates.append(cleaned)
 
-    def _iter_tag_payloads(self, text: str) -> list[tuple[str, str]]:
-        entries: list[tuple[str, str]] = []
-        tag_open = re.compile(r"(?is)<(reason|depth|loc|answer)>")
-        i = 0
-        while True:
-            open_match = tag_open.search(text, i)
-            if not open_match:
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(parsed, dict):
+                payload_obj = parsed
                 break
-            tag = open_match.group(1).lower()
-            content_start = open_match.end()
-            close_match = re.search(rf"(?is)</{tag}>", text[content_start:])
-            if close_match:
-                content_end = content_start + close_match.start()
-                end_index = content_start + close_match.end()
+
+        if isinstance(payload_obj, dict):
+            raw_pq = payload_obj.get("pq_score_estimate", payload_obj.get("pq_score", payload_obj.get("pq", 0.0)))
+            try:
+                pq_score = float(raw_pq)
+            except (TypeError, ValueError):
+                pq_score = 0.0
+            pq_score = max(0.0, min(1.0, pq_score))
+
+            raw_corrections = payload_obj.get("corrections", "")
+            if isinstance(raw_corrections, list):
+                corrections = " ".join(str(item).strip() for item in raw_corrections if str(item).strip())
             else:
-                next_tag = re.search(r"(?is)<(reason|depth|loc|answer|verifier)>", text[content_start:])
-                if next_tag:
-                    content_end = content_start + next_tag.start()
-                    end_index = content_start + next_tag.start()
-                else:
-                    content_end = len(text)
-                    end_index = len(text)
-            payload = text[content_start:content_end].strip()
-            entries.append((tag, payload))
-            i = end_index
-        return entries
+                corrections = str(raw_corrections).strip()
 
-    def _collapse_for_self_verifier(self, text: str) -> str:
-        cleaned_text = re.sub(r"(?is)<verifier>.*?</verifier>", "", text).strip()
-        entries = self._iter_tag_payloads(cleaned_text)
-        if not entries:
-            return cleaned_text
-
-        parts: list[str] = []
-        for tag, payload in entries:
-            if tag == "reason":
-                parts.append(f"<reason>{payload}</reason>")
-            elif tag == "answer":
-                parts.append(f"<answer>{payload}</answer>")
-        return "\n".join(parts) if parts else ""
+        if not corrections:
+            corrections = cleaned
+        return pq_score, corrections, cleaned
 
     async def _generate_once(
         self,
@@ -700,23 +603,6 @@ class SttvAgentLoop(AgentLoopBase):
         serialized_images = [self._serialize_image_bytes(image) for image in verifier_images]
         return text, prompt_ids, output_ids, serialized_images
 
-    async def _run_self_verifier(
-        self,
-        visuals: list[Image.Image],
-        prompt: str,
-        metrics: dict[str, Any],
-    ) -> str:
-        messages = self._build_messages(prompt, visuals)
-        sampling_params = {"temperature": 0.0, "top_p": 1.0, "top_k": -1, "logprobs": False}
-        text, _, _ = await self._generate_once(
-            messages,
-            images=visuals,
-            sampling_params=sampling_params,
-            max_new_tokens=self.self_verifier_max_new_tokens,
-            metrics=metrics,
-        )
-        return text
-
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         raw_messages = list(kwargs["raw_prompt"])
         query = self._extract_query(raw_messages)
@@ -740,40 +626,43 @@ class SttvAgentLoop(AgentLoopBase):
 
         output_chunks: list[str] = []
         failures = 0
-        retry_expected = False
-        retry_payload = ""
-        last_verifier_feedback = ""
         step_count = 0
         max_total_tokens = self.max_steps * self.max_new_tokens_per_chunk
         total_generated_tokens = 0
         max_failed_loc_rounds = 3
         max_empty_generation_attempts = 3
-        self_verify_failures = 0
         missing_loc_failures = 0
         empty_generation_failures = 0
-        solution_start_index = 0
 
         final_answer_prompt = "I can now predict the final answer which is: "
         final_fail_prompt = (
             "I am unable to locate the objects correctly. Provide a final <reason> step and then the final <answer>."
         )
-        empty_loc_prompt = "You did not place an object in your <loc> tags, please review the format and try again."
-        missing_label_prompt = (
-            "You did not label the object you are detecting, please add the object name before the coordinates."
+        bbox_line_format = (
+            'label="object_name", [x_min, y_min, x_max, y_max]'
+            if self.instruction_mode == "box"
+            else 'label="object_name", [x, y]'
         )
-        generic_format_prompt = "There was a formatting error with your <loc> predictions, please review the format and try again."
+        empty_loc_prompt = (
+            "You did not place an object in your <bbox_2d> tags. "
+            "Output exactly one <bbox_2d> block with one line per object."
+        )
+        missing_label_prompt = (
+            "Missing required label syntax. Output exactly one <bbox_2d> block and "
+            f"use one line per object as: {bbox_line_format}."
+        )
+        generic_format_prompt = (
+            "Formatting error in <bbox_2d>. Output exactly one <bbox_2d> block and "
+            f"use ONLY lines in this exact format: {bbox_line_format}."
+        )
+        multi_block_prompt = (
+            "Do not output multiple <bbox_2d> blocks. Output exactly one <bbox_2d> block "
+            "and put one object per line inside that single block."
+        )
 
         metrics: dict[str, Any] = {"generate_sequences": 0.0, "tool_calls": 0.0, "num_preempted": -1}
         user_turns = 1
         assistant_turns = 0
-
-        def _format_incorrect_message(feedback: str) -> str:
-            cleaned = feedback.strip()
-            if cleaned:
-                cleaned = cleaned.rstrip(".!?")
-            if not cleaned:
-                cleaned = "Please adjust the coordinates to match the correct object"
-            return f"That looks incorrect. {cleaned}. Please try again and update your prediction."
 
         def _extend_objective_masks(answer_value: int, loc_value: int, count: int) -> None:
             if count <= 0:
@@ -883,49 +772,6 @@ class SttvAgentLoop(AgentLoopBase):
                 },
             )
 
-        async def _run_self_verifier_once() -> Tuple[str, str, str]:
-            current_output = "".join(output_chunks[solution_start_index:])
-            collapsed = self._collapse_for_self_verifier(current_output)
-            if not collapsed.strip():
-                collapsed = re.sub(r"(?is)<verifier>.*?</verifier>", "", current_output)
-                collapsed = re.sub(r"(?is)<(loc|depth)>.*?</\1>", "", collapsed)
-                collapsed = collapsed.strip()
-            prompt = self._build_self_verifier_prompt(query, collapsed)
-            self_verifier_output = await self._run_self_verifier(images, prompt, metrics)
-            verdict, _, verifier_feedback = self._parse_self_verifier_answer(self_verifier_output)
-            return verdict, verifier_feedback, prompt
-
-        async def _handle_self_verifier() -> bool:
-            nonlocal self_verify_failures, solution_start_index, user_turns
-            verdict, verifier_feedback, _ = await _run_self_verifier_once()
-            if verdict == "correct":
-                self_verify_failures = 0
-                _append_verifier_injection("<verifier>self-verifier: correct</verifier>")
-                return True
-            self_verify_failures += 1
-            if self_verify_failures >= self.verifier_max_attempts:
-                _append_verifier_injection("<verifier>self-verifier: max attempts reached</verifier>")
-                return True
-            feedback_text = self._format_self_verifier_feedback(verdict, verifier_feedback)
-            if feedback_text:
-                _append_verifier_injection(f"<verifier>{feedback_text}</verifier>")
-                await _append_user_turn(feedback_text)
-                user_turns += 1
-                solution_start_index = len(output_chunks)
-                return False
-            return True
-
-        async def _inject_and_verify(
-            prefix: str,
-            max_new_tokens: int = None,
-            count_step: bool = False,
-        ) -> bool:
-            nonlocal step_count
-            if count_step:
-                step_count += 1
-            await _inject_final_answer(prefix, max_new_tokens or self.max_new_tokens_per_chunk)
-            return await _handle_self_verifier()
-
         while True:
             if len(response_mask) >= self.response_length:
                 return _return_output()
@@ -934,7 +780,7 @@ class SttvAgentLoop(AgentLoopBase):
                 messages,
                 images=images,
                 sampling_params=sampling_params,
-                stop_sequences=["</loc>", "</answer>"],
+                stop_sequences=["</bbox_2d>"],
                 max_new_tokens=self.max_new_tokens_per_chunk,
                 metrics=metrics,
             )
@@ -955,8 +801,11 @@ class SttvAgentLoop(AgentLoopBase):
                 await _inject_final_answer(final_answer_prompt, self.max_final_answer_tokens)
                 return _return_output()
             if "</answer>" in chunk:
-                if await _handle_self_verifier():
-                    return _return_output()
+                _append_verifier_injection("<verifier>You must predict <bbox_2d> before <reason> and <answer>.</verifier>")
+                await _append_user_turn(
+                    "First output only one <bbox_2d> block with all objects listed inside it. "
+                    f"Use one line per object in this exact format: {bbox_line_format}."
+                )
                 continue
 
             reason_steps = len(re.findall(r"(?is)<reason>.*?</reason>", chunk))
@@ -972,16 +821,16 @@ class SttvAgentLoop(AgentLoopBase):
                 await _inject_final_answer(final_answer_prompt, self.max_final_answer_tokens)
                 return _return_output()
 
-            loc_payload = self._extract_last_loc_payload(chunk)
-            if not loc_payload:
-                if "<loc>" in chunk:
+            loc_payloads = self._extract_bbox_2d_payloads(chunk)
+            if len(loc_payloads) != 1:
+                if "<bbox_2d>" in chunk.lower():
                     failures += 1
-                    _append_verifier_injection(f"<verifier>{empty_loc_prompt}</verifier>")
+                    prompt_text = multi_block_prompt if len(loc_payloads) > 1 else empty_loc_prompt
+                    _append_verifier_injection(f"<verifier>{prompt_text}</verifier>")
                     if failures >= max_failed_loc_rounds:
-                        if await _inject_and_verify(final_fail_prompt, count_step=True):
-                            return _return_output()
-                        continue
-                    await _append_user_turn(empty_loc_prompt)
+                        await _inject_final_answer(final_fail_prompt, self.max_final_answer_tokens)
+                        return _return_output()
+                    await _append_user_turn(prompt_text)
                     continue
                 if self.depth_enabled and ("<depth>" in chunk or "<reason>" in chunk):
                     continue
@@ -989,128 +838,146 @@ class SttvAgentLoop(AgentLoopBase):
                 if missing_loc_failures >= max_failed_loc_rounds:
                     await _inject_final_answer(final_fail_prompt, self.max_final_answer_tokens)
                     return _return_output()
-                if await _inject_and_verify(final_answer_prompt):
-                    return _return_output()
-                continue
+                await _inject_final_answer(final_answer_prompt, self.max_final_answer_tokens)
+                return _return_output()
+            loc_payload = loc_payloads[0]
             missing_loc_failures = 0
 
             if self._has_missing_label(loc_payload):
                 failures += 1
                 _append_verifier_injection(f"<verifier>{missing_label_prompt}</verifier>")
                 if failures >= max_failed_loc_rounds:
-                    if await _inject_and_verify(final_fail_prompt, count_step=True):
-                        return _return_output()
-                    continue
+                    await _inject_final_answer(final_fail_prompt, self.max_final_answer_tokens)
+                    return _return_output()
                 await _append_user_turn(missing_label_prompt)
                 continue
 
-            normalized_payload = re.sub(r"\\s+", "", loc_payload)
-            if retry_expected and normalized_payload == re.sub(r"\\s+", "", retry_payload):
-                failures += 1
-                feedback_text = last_verifier_feedback or "adjust the coordinates to match the correct object."
-                verifier_message = _format_incorrect_message(feedback_text)
-                if failures >= max_failed_loc_rounds:
-                    if await _inject_and_verify(final_fail_prompt, count_step=True):
-                        return _return_output()
-                    continue
-
-                _append_verifier_injection(f"<verifier>{verifier_message}</verifier>")
-                await _append_user_turn(
-                    (
-                        f"{verifier_message}\nYou repeated the same <loc> coordinates. "
-                        "You must change them. Output only a corrected <loc> step."
-                    )
-                )
-                continue
-
-            entries = self._parse_loc_entries(loc_payload)
+            entries = self._parse_bbox_2d_entries(loc_payload)
             if not entries:
                 failures += 1
                 _append_verifier_injection(f"<verifier>{generic_format_prompt}</verifier>")
                 if failures >= max_failed_loc_rounds:
-                    if await _inject_and_verify(final_fail_prompt, count_step=True):
-                        return _return_output()
-                    continue
+                    await _inject_final_answer(final_fail_prompt, self.max_final_answer_tokens)
+                    return _return_output()
                 await _append_user_turn(generic_format_prompt)
                 continue
-            if self.instruction_mode == "box" and self._has_invalid_box(entries):
+            if self._has_invalid_box(entries):
                 failures += 1
                 _append_verifier_injection(f"<verifier>{generic_format_prompt}</verifier>")
                 if failures >= max_failed_loc_rounds:
-                    if await _inject_and_verify(final_fail_prompt, count_step=True):
-                        return _return_output()
-                    continue
+                    await _inject_final_answer(final_fail_prompt, self.max_final_answer_tokens)
+                    return _return_output()
                 await _append_user_turn(generic_format_prompt)
                 continue
 
-            entries_by_image: dict[int, list[LocEntry]] = {}
-            for entry in entries:
-                entries_by_image.setdefault(entry.image_index, []).append(entry)
+            current_entries = entries
+            for verifier_round in range(self.loc_verifier_rounds):
+                entries_by_image: dict[int, list[LocEntry]] = {}
+                for entry in current_entries:
+                    entries_by_image.setdefault(entry.image_index, []).append(entry)
 
-            originals: list[Image.Image] = []
-            overlays: list[Image.Image] = []
-            for image_idx in range(1, len(raw_images) + 1):
-                original = raw_images[image_idx - 1].convert("RGB")
-                image_entries = entries_by_image.get(image_idx, [])
-                if self.instruction_mode == "point":
-                    overlay = self._overlay_points(original, image_entries)
-                else:
+                originals: list[Image.Image] = []
+                overlays: list[Image.Image] = []
+                for image_idx in range(1, len(raw_images) + 1):
+                    original = raw_images[image_idx - 1].convert("RGB")
+                    image_entries = entries_by_image.get(image_idx, [])
                     overlay = self._overlay_boxes(original, image_entries)
-                originals.append(original)
-                overlays.append(overlay)
+                    originals.append(original)
+                    overlays.append(overlay)
 
-            verifier_prompt = self._build_verifier_prompt(entries, len(images))
-            verifier_output, verifier_prompt_ids, verifier_output_ids, verifier_images = await self._build_verifier_messages(
-                originals,
-                overlays,
-                verifier_prompt,
-                metrics,
-            )
-            verdict, _, verifier_feedback = self._parse_verifier_answer(verifier_output)
-            current_loc_call_index = sttv_loc_calls[-1]["call_index"] if sttv_loc_calls else -1
-            if current_loc_call_index >= 0:
-                sttv_loc_verifier_calls.append(
-                    {
-                        "call_index": int(current_loc_call_index),
-                        "verifier_prompt_text": verifier_prompt,
-                        "verifier_output_text": verifier_output,
-                        "verifier_prompt_token_ids": verifier_prompt_ids,
-                        "verifier_output_token_ids": verifier_output_ids,
-                        "verifier_images": verifier_images,
-                    }
+                verifier_prompt = self._build_verifier_prompt(current_entries, len(images))
+                verifier_output, verifier_prompt_ids, verifier_output_ids, verifier_images = await self._build_verifier_messages(
+                    originals,
+                    overlays,
+                    verifier_prompt,
+                    metrics,
+                )
+                pq_score, corrections, _ = self._parse_verifier_feedback(verifier_output)
+                current_loc_call_index = sttv_loc_calls[-1]["call_index"] if sttv_loc_calls else -1
+                if current_loc_call_index >= 0:
+                    sttv_loc_verifier_calls.append(
+                        {
+                            "call_index": int(current_loc_call_index),
+                            "round_index": int(verifier_round),
+                            "pq_score_estimate": float(pq_score),
+                            "corrections": str(corrections),
+                            "verifier_prompt_text": verifier_prompt,
+                            "verifier_output_text": verifier_output,
+                            "verifier_prompt_token_ids": verifier_prompt_ids,
+                            "verifier_output_token_ids": verifier_output_ids,
+                            "verifier_images": verifier_images,
+                        }
+                    )
+
+                round_message = (
+                    f"Verifier round {verifier_round + 1}/{self.loc_verifier_rounds}: "
+                    f"estimated PQ={pq_score:.3f}. Corrections: {corrections}"
+                )
+                _append_verifier_injection(f"<verifier>{round_message}</verifier>")
+                await _append_user_turn(
+                    (
+                        f"{round_message}\nRewrite your <bbox_2d> to improve the estimated PQ. "
+                        f"Output ONLY one corrected <bbox_2d> block using lines formatted as {bbox_line_format}."
+                    )
                 )
 
-            if verdict == "correct":
-                verifier_message = "That looks correct, you can proceed."
-            else:
-                feedback_text = verifier_feedback or "adjust the coordinates to match the correct object."
-                verifier_message = _format_incorrect_message(feedback_text)
+                correction_chunk, correction_token_ids, correction_log_probs = await self._generate_once(
+                    messages,
+                    images=images,
+                    sampling_params=sampling_params,
+                    stop_sequences=["</bbox_2d>"],
+                    max_new_tokens=self.max_new_tokens_per_chunk,
+                    metrics=metrics,
+                )
+                total_generated_tokens += len(correction_token_ids)
+                assistant_turns += 1
+                _append_assistant_turn(correction_chunk, correction_token_ids, correction_log_probs)
+                messages.append({"role": "assistant", "content": [{"type": "text", "text": correction_chunk}]})
 
-            _append_verifier_injection(f"<verifier>{verifier_message}</verifier>")
-            if verdict == "correct":
-                step_count += 1
-                if step_count >= self.max_steps:
-                    await _inject_final_answer(f"{verifier_message}\n{final_answer_prompt}", self.max_final_answer_tokens)
-                    return _return_output()
-                await _append_user_turn(verifier_message)
-                retry_expected = False
-                retry_payload = ""
-                last_verifier_feedback = ""
-                continue
-
-            failures += 1
-            retry_expected = True
-            retry_payload = loc_payload
-            last_verifier_feedback = verifier_feedback
-            if failures >= max_failed_loc_rounds:
-                if await _inject_and_verify(final_fail_prompt, count_step=True):
-                    return _return_output()
-                continue
+                corrected_payloads = self._extract_bbox_2d_payloads(correction_chunk)
+                if len(corrected_payloads) != 1:
+                    correction_error = (
+                        "<verifier>Correction output has multiple <bbox_2d> blocks. "
+                        "Keeping previous prediction.</verifier>"
+                        if len(corrected_payloads) > 1
+                        else "<verifier>Correction output missing <bbox_2d>. Keeping previous prediction.</verifier>"
+                    )
+                    _append_verifier_injection(
+                        correction_error
+                    )
+                    continue
+                corrected_payload = corrected_payloads[0]
+                if self._has_missing_label(corrected_payload):
+                    _append_verifier_injection(
+                        "<verifier>Correction formatting invalid (missing label). Keeping previous prediction.</verifier>"
+                    )
+                    continue
+                corrected_entries = self._parse_bbox_2d_entries(corrected_payload)
+                if not corrected_entries:
+                    _append_verifier_injection(
+                        "<verifier>Correction formatting invalid. Keeping previous prediction.</verifier>"
+                    )
+                    continue
+                if self._has_invalid_box(corrected_entries):
+                    _append_verifier_injection(
+                        "<verifier>Correction contains invalid box geometry. Keeping previous prediction.</verifier>"
+                    )
+                    continue
+                current_entries = corrected_entries
 
             await _append_user_turn(
-                (
-                    f"{verifier_message}\nUse the verifier feedback above to correct your "
-                    "last <loc> step. You must change at least one coordinate and should not repeat "
-                    "the same <loc>. Output only a corrected <loc> step."
-                )
+                "Grounding refinement is complete. Using your latest <bbox_2d>, output exactly one <reason> and then one <answer>. Do not output another <bbox_2d>."
             )
+            final_chunk, final_token_ids, final_log_probs = await self._generate_once(
+                messages,
+                images=images,
+                sampling_params=sampling_params,
+                stop_sequences=["</answer>"],
+                max_new_tokens=self.max_new_tokens_per_chunk,
+                metrics=metrics,
+            )
+            total_generated_tokens += len(final_token_ids)
+            assistant_turns += 1
+            _append_assistant_turn(final_chunk, final_token_ids, final_log_probs)
+            messages.append({"role": "assistant", "content": [{"type": "text", "text": final_chunk}]})
+            return _return_output()
