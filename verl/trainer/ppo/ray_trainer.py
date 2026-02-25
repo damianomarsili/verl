@@ -740,6 +740,10 @@ class RayPPOTrainer:
                 reward_cfg.get("sttv_sam3_load_from_hf", True),
                 True,
             ),
+            "sttv_discard_on_empty_sam3": self._coerce_sttv_bool(
+                reward_cfg.get("sttv_discard_on_empty_sam3", False),
+                False,
+            ),
         }
 
     def _extract_sttv_mask_tensor(
@@ -794,7 +798,19 @@ class RayPPOTrainer:
             data_sources.extend(["unknown"] * (bsz - len(data_sources)))
 
         if include_solution_strs:
-            solution_strs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in batch.batch["responses"]]
+            response_ids = batch.batch["responses"]
+            try:
+                response_mask = batch.batch["response_mask"]
+            except Exception:
+                response_mask = None
+            solution_strs = []
+            if response_mask is not None and tuple(response_mask.shape) == tuple(response_ids.shape):
+                for ids, mask in zip(response_ids, response_mask, strict=True):
+                    active_ids = ids[mask > 0]
+                    solution_strs.append(self.tokenizer.decode(active_ids, skip_special_tokens=True))
+            else:
+                for ids in response_ids:
+                    solution_strs.append(self.tokenizer.decode(ids, skip_special_tokens=True))
         else:
             solution_strs = [""] * bsz
 
@@ -1427,14 +1443,17 @@ class RayPPOTrainer:
         batch: DataProto,
         reward_fn: Optional[Callable[..., Any]],
         reward_kwargs: Optional[dict[str, Any]] = None,
-    ) -> tuple[torch.Tensor, int]:
+    ) -> tuple[torch.Tensor, int, list[bool]]:
         response_mask = batch.batch["response_mask"]
+        bsz = response_mask.shape[0]
         response_len = response_mask.shape[1]
         loc_rewards = torch.zeros_like(response_mask, dtype=torch.float32)
+        discard_rows = [False] * bsz
+        discard_on_empty_sam3 = bool((reward_kwargs or {}).get("sttv_discard_on_empty_sam3", False))
 
         raw_calls = batch.non_tensor_batch.get("sttv_loc_calls")
         if raw_calls is None:
-            return loc_rewards, 0
+            return loc_rewards, 0, discard_rows
 
         loc_call_records: list[list[dict[str, Any]]] = []
         for row in raw_calls:
@@ -1447,14 +1466,13 @@ class RayPPOTrainer:
 
         total_calls = sum(len(records) for records in loc_call_records)
         if total_calls == 0:
-            return loc_rewards, 0
+            return loc_rewards, 0, discard_rows
 
         reward_values = [[0.0] * len(records) for records in loc_call_records]
         if reward_fn is not None:
-            data_sources, _, ground_truths, extra_infos = self._extract_reward_context(
-                batch, include_solution_strs=False
+            data_sources, solution_strs, ground_truths, extra_infos = self._extract_reward_context(
+                batch, include_solution_strs=True
             )
-            solution_strs = [""] * len(batch)
             raw_prompts_raw = batch.non_tensor_batch.get("raw_prompt")
             if isinstance(raw_prompts_raw, np.ndarray):
                 raw_prompts = raw_prompts_raw.tolist()
@@ -1504,6 +1522,24 @@ class RayPPOTrainer:
             reward_values = self._normalize_per_sample_call_rewards(raw_reward_values, loc_call_records)
 
         for row_idx, (call_records, call_rewards) in enumerate(zip(loc_call_records, reward_values, strict=True)):
+            if discard_on_empty_sam3 and call_records:
+                sam_counts: list[int] = []
+                has_sam_eval = False
+                for call_record in call_records:
+                    eval_result = call_record.get("sttv_sam3_eval")
+                    if not isinstance(eval_result, dict):
+                        continue
+                    has_sam_eval = True
+                    try:
+                        count = int(eval_result.get("num_sam_boxes", 0))
+                    except (TypeError, ValueError):
+                        count = 0
+                    sam_counts.append(max(0, count))
+                if has_sam_eval and sam_counts and all(count == 0 for count in sam_counts):
+                    discard_rows[row_idx] = True
+                    for call_record in call_records:
+                        call_record["sttv_discarded_empty_sam3"] = True
+                    continue
             for call_record, reward in zip(call_records, call_rewards, strict=True):
                 start = int(call_record.get("token_start", 0))
                 end = int(call_record.get("token_end", 0))
@@ -1514,7 +1550,7 @@ class RayPPOTrainer:
                 endpoint = end - 1
                 loc_rewards[row_idx, endpoint] += float(reward)
 
-        return loc_rewards, total_calls
+        return loc_rewards, total_calls, discard_rows
 
     def _deserialize_sttv_images(self, serialized_images: Any) -> list[Image.Image]:
         if not isinstance(serialized_images, (list, tuple)):
@@ -1700,8 +1736,8 @@ class RayPPOTrainer:
         if pad_token_id is None:
             pad_token_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else 0
 
-        data_sources, _, ground_truths, extra_infos = self._extract_reward_context(
-            batch, include_solution_strs=False
+        data_sources, solution_strs, ground_truths, extra_infos = self._extract_reward_context(
+            batch, include_solution_strs=True
         )
 
         aux_rows: list[dict[str, Any]] = []
@@ -1758,6 +1794,7 @@ class RayPPOTrainer:
                         "call_record": call_record,
                         "data_source": str(data_sources[row_idx]),
                         "ground_truth": str(ground_truths[row_idx]),
+                        "parent_solution_str": str(solution_strs[row_idx]),
                         "extra_info": extra_infos[row_idx],
                         "prompt_token_ids": prompt_token_ids,
                         "output_token_ids": output_token_ids,
@@ -1793,6 +1830,7 @@ class RayPPOTrainer:
         call_records: list[dict[str, Any]] = []
         aux_data_sources: list[str] = []
         aux_ground_truths: list[str] = []
+        aux_solution_strs: list[str] = []
         aux_extra_infos: list[dict[str, Any]] = []
 
         for row in aux_rows:
@@ -1831,6 +1869,7 @@ class RayPPOTrainer:
             call_records.append(row["call_record"])
             aux_data_sources.append(row["data_source"])
             aux_ground_truths.append(row["ground_truth"])
+            aux_solution_strs.append(row["parent_solution_str"])
             aux_extra_infos.append(row["extra_info"])
 
         if self.processor is not None:
@@ -1869,6 +1908,7 @@ class RayPPOTrainer:
             "sttv_loc_verifier_call_record": np.array(call_records, dtype=object),
             "data_source": np.array(aux_data_sources, dtype=object),
             "sttv_ground_truth": np.array(aux_ground_truths, dtype=object),
+            "sttv_parent_solution_str": np.array(aux_solution_strs, dtype=object),
             "sttv_extra_info": np.array(aux_extra_infos, dtype=object),
             "multi_modal_inputs": np.array(multi_modal_inputs_list, dtype=object),
         }
@@ -1916,12 +1956,20 @@ class RayPPOTrainer:
                 np.array([""] * len(aux_batch), dtype=object),
             )
             ground_truths = ground_truths_raw.tolist() if isinstance(ground_truths_raw, np.ndarray) else list(ground_truths_raw)
+            solution_strs_raw = aux_batch.non_tensor_batch.get(
+                "sttv_parent_solution_str",
+                np.array([""] * len(aux_batch), dtype=object),
+            )
+            solution_strs = (
+                solution_strs_raw.tolist() if isinstance(solution_strs_raw, np.ndarray) else list(solution_strs_raw)
+            )
+            if len(solution_strs) < len(aux_batch):
+                solution_strs.extend([""] * (len(aux_batch) - len(solution_strs)))
             extra_infos_raw = aux_batch.non_tensor_batch.get(
                 "sttv_extra_info",
                 np.array([{}] * len(aux_batch), dtype=object),
             )
             extra_infos = extra_infos_raw.tolist() if isinstance(extra_infos_raw, np.ndarray) else list(extra_infos_raw)
-            solution_strs = [""] * len(call_records)
             try:
                 raw_rewards = reward_fn(
                     data_sources=data_sources,
@@ -1959,6 +2007,48 @@ class RayPPOTrainer:
             index=group_index,
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
         )
+
+    def _build_sttv_group_index_with_discard(
+        self,
+        group_index: np.ndarray,
+        discard_rows: Sequence[bool],
+    ) -> np.ndarray:
+        if isinstance(group_index, np.ndarray):
+            adjusted = group_index.astype(object, copy=True)
+        else:
+            adjusted = np.array(list(group_index), dtype=object)
+        if len(discard_rows) == 0 or adjusted.size == 0:
+            return adjusted
+        limit = min(int(adjusted.size), len(discard_rows))
+        for row_idx in range(limit):
+            if bool(discard_rows[row_idx]):
+                adjusted[row_idx] = f"{adjusted[row_idx]}::discard_empty_sam3::{row_idx}"
+        return adjusted
+
+    def _count_zero_advantage_samples(
+        self,
+        advantages: torch.Tensor,
+        objective_mask: torch.Tensor,
+        *,
+        epsilon: float = 1e-12,
+    ) -> tuple[int, int]:
+        """Return (zero_adv_samples, active_samples) for one objective.
+
+        A sample is active when it has at least one objective token.
+        Among active samples, it is counted as zero-advantage when the masked
+        absolute advantage sum is <= epsilon.
+        """
+        if advantages.numel() == 0 or objective_mask.numel() == 0:
+            return 0, 0
+        mask_bool = objective_mask > 0
+        active = mask_bool.any(dim=-1)
+        active_count = int(active.sum().item())
+        if active_count <= 0:
+            return 0, 0
+        masked_abs_sum = (advantages.abs() * mask_bool.to(dtype=advantages.dtype)).sum(dim=-1)
+        zero_adv = active & (masked_abs_sum <= float(epsilon))
+        zero_count = int(zero_adv.sum().item())
+        return zero_count, active_count
 
     def _compose_sttv_actor_batch(self, main_batch: DataProto, aux_batch: Optional[DataProto]) -> DataProto:
         tensor_keys = [
@@ -3377,29 +3467,60 @@ class RayPPOTrainer:
                             sttv_reward_fns = self._load_sttv_reward_functions()
                             sttv_reward_kwargs = self._get_sttv_reward_kwargs()
 
+                            # Objective 3: loc calls.
+                            loc_mask = self._extract_sttv_mask_tensor(batch, "sttv_loc_mask")
+                            loc_score_tensor, total_loc_calls, discard_rows = self._compute_sttv_loc_call_reward_tensor(
+                                batch,
+                                sttv_reward_fns.get("loc"),
+                                reward_kwargs=sttv_reward_kwargs,
+                            )
+                            discard_count = int(sum(1 for dropped in discard_rows if dropped))
+                            if discard_count > 0:
+                                discard_mask = torch.tensor(discard_rows, dtype=torch.bool, device=answer_mask.device)
+                                answer_mask = answer_mask.clone()
+                                answer_mask[discard_mask] = 0
+                                loc_mask = loc_mask.clone()
+                                loc_mask[discard_mask] = 0
+                                loc_score_tensor = loc_score_tensor.clone()
+                                loc_score_tensor[discard_mask] = 0.0
+                                batch.batch["token_level_rewards"] = batch.batch["token_level_rewards"].clone()
+                                batch.batch["token_level_rewards"][discard_mask] = 0.0
+                            metrics["sttv/sam3_empty_sample_discard_count"] = float(discard_count)
+                            metrics["sttv/sam3_empty_sample_discard_frac"] = (
+                                float(discard_count) / float(len(discard_rows)) if len(discard_rows) > 0 else 0.0
+                            )
+                            group_index_main = self._build_sttv_group_index_with_discard(
+                                batch.non_tensor_batch["uid"],
+                                discard_rows,
+                            )
+
                             # Objective 1: answer correctness.
                             answer_advantages, answer_returns = self._compute_sttv_grpo_advantages(
                                 token_level_rewards=batch.batch["token_level_rewards"],
                                 objective_mask=answer_mask,
-                                group_index=batch.non_tensor_batch["uid"],
+                                group_index=group_index_main,
                                 norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             )
                             batch.batch["advantages"] = answer_advantages
                             batch.batch["returns"] = answer_returns
                             batch.batch["sttv_adv_answer"] = answer_advantages
                             batch.batch["sttv_mask_answer"] = answer_mask
-
-                            # Objective 3: loc calls.
-                            loc_mask = self._extract_sttv_mask_tensor(batch, "sttv_loc_mask")
-                            loc_score_tensor, total_loc_calls = self._compute_sttv_loc_call_reward_tensor(
-                                batch,
-                                sttv_reward_fns.get("loc"),
-                                reward_kwargs=sttv_reward_kwargs,
+                            answer_zero_count, answer_active_count = self._count_zero_advantage_samples(
+                                answer_advantages,
+                                answer_mask,
                             )
+                            metrics["sttv/adv_zero_samples_answer"] = float(answer_zero_count)
+                            metrics["sttv/adv_active_samples_answer"] = float(answer_active_count)
+                            metrics["sttv/adv_zero_frac_answer"] = (
+                                float(answer_zero_count) / float(answer_active_count)
+                                if answer_active_count > 0
+                                else 0.0
+                            )
+
                             loc_advantages, _ = self._compute_sttv_grpo_advantages(
                                 token_level_rewards=loc_score_tensor,
                                 objective_mask=loc_mask,
-                                group_index=batch.non_tensor_batch["uid"],
+                                group_index=group_index_main,
                                 norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             )
                             batch.batch["sttv_adv_loc"] = loc_advantages
@@ -3407,11 +3528,21 @@ class RayPPOTrainer:
                             batch.batch["sttv_adv_loc_verifier"] = torch.zeros_like(answer_advantages)
                             batch.batch["sttv_mask_loc_verifier"] = torch.zeros_like(answer_mask)
                             metrics["sttv/loc_call_count"] = float(total_loc_calls)
+                            loc_zero_count, loc_active_count = self._count_zero_advantage_samples(
+                                loc_advantages,
+                                loc_mask,
+                            )
+                            metrics["sttv/adv_zero_samples_loc"] = float(loc_zero_count)
+                            metrics["sttv/adv_active_samples_loc"] = float(loc_active_count)
+                            metrics["sttv/adv_zero_frac_loc"] = (
+                                float(loc_zero_count) / float(loc_active_count) if loc_active_count > 0 else 0.0
+                            )
 
                             # Objective 2: verifier calls after <bbox_2d> (separate aux sub-batch).
                             aux_rows = len(aux_batch) if aux_batch is not None else 0
                             total_loc_verifier_calls = 0
                             aux_verifier_scores: Optional[torch.Tensor] = None
+                            aux_discard_rows = [False] * aux_rows
                             if aux_batch is not None and aux_rows > 0:
                                 if aux_old_log_prob is None:
                                     aux_old_log_prob, _ = self._compute_old_log_prob_with_padding(aux_batch)
@@ -3432,13 +3563,43 @@ class RayPPOTrainer:
                                     reward_kwargs=sttv_reward_kwargs,
                                 )
                                 aux_verifier_mask = aux_batch.batch["response_mask"].to(dtype=answer_mask.dtype)
+                                if discard_count > 0:
+                                    parent_rows_raw = aux_batch.non_tensor_batch.get("sttv_parent_row_index")
+                                    if parent_rows_raw is not None:
+                                        parent_rows = (
+                                            parent_rows_raw.tolist()
+                                            if isinstance(parent_rows_raw, np.ndarray)
+                                            else list(parent_rows_raw)
+                                        )
+                                        for aux_idx in range(min(len(parent_rows), aux_rows)):
+                                            try:
+                                                parent_row = int(parent_rows[aux_idx])
+                                            except (TypeError, ValueError):
+                                                continue
+                                            if 0 <= parent_row < len(discard_rows) and discard_rows[parent_row]:
+                                                aux_discard_rows[aux_idx] = True
+                                if any(aux_discard_rows):
+                                    aux_discard_mask = torch.tensor(
+                                        aux_discard_rows,
+                                        dtype=torch.bool,
+                                        device=aux_verifier_mask.device,
+                                    )
+                                    aux_verifier_mask = aux_verifier_mask.clone()
+                                    aux_verifier_mask[aux_discard_mask] = 0
+                                    if aux_verifier_scores is not None:
+                                        aux_verifier_scores = aux_verifier_scores.clone()
+                                        aux_verifier_scores[aux_discard_mask] = 0.0
+                                aux_group_index = self._build_sttv_group_index_with_discard(
+                                    aux_batch.non_tensor_batch["uid"],
+                                    aux_discard_rows,
+                                )
                                 if aux_verifier_scores is None:
                                     aux_verifier_advantages = torch.zeros_like(aux_verifier_mask, dtype=torch.float32)
                                 else:
                                     aux_verifier_advantages, _ = self._compute_sttv_grpo_advantages(
                                         token_level_rewards=aux_verifier_scores,
                                         objective_mask=aux_verifier_mask,
-                                        group_index=aux_batch.non_tensor_batch["uid"],
+                                        group_index=aux_group_index,
                                         norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                                     )
 

@@ -85,6 +85,8 @@ class SttvNoVerifierAgentLoop(SttvAgentLoop):
             span_end = min(len(response_ids), int(loc_span.get("token_end", 0)))
             if span_end <= span_start:
                 continue
+            # Decouple objectives: do not optimize answer loss on bbox tokens.
+            sttv_answer_mask[span_start:span_end] = [0] * (span_end - span_start)
             sttv_loc_mask[span_start:span_end] = [1] * (span_end - span_start)
             sttv_loc_calls.append(
                 {

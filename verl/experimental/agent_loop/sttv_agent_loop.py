@@ -99,7 +99,7 @@ class SttvAgentLoop(AgentLoopBase):
         if self.depth_enabled:
             prompt_file = prompts_dir / "sttv_verifier_depth.txt"
         else:
-            prompt_file = prompts_dir / "sttv_no_verifier_single_turn.txt"
+            prompt_file = prompts_dir / "sttv_verifier_single_turn.txt"
         self.prompt_template = self._read_prompt_file(prompt_file)
         self.instruction_text = self._read_prompt_file(prompts_dir / "instructions_box.txt")
         self.depth_instruction_text = None
@@ -537,22 +537,6 @@ class SttvAgentLoop(AgentLoopBase):
             response_logprobs.extend([0.0] * len(extra_prompt_ids))
         return len(extra_prompt_ids)
 
-    def _append_injected_text(
-        self,
-        output_chunks: list[str],
-        text: str,
-        train_prompt_ids: list[int],
-        response_mask: list[int],
-        response_logprobs: Optional[list[float]],
-    ) -> int:
-        output_chunks.append(text)
-        token_ids = self.tokenizer(text, add_special_tokens=False)["input_ids"]
-        train_prompt_ids.extend(token_ids)
-        response_mask.extend([1] * len(token_ids))
-        if response_logprobs is not None:
-            response_logprobs.extend([0.0] * len(token_ids))
-        return len(token_ids)
-
     def _append_assistant_tokens(
         self,
         output_chunks: list[str],
@@ -625,40 +609,17 @@ class SttvAgentLoop(AgentLoopBase):
         loc_call_counter = 0
 
         output_chunks: list[str] = []
-        failures = 0
         step_count = 0
         max_total_tokens = self.max_steps * self.max_new_tokens_per_chunk
         total_generated_tokens = 0
-        max_failed_loc_rounds = 3
         max_empty_generation_attempts = 3
-        missing_loc_failures = 0
         empty_generation_failures = 0
 
         final_answer_prompt = "I can now predict the final answer which is: "
         final_fail_prompt = (
             "I am unable to locate the objects correctly. Provide a final <reason> step and then the final <answer>."
         )
-        bbox_line_format = (
-            'label="object_name", [x_min, y_min, x_max, y_max]'
-            if self.instruction_mode == "box"
-            else 'label="object_name", [x, y]'
-        )
-        empty_loc_prompt = (
-            "You did not place an object in your <bbox_2d> tags. "
-            "Output exactly one <bbox_2d> block with one line per object."
-        )
-        missing_label_prompt = (
-            "Missing required label syntax. Output exactly one <bbox_2d> block and "
-            f"use one line per object as: {bbox_line_format}."
-        )
-        generic_format_prompt = (
-            "Formatting error in <bbox_2d>. Output exactly one <bbox_2d> block and "
-            f"use ONLY lines in this exact format: {bbox_line_format}."
-        )
-        multi_block_prompt = (
-            "Do not output multiple <bbox_2d> blocks. Output exactly one <bbox_2d> block "
-            "and put one object per line inside that single block."
-        )
+        bbox_line_format = 'label="object_name", [x_min, y_min, x_max, y_max]'
 
         metrics: dict[str, Any] = {"generate_sequences": 0.0, "tool_calls": 0.0, "num_preempted": -1}
         user_turns = 1
@@ -681,14 +642,15 @@ class SttvAgentLoop(AgentLoopBase):
             _extend_objective_masks(answer_value=0, loc_value=0, count=appended)
 
         def _append_verifier_injection(text: str) -> None:
-            appended = self._append_injected_text(
-                output_chunks,
-                text,
-                train_prompt_ids,
-                response_mask,
-                response_logprobs,
-            )
-            # Verifier injections are treated as non-answer/tool-like tokens.
+            # Verifier injections are tool-like metadata: keep them in trajectory text,
+            # but mask them out of response tokens and all objectives.
+            output_chunks.append(text)
+            token_ids = self.tokenizer(text, add_special_tokens=False)["input_ids"]
+            train_prompt_ids.extend(token_ids)
+            response_mask.extend([0] * len(token_ids))
+            if response_logprobs is not None:
+                response_logprobs.extend([0.0] * len(token_ids))
+            appended = len(token_ids)
             _extend_objective_masks(answer_value=0, loc_value=0, count=appended)
 
         def _append_assistant_turn(chunk: str, token_ids: list[int], log_probs: list[float]) -> None:
@@ -713,6 +675,8 @@ class SttvAgentLoop(AgentLoopBase):
                 span_end = min(len(sttv_loc_mask), int(loc_span["token_end"]))
                 if span_end <= span_start:
                     continue
+                # Decouple objectives: do not optimize answer loss on bbox tokens.
+                sttv_answer_mask[span_start:span_end] = [0] * (span_end - span_start)
                 sttv_loc_mask[span_start:span_end] = [1] * (span_end - span_start)
                 sttv_loc_calls.append(
                     {
@@ -801,12 +765,7 @@ class SttvAgentLoop(AgentLoopBase):
                 await _inject_final_answer(final_answer_prompt, self.max_final_answer_tokens)
                 return _return_output()
             if "</answer>" in chunk:
-                _append_verifier_injection("<verifier>You must predict <bbox_2d> before <reason> and <answer>.</verifier>")
-                await _append_user_turn(
-                    "First output only one <bbox_2d> block with all objects listed inside it. "
-                    f"Use one line per object in this exact format: {bbox_line_format}."
-                )
-                continue
+                return _return_output()
 
             reason_steps = len(re.findall(r"(?is)<reason>.*?</reason>", chunk))
             if reason_steps == 0 and "<reason>" in chunk:
@@ -823,52 +782,17 @@ class SttvAgentLoop(AgentLoopBase):
 
             loc_payloads = self._extract_bbox_2d_payloads(chunk)
             if len(loc_payloads) != 1:
-                if "<bbox_2d>" in chunk.lower():
-                    failures += 1
-                    prompt_text = multi_block_prompt if len(loc_payloads) > 1 else empty_loc_prompt
-                    _append_verifier_injection(f"<verifier>{prompt_text}</verifier>")
-                    if failures >= max_failed_loc_rounds:
-                        await _inject_final_answer(final_fail_prompt, self.max_final_answer_tokens)
-                        return _return_output()
-                    await _append_user_turn(prompt_text)
-                    continue
-                if self.depth_enabled and ("<depth>" in chunk or "<reason>" in chunk):
-                    continue
-                missing_loc_failures += 1
-                if missing_loc_failures >= max_failed_loc_rounds:
-                    await _inject_final_answer(final_fail_prompt, self.max_final_answer_tokens)
-                    return _return_output()
-                await _inject_final_answer(final_answer_prompt, self.max_final_answer_tokens)
                 return _return_output()
             loc_payload = loc_payloads[0]
-            missing_loc_failures = 0
 
             if self._has_missing_label(loc_payload):
-                failures += 1
-                _append_verifier_injection(f"<verifier>{missing_label_prompt}</verifier>")
-                if failures >= max_failed_loc_rounds:
-                    await _inject_final_answer(final_fail_prompt, self.max_final_answer_tokens)
-                    return _return_output()
-                await _append_user_turn(missing_label_prompt)
-                continue
+                return _return_output()
 
             entries = self._parse_bbox_2d_entries(loc_payload)
             if not entries:
-                failures += 1
-                _append_verifier_injection(f"<verifier>{generic_format_prompt}</verifier>")
-                if failures >= max_failed_loc_rounds:
-                    await _inject_final_answer(final_fail_prompt, self.max_final_answer_tokens)
-                    return _return_output()
-                await _append_user_turn(generic_format_prompt)
-                continue
+                return _return_output()
             if self._has_invalid_box(entries):
-                failures += 1
-                _append_verifier_injection(f"<verifier>{generic_format_prompt}</verifier>")
-                if failures >= max_failed_loc_rounds:
-                    await _inject_final_answer(final_fail_prompt, self.max_final_answer_tokens)
-                    return _return_output()
-                await _append_user_turn(generic_format_prompt)
-                continue
+                return _return_output()
 
             current_entries = entries
             for verifier_round in range(self.loc_verifier_rounds):
@@ -936,32 +860,14 @@ class SttvAgentLoop(AgentLoopBase):
 
                 corrected_payloads = self._extract_bbox_2d_payloads(correction_chunk)
                 if len(corrected_payloads) != 1:
-                    correction_error = (
-                        "<verifier>Correction output has multiple <bbox_2d> blocks. "
-                        "Keeping previous prediction.</verifier>"
-                        if len(corrected_payloads) > 1
-                        else "<verifier>Correction output missing <bbox_2d>. Keeping previous prediction.</verifier>"
-                    )
-                    _append_verifier_injection(
-                        correction_error
-                    )
                     continue
                 corrected_payload = corrected_payloads[0]
                 if self._has_missing_label(corrected_payload):
-                    _append_verifier_injection(
-                        "<verifier>Correction formatting invalid (missing label). Keeping previous prediction.</verifier>"
-                    )
                     continue
                 corrected_entries = self._parse_bbox_2d_entries(corrected_payload)
                 if not corrected_entries:
-                    _append_verifier_injection(
-                        "<verifier>Correction formatting invalid. Keeping previous prediction.</verifier>"
-                    )
                     continue
                 if self._has_invalid_box(corrected_entries):
-                    _append_verifier_injection(
-                        "<verifier>Correction contains invalid box geometry. Keeping previous prediction.</verifier>"
-                    )
                     continue
                 current_entries = corrected_entries
 

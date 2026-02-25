@@ -35,9 +35,16 @@ class BatchRewardManager(RewardManagerBase):
         assert len(data) == 1, "Only support single data item"
         data_item = data[0]
         response_ids = data_item.batch["responses"]
-        response_length = response_ids.shape[-1]
-        valid_response_length = data_item.batch["attention_mask"][-response_length:].sum()
-        valid_response_ids = response_ids[:valid_response_length]
+        try:
+            response_mask = data_item.batch["response_mask"]
+        except Exception:
+            response_mask = None
+        if response_mask is not None and tuple(response_mask.shape) == tuple(response_ids.shape):
+            valid_response_ids = response_ids[response_mask > 0]
+        else:
+            response_length = response_ids.shape[-1]
+            valid_response_length = data_item.batch["attention_mask"][-response_length:].sum()
+            valid_response_ids = response_ids[:valid_response_length]
 
         data_source = data_item.non_tensor_batch["data_source"]
         ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
