@@ -43,6 +43,7 @@ BOX_FILL_RGBA = (0, 0, 255, 25)
 FONT_SCALE = 0.022
 BOX_OUTLINE_SCALE = 0.005
 LABEL_PADDING = 2
+VERIFIER_IMAGE_JPEG_QUALITY = 85
 BBOX_2D_ENTRY_PATTERN = re.compile(
     r'^\s*label\s*=\s*"(?P<label>[^"\n]+?)"\s*,\s*\[(?P<coords>[^\]]+)\]\s*$',
     flags=re.IGNORECASE,
@@ -65,14 +66,11 @@ class SttvAgentLoop(AgentLoopBase):
         tokenizer: AutoTokenizer,
         processor: AutoProcessor,
         instruction_mode: str = "box",
-        depth_enabled: bool = False,
         max_image_side: int = 768,
         verifier_image_side: int = 1024,
         loc_verifier_rounds: int = 3,
         verifier_max_new_tokens: int = 96,
-        max_steps: int = 8,
         max_new_tokens_per_chunk: int = 256,
-        max_final_answer_tokens: int = 64,
         **kwargs: Any,
     ):
         super().__init__(trainer_config, server_manager, tokenizer, processor, **kwargs)
@@ -84,39 +82,19 @@ class SttvAgentLoop(AgentLoopBase):
         self.instruction_mode = instruction_mode.lower()
         if self.instruction_mode != "box":
             raise ValueError(f"Only box mode is supported; got instruction_mode={instruction_mode}")
-        self.depth_enabled = self._coerce_bool(depth_enabled)
 
         self.max_image_side = int(max_image_side)
         self.verifier_image_side = int(verifier_image_side)
         self.loc_verifier_rounds = max(0, int(loc_verifier_rounds))
         self.verifier_max_new_tokens = int(verifier_max_new_tokens)
 
-        self.max_steps = int(max_steps)
         self.max_new_tokens_per_chunk = int(max_new_tokens_per_chunk)
-        self.max_final_answer_tokens = int(max_final_answer_tokens)
 
         prompts_dir = self._resolve_prompts_dir()
-        if self.depth_enabled:
-            prompt_file = prompts_dir / "sttv_verifier_depth.txt"
-        else:
-            prompt_file = prompts_dir / "sttv_verifier_single_turn.txt"
+        prompt_file = prompts_dir / "sttv_verifier_single_turn.txt"
         self.prompt_template = self._read_prompt_file(prompt_file)
         self.instruction_text = self._read_prompt_file(prompts_dir / "instructions_box.txt")
-        self.depth_instruction_text = None
-        if self.depth_enabled:
-            depth_file = prompts_dir / "instructions_depth_box.txt"
-            self.depth_instruction_text = self._read_prompt_file(depth_file)
         self.verifier_template = self._read_prompt_file(prompts_dir / "verifier_instructions.txt")
-
-    def _coerce_bool(self, value: Any) -> bool:
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)):
-            return value != 0
-        if value is None:
-            return False
-        normalized = str(value).strip().lower()
-        return normalized not in {"0", "false", "no", "off", ""}
 
     def _resolve_prompts_dir(self) -> Path:
         here = Path(__file__).resolve()
@@ -136,10 +114,6 @@ class SttvAgentLoop(AgentLoopBase):
         return text.replace("<plan>", "<reason>").replace("</plan>", "</reason>")
 
     def _build_prompted_context(self, query: str) -> str:
-        if self.depth_enabled:
-            if self.depth_instruction_text is None:
-                raise ValueError("Depth mode enabled but depth instructions are missing.")
-            return self.prompt_template.format(self.instruction_text, self.depth_instruction_text, query.strip())
         return self.prompt_template.format(self.instruction_text, query.strip())
 
     def _resize_longest_side(self, image: Image.Image, longest_side: int) -> Image.Image:
@@ -163,10 +137,15 @@ class SttvAgentLoop(AgentLoopBase):
 
     def _serialize_image_bytes(self, image: Image.Image) -> dict[str, Any]:
         buffer = BytesIO()
-        image.convert("RGB").save(buffer, format="PNG")
+        image.convert("RGB").save(
+            buffer,
+            format="JPEG",
+            quality=VERIFIER_IMAGE_JPEG_QUALITY,
+            optimize=True,
+        )
         return {
             "bytes": buffer.getvalue(),
-            "format": "PNG",
+            "format": "JPEG",
             "width": image.width,
             "height": image.height,
         }
@@ -609,16 +588,8 @@ class SttvAgentLoop(AgentLoopBase):
         loc_call_counter = 0
 
         output_chunks: list[str] = []
-        step_count = 0
-        max_total_tokens = self.max_steps * self.max_new_tokens_per_chunk
+        max_total_tokens = self.response_length
         total_generated_tokens = 0
-        max_empty_generation_attempts = 3
-        empty_generation_failures = 0
-
-        final_answer_prompt = "I can now predict the final answer which is: "
-        final_fail_prompt = (
-            "I am unable to locate the objects correctly. Provide a final <reason> step and then the final <answer>."
-        )
         bbox_line_format = 'label="object_name", [x_min, y_min, x_max, y_max]'
 
         metrics: dict[str, Any] = {"generate_sequences": 0.0, "tool_calls": 0.0, "num_preempted": -1}
@@ -689,24 +660,6 @@ class SttvAgentLoop(AgentLoopBase):
                 )
                 loc_call_counter += 1
 
-        async def _inject_final_answer(prompt_prefix: str, max_new_tokens: int) -> str:
-            nonlocal total_generated_tokens, assistant_turns, user_turns
-            await _append_user_turn(prompt_prefix)
-            user_turns += 1
-            chunk, token_ids, log_probs = await self._generate_once(
-                messages,
-                images=images,
-                sampling_params=sampling_params,
-                stop_sequences=["</answer>"],
-                max_new_tokens=max_new_tokens,
-                metrics=metrics,
-            )
-            total_generated_tokens += len(token_ids)
-            assistant_turns += 1
-            _append_assistant_turn(chunk, token_ids, log_probs)
-            messages.append({"role": "assistant", "content": [{"type": "text", "text": chunk}]})
-            return "".join(output_chunks)
-
         def _return_output() -> AgentLoopOutput:
             response_ids = train_prompt_ids[len(initial_prompt_ids) :]
             max_response_len = min(len(response_ids), self.response_length)
@@ -749,12 +702,7 @@ class SttvAgentLoop(AgentLoopBase):
                 metrics=metrics,
             )
             if not token_ids and not chunk.strip():
-                empty_generation_failures += 1
-                if empty_generation_failures >= max_empty_generation_attempts:
-                    await _inject_final_answer(final_fail_prompt, self.max_final_answer_tokens)
-                    return _return_output()
-            else:
-                empty_generation_failures = 0
+                return _return_output()
 
             total_generated_tokens += len(token_ids)
             assistant_turns += 1
@@ -762,22 +710,8 @@ class SttvAgentLoop(AgentLoopBase):
             messages.append({"role": "assistant", "content": [{"type": "text", "text": chunk}]})
 
             if total_generated_tokens >= max_total_tokens:
-                await _inject_final_answer(final_answer_prompt, self.max_final_answer_tokens)
                 return _return_output()
             if "</answer>" in chunk:
-                return _return_output()
-
-            reason_steps = len(re.findall(r"(?is)<reason>.*?</reason>", chunk))
-            if reason_steps == 0 and "<reason>" in chunk:
-                reason_steps = 1
-            depth_steps = 0
-            if self.depth_enabled:
-                depth_steps = len(re.findall(r"(?is)<depth>.*?</depth>", chunk))
-                if depth_steps == 0 and "<depth>" in chunk:
-                    depth_steps = 1
-            step_count += reason_steps + depth_steps
-            if step_count >= self.max_steps:
-                await _inject_final_answer(final_answer_prompt, self.max_final_answer_tokens)
                 return _return_output()
 
             loc_payloads = self._extract_bbox_2d_payloads(chunk)
@@ -840,8 +774,11 @@ class SttvAgentLoop(AgentLoopBase):
                 _append_verifier_injection(f"<verifier>{round_message}</verifier>")
                 await _append_user_turn(
                     (
-                        f"{round_message}\nRewrite your <bbox_2d> to improve the estimated PQ. "
-                        f"Output ONLY one corrected <bbox_2d> block using lines formatted as {bbox_line_format}."
+                        "I have some feedback for you to incorporate. "
+                        f"Please output ONLY one <bbox_2d> block using lines formatted as {bbox_line_format} "
+                        "that incorporates the feedback.\n"
+                        f"Feedback: {corrections}\n"
+                        "You MUST update the boxes."
                     )
                 )
 
@@ -872,7 +809,9 @@ class SttvAgentLoop(AgentLoopBase):
                 current_entries = corrected_entries
 
             await _append_user_turn(
-                "Grounding refinement is complete. Using your latest <bbox_2d>, output exactly one <reason> and then one <answer>. Do not output another <bbox_2d>."
+                "Please now answer the query by first reasoning inside <reason> tags and then putting ONLY your final answer "
+                "inside <answer>. Do not round answers, express all ratios as unrounded decimals. "
+                "Do not output another <bbox_2d>."
             )
             final_chunk, final_token_ids, final_log_probs = await self._generate_once(
                 messages,

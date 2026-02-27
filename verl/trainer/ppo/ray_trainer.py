@@ -21,8 +21,10 @@ This trainer supports model-agonistic model initialization with huggingface
 import json
 import os
 import re
+import hashlib
+import time
 import uuid
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from copy import deepcopy
 from io import BytesIO
 from pprint import pprint
@@ -74,6 +76,7 @@ from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_pad
 ANSWER_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.IGNORECASE | re.DOTALL)
 STTV_AUX_MM_CHUNK_SIZE = 8
 STTV_PAD_RATIO_WARN_THRESHOLD = 0.1
+STTV_IMAGE_DECODE_CACHE_SIZE = 1024
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -319,6 +322,7 @@ class RayPPOTrainer:
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+        self._sttv_image_decode_cache: OrderedDict[str, Image.Image] = OrderedDict()
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -498,7 +502,7 @@ class RayPPOTrainer:
         if close_match:
             content_end = content_start + close_match.start()
             return text[content_start:content_end].strip()
-        next_tag = re.search(r"(?is)<(reason|depth|bbox_2d|verifier|answer)>", text[content_start:])
+        next_tag = re.search(r"(?is)<(reason|bbox_2d|verifier|answer)>", text[content_start:])
         if next_tag:
             content_end = content_start + next_tag.start()
             return text[content_start:content_end].strip()
@@ -880,6 +884,26 @@ class RayPPOTrainer:
             offset_x += image.width
         return canvas
 
+    def _concat_images_v(self, images: list[Image.Image]) -> Optional[Image.Image]:
+        if len(images) == 0:
+            return None
+        widths = [img.width for img in images]
+        heights = [img.height for img in images]
+        canvas = Image.new("RGB", (max(widths), sum(heights)), color=(255, 255, 255))
+        offset_y = 0
+        for image in images:
+            canvas.paste(image, (0, offset_y))
+            offset_y += image.height
+        return canvas
+
+    def _add_plot_header(self, image: Image.Image, title: str) -> Image.Image:
+        header_h = 26
+        canvas = Image.new("RGB", (image.width, image.height + header_h), color=(255, 255, 255))
+        canvas.paste(image, (0, header_h))
+        draw = ImageDraw.Draw(canvas)
+        draw.text((8, 6), title, fill=(0, 0, 0))
+        return canvas
+
     def _draw_box_with_label(
         self,
         draw: ImageDraw.ImageDraw,
@@ -1033,88 +1057,102 @@ class RayPPOTrainer:
         loc_calls: list[dict[str, Any]],
         raw_prompt: Any,
     ) -> tuple[Optional[Image.Image], Optional[Image.Image]]:
-        verifier_diag_calls: list[dict[str, Any]] = []
-        for call in verifier_calls:
+        def _prediction_diagnostics(call: dict[str, Any]) -> list[dict[str, Any]]:
             eval_result = call.get("sttv_sam3_eval")
-            if isinstance(eval_result, dict) and isinstance(eval_result.get("prediction_diagnostics"), list):
-                verifier_diag_calls.append(call)
+            if not isinstance(eval_result, dict):
+                return []
+            rows = eval_result.get("prediction_diagnostics", [])
+            if not isinstance(rows, list):
+                return []
+            return [row for row in rows if isinstance(row, dict)]
 
-        diagnostic_calls: list[dict[str, Any]] = []
-        originals: list[Image.Image] = []
+        def _call_sort_key(call: dict[str, Any]) -> tuple[int, int]:
+            try:
+                call_idx = int(call.get("call_index", -1))
+            except (TypeError, ValueError):
+                call_idx = -1
+            try:
+                round_idx = int(call.get("round_index", -1))
+            except (TypeError, ValueError):
+                round_idx = -1
+            return call_idx, round_idx
+
+        # Prefer verifier rounds when they have real diagnostics; otherwise fallback to loc call diagnostics.
+        verifier_diag_calls = [call for call in verifier_calls if len(_prediction_diagnostics(call)) > 0]
         if len(verifier_diag_calls) > 0:
-            diagnostic_calls = verifier_diag_calls
-            for call in reversed(verifier_diag_calls):
-                originals = self._extract_original_images_from_verifier_call(call)
-                if len(originals) > 0:
-                    break
+            diagnostic_calls = sorted(verifier_diag_calls, key=_call_sort_key)
         else:
-            loc_diag_calls: list[dict[str, Any]] = []
-            for call in loc_calls:
-                eval_result = call.get("sttv_sam3_eval")
-                if isinstance(eval_result, dict) and isinstance(eval_result.get("prediction_diagnostics"), list):
-                    loc_diag_calls.append(call)
+            loc_diag_calls = [call for call in loc_calls if len(_prediction_diagnostics(call)) > 0]
             if len(loc_diag_calls) == 0:
                 return None, None
-            diagnostic_calls = loc_diag_calls
-            originals = self._extract_original_images_from_raw_prompt(raw_prompt)
+            diagnostic_calls = sorted(loc_diag_calls, key=_call_sort_key)
 
-        if len(originals) == 0:
-            originals = self._extract_original_images_from_raw_prompt(raw_prompt)
-        if len(originals) == 0:
-            return None, None
+        default_originals = self._extract_original_images_from_raw_prompt(raw_prompt)
+        loc_round_panels: list[Image.Image] = []
+        sam3_round_panels: list[Image.Image] = []
 
-        diagnostics: list[dict[str, Any]] = []
         for call in diagnostic_calls:
-            eval_result = call.get("sttv_sam3_eval", {})
-            if not isinstance(eval_result, dict):
+            diagnostics = _prediction_diagnostics(call)
+            if len(diagnostics) == 0:
                 continue
-            call_diagnostics = eval_result.get("prediction_diagnostics", [])
-            if not isinstance(call_diagnostics, list):
+
+            originals = self._extract_original_images_from_verifier_call(call)
+            if len(originals) == 0:
+                originals = default_originals
+            if len(originals) == 0:
                 continue
-            for diagnostic in call_diagnostics:
-                if isinstance(diagnostic, dict):
-                    diagnostics.append(diagnostic)
-        if len(diagnostics) == 0:
-            return None, None
 
-        diagnostics_by_image: dict[int, list[dict[str, Any]]] = defaultdict(list)
-        for diagnostic in diagnostics:
-            try:
-                image_index = int(diagnostic.get("image_index", 1))
-            except (TypeError, ValueError):
-                image_index = 1
-            diagnostics_by_image[image_index].append(diagnostic)
+            diagnostics_by_image: dict[int, list[dict[str, Any]]] = defaultdict(list)
+            for diagnostic in diagnostics:
+                try:
+                    image_index = int(diagnostic.get("image_index", 1))
+                except (TypeError, ValueError):
+                    image_index = 1
+                diagnostics_by_image[image_index].append(diagnostic)
 
-        loc_panels: list[Image.Image] = []
-        sam3_panels: list[Image.Image] = []
-        for image_index, image in enumerate(originals, start=1):
-            loc_image = image.copy()
-            sam3_image = image.copy()
-            loc_draw = ImageDraw.Draw(loc_image)
-            sam3_draw = ImageDraw.Draw(sam3_image)
-            for diagnostic in diagnostics_by_image.get(image_index, []):
-                label = str(diagnostic.get("label", "obj"))
-                loc_box_xyxy = self._extract_loc_box_xyxy_from_diagnostic(diagnostic, image)
-                self._draw_box_with_label(
-                    loc_draw,
-                    loc_box_xyxy,
-                    label=f"loc:{label}",
-                    outline=(220, 20, 20),
-                    image_size=image.size,
-                )
-                sam3_boxes = self._extract_sam3_boxes_from_diagnostic(diagnostic)
-                for box_idx, sam3_box in enumerate(sam3_boxes):
+            loc_panels: list[Image.Image] = []
+            sam3_panels: list[Image.Image] = []
+            for image_index, image in enumerate(originals, start=1):
+                loc_image = image.copy()
+                sam3_image = image.copy()
+                loc_draw = ImageDraw.Draw(loc_image)
+                sam3_draw = ImageDraw.Draw(sam3_image)
+                for diagnostic in diagnostics_by_image.get(image_index, []):
+                    label = str(diagnostic.get("label", "obj"))
+                    loc_box_xyxy = self._extract_loc_box_xyxy_from_diagnostic(diagnostic, image)
                     self._draw_box_with_label(
-                        sam3_draw,
-                        sam3_box,
-                        label=f"sam3:{label}:{box_idx + 1}",
-                        outline=(20, 140, 20),
+                        loc_draw,
+                        loc_box_xyxy,
+                        label=f"loc:{label}",
+                        outline=(220, 20, 20),
                         image_size=image.size,
                     )
-            loc_panels.append(self._resize_image_for_log(loc_image))
-            sam3_panels.append(self._resize_image_for_log(sam3_image))
+                    sam3_boxes = self._extract_sam3_boxes_from_diagnostic(diagnostic)
+                    for box_idx, sam3_box in enumerate(sam3_boxes):
+                        self._draw_box_with_label(
+                            sam3_draw,
+                            sam3_box,
+                            label=f"sam3:{label}:{box_idx + 1}",
+                            outline=(20, 140, 20),
+                            image_size=image.size,
+                        )
+                loc_panels.append(self._resize_image_for_log(loc_image))
+                sam3_panels.append(self._resize_image_for_log(sam3_image))
 
-        return self._concat_images_h(loc_panels), self._concat_images_h(sam3_panels)
+            loc_round = self._concat_images_h(loc_panels)
+            sam3_round = self._concat_images_h(sam3_panels)
+            if loc_round is None or sam3_round is None:
+                continue
+
+            call_index = int(call.get("call_index", -1))
+            round_index = int(call.get("round_index", -1))
+            title = f"call={call_index}"
+            if round_index >= 0:
+                title += f" round={round_index + 1}"
+            loc_round_panels.append(self._add_plot_header(loc_round, f"loc {title}"))
+            sam3_round_panels.append(self._add_plot_header(sam3_round, f"sam3 {title}"))
+
+        return self._concat_images_v(loc_round_panels), self._concat_images_v(sam3_round_panels)
 
     def _build_sttv_loc_reward_plot(
         self,
@@ -1201,6 +1239,12 @@ class RayPPOTrainer:
         weights: dict[str, float],
         raw_prompts: Optional[list[object]] = None,
     ) -> dict[str, list[Any]]:
+        def _as_float(value: Any, default: float = 0.0) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return float(default)
+
         batch_size = len(batch)
         answer_weight = float(weights.get("answer", 1.0))
         loc_weight = float(weights.get("loc", 1.0))
@@ -1220,6 +1264,8 @@ class RayPPOTrainer:
         loc_outputs_normalized: list[list[dict[str, Any]]] = []
         sam3_outputs: list[list[dict[str, Any]]] = []
         loc_call_rewards: list[list[dict[str, Any]]] = []
+        loc_reward_components: list[list[dict[str, Any]]] = []
+        verifier_reward_components: list[list[dict[str, Any]]] = []
         loc_plots: list[Optional[Image.Image]] = []
         sam3_plots: list[Optional[Image.Image]] = []
         loc_reward_plots: list[Optional[Image.Image]] = []
@@ -1231,11 +1277,43 @@ class RayPPOTrainer:
                         "call_index": int(call.get("call_index", -1)),
                         "token_start": int(call.get("token_start", -1)),
                         "token_end": int(call.get("token_end", -1)),
-                        "loc_reward": float(call.get("sttv_loc_reward", 0.0)),
+                        "loc_reward": _as_float(call.get("sttv_loc_reward", 0.0)),
+                        "loc_reward_quality": _as_float(call.get("sttv_loc_reward_quality", 0.0)),
+                        "loc_reward_improve": _as_float(call.get("sttv_loc_reward_improve", 0.0)),
+                        "loc_reward_raw": _as_float(call.get("sttv_loc_reward_raw", 0.0)),
                     }
                 )
             loc_call_rewards.append(loc_call_entries)
+            loc_reward_components.append(loc_call_entries)
             loc_reward_plots.append(self._build_sttv_loc_reward_plot(loc_call_entries))
+
+            verifier_entries: list[dict[str, Any]] = []
+            for call in verifier_calls_per_sample[sample_idx]:
+                sttv_sam_eval = call.get("sttv_sam3_eval", {})
+                if not isinstance(sttv_sam_eval, dict):
+                    sttv_sam_eval = {}
+                verifier_entries.append(
+                    {
+                        "call_index": int(call.get("call_index", -1)),
+                        "round_index": int(call.get("round_index", -1)),
+                        "pq_score_estimate": _as_float(
+                            call.get("pq_score_estimate", sttv_sam_eval.get("pq_score_estimate", 0.0))
+                        ),
+                        "pq_true": _as_float(sttv_sam_eval.get("pq", 0.0)),
+                        "verifier_reward": _as_float(call.get("sttv_loc_verifier_reward", 0.0)),
+                        "verifier_accuracy": _as_float(call.get("sttv_loc_verifier_accuracy", 0.0)),
+                        "verifier_usefulness": _as_float(call.get("sttv_loc_verifier_usefulness", 0.0)),
+                        "verifier_reward_raw": _as_float(call.get("sttv_loc_verifier_reward_raw", 0.0)),
+                    }
+                )
+            verifier_entries = sorted(
+                verifier_entries,
+                key=lambda row: (
+                    int(row.get("call_index", -1)),
+                    int(row.get("round_index", -1)),
+                ),
+            )
+            verifier_reward_components.append(verifier_entries)
 
             normalized_entries: list[dict[str, Any]] = []
             sam3_entries: list[dict[str, Any]] = []
@@ -1323,7 +1401,86 @@ class RayPPOTrainer:
             loc_plots.append(loc_plot)
             sam3_plots.append(sam3_plot)
 
-        return {
+        # Flatten per-step reward components into scalar columns so they are easy to
+        # inspect/sort in the W&B samples table (instead of only JSON blobs).
+        loc_component_maps: list[dict[int, dict[str, Any]]] = []
+        verifier_component_maps: list[dict[int, dict[str, Any]]] = []
+        max_loc_call_index = -1
+        max_verifier_round_index = -1
+        for sample_idx in range(batch_size):
+            loc_map: dict[int, dict[str, Any]] = {}
+            for entry in loc_reward_components[sample_idx]:
+                try:
+                    call_index = int(entry.get("call_index", -1))
+                except (TypeError, ValueError):
+                    continue
+                if call_index < 0:
+                    continue
+                max_loc_call_index = max(max_loc_call_index, call_index)
+                loc_map[call_index] = entry
+            loc_component_maps.append(loc_map)
+
+            verifier_map: dict[int, dict[str, Any]] = {}
+            for entry in verifier_reward_components[sample_idx]:
+                try:
+                    round_index = int(entry.get("round_index", -1))
+                except (TypeError, ValueError):
+                    round_index = -1
+                if round_index < 0:
+                    try:
+                        round_index = int(entry.get("call_index", -1))
+                    except (TypeError, ValueError):
+                        round_index = -1
+                if round_index < 0:
+                    continue
+                max_verifier_round_index = max(max_verifier_round_index, round_index)
+                verifier_map[round_index] = entry
+            verifier_component_maps.append(verifier_map)
+
+        per_step_columns: dict[str, list[Any]] = {
+            "sttv_loc_num_calls": [len(entries) for entries in loc_reward_components],
+            "sttv_verifier_num_rounds": [len(entries) for entries in verifier_reward_components],
+        }
+        for call_index in range(max_loc_call_index + 1):
+            reward_col: list[Any] = []
+            quality_col: list[Any] = []
+            improve_col: list[Any] = []
+            raw_col: list[Any] = []
+            for sample_idx in range(batch_size):
+                entry = loc_component_maps[sample_idx].get(call_index)
+                reward_col.append(None if entry is None else _as_float(entry.get("loc_reward", 0.0)))
+                quality_col.append(None if entry is None else _as_float(entry.get("loc_reward_quality", 0.0)))
+                improve_col.append(None if entry is None else _as_float(entry.get("loc_reward_improve", 0.0)))
+                raw_col.append(None if entry is None else _as_float(entry.get("loc_reward_raw", 0.0)))
+            per_step_columns[f"sttv_loc_call_{call_index}_reward"] = reward_col
+            per_step_columns[f"sttv_loc_call_{call_index}_quality"] = quality_col
+            per_step_columns[f"sttv_loc_call_{call_index}_improve"] = improve_col
+            per_step_columns[f"sttv_loc_call_{call_index}_raw"] = raw_col
+
+        for round_index in range(max_verifier_round_index + 1):
+            reward_col = []
+            accuracy_col = []
+            usefulness_col = []
+            pq_estimate_col = []
+            pq_true_col = []
+            raw_col = []
+            for sample_idx in range(batch_size):
+                entry = verifier_component_maps[sample_idx].get(round_index)
+                reward_col.append(None if entry is None else _as_float(entry.get("verifier_reward", 0.0)))
+                accuracy_col.append(None if entry is None else _as_float(entry.get("verifier_accuracy", 0.0)))
+                usefulness_col.append(None if entry is None else _as_float(entry.get("verifier_usefulness", 0.0)))
+                pq_estimate_col.append(None if entry is None else _as_float(entry.get("pq_score_estimate", 0.0)))
+                pq_true_col.append(None if entry is None else _as_float(entry.get("pq_true", 0.0)))
+                raw_col.append(None if entry is None else _as_float(entry.get("verifier_reward_raw", 0.0)))
+            round_label = round_index + 1
+            per_step_columns[f"sttv_verifier_round_{round_label}_reward"] = reward_col
+            per_step_columns[f"sttv_verifier_round_{round_label}_accuracy"] = accuracy_col
+            per_step_columns[f"sttv_verifier_round_{round_label}_usefulness"] = usefulness_col
+            per_step_columns[f"sttv_verifier_round_{round_label}_pq_estimate"] = pq_estimate_col
+            per_step_columns[f"sttv_verifier_round_{round_label}_pq_true"] = pq_true_col
+            per_step_columns[f"sttv_verifier_round_{round_label}_raw"] = raw_col
+
+        sample_columns = {
             "sttv_answer_reward": answer_rewards,
             "sttv_loc_reward": loc_rewards,
             "sttv_loc_verifier_reward": loc_verifier_rewards,
@@ -1331,13 +1488,23 @@ class RayPPOTrainer:
             "sttv_loc_reward_weighted": loc_rewards_weighted,
             "sttv_loc_verifier_reward_weighted": loc_verifier_rewards_weighted,
             "sttv_global_reward": global_rewards,
+        }
+        # Keep per-step scalars close to core rewards so they are visible
+        # in default W&B table views (instead of far-right after JSON blobs).
+        sample_columns.update(per_step_columns)
+        sample_columns.update(
+            {
             "sttv_loc_plot": loc_plots,
             "sttv_sam3_plot": sam3_plots,
             "sttv_loc_reward_plot": loc_reward_plots,
             "sttv_loc_outputs_norm": loc_outputs_normalized,
             "sttv_sam3_outputs": sam3_outputs,
             "sttv_loc_call_rewards": loc_call_rewards,
-        }
+            "sttv_loc_reward_components": loc_reward_components,
+            "sttv_loc_verifier_reward_components": verifier_reward_components,
+            }
+        )
+        return sample_columns
 
     def _normalize_per_sample_call_rewards(
         self,
@@ -1552,7 +1719,12 @@ class RayPPOTrainer:
 
         return loc_rewards, total_calls, discard_rows
 
-    def _deserialize_sttv_images(self, serialized_images: Any) -> list[Image.Image]:
+    def _deserialize_sttv_images(
+        self,
+        serialized_images: Any,
+        *,
+        stats: Optional[dict[str, int]] = None,
+    ) -> list[Image.Image]:
         if not isinstance(serialized_images, (list, tuple)):
             return []
         images: list[Image.Image] = []
@@ -1562,10 +1734,31 @@ class RayPPOTrainer:
             image_bytes = image_blob.get("bytes")
             if image_bytes is None:
                 continue
-            try:
-                images.append(Image.open(BytesIO(image_bytes)).convert("RGB"))
-            except Exception:
+            if isinstance(image_bytes, bytearray):
+                image_bytes = bytes(image_bytes)
+            if not isinstance(image_bytes, bytes):
                 continue
+            cache_key = hashlib.sha1(image_bytes).hexdigest()
+            cached = self._sttv_image_decode_cache.get(cache_key)
+            if cached is not None:
+                if stats is not None:
+                    stats["cache_hits"] = int(stats.get("cache_hits", 0)) + 1
+                self._sttv_image_decode_cache.move_to_end(cache_key)
+                images.append(cached.copy())
+                continue
+            try:
+                decoded = Image.open(BytesIO(image_bytes)).convert("RGB")
+            except Exception:
+                if stats is not None:
+                    stats["decode_errors"] = int(stats.get("decode_errors", 0)) + 1
+                continue
+            if stats is not None:
+                stats["cache_misses"] = int(stats.get("cache_misses", 0)) + 1
+            self._sttv_image_decode_cache[cache_key] = decoded
+            self._sttv_image_decode_cache.move_to_end(cache_key)
+            while len(self._sttv_image_decode_cache) > STTV_IMAGE_DECODE_CACHE_SIZE:
+                self._sttv_image_decode_cache.popitem(last=False)
+            images.append(decoded.copy())
         return images
 
     def _compute_aux_multi_modal_inputs(
@@ -1589,6 +1782,24 @@ class RayPPOTrainer:
             images_seqlens = torch.repeat_interleave(image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0])
             multi_modal_inputs["images_seqlens"] = images_seqlens
         return multi_modal_inputs
+
+    def _build_aux_mm_processor_text(self, image_count: int) -> str:
+        """Build canonical multimodal text for processor() with exact image token count.
+
+        Aux prompt token ids already contain expanded image tokens. Decoding those ids
+        back to text can duplicate image markers and break batched processor calls
+        (image-token count no longer matches provided images). We use a canonical
+        processor text with one image marker per image to get stable image tensors.
+        """
+        if image_count <= 0:
+            return ""
+        if self.processor is None:
+            return " ".join(["<image>"] * image_count)
+        vision_start = str(getattr(self.processor, "vision_start_token", "<|vision_start|>"))
+        image_token = str(getattr(self.processor, "image_token", "<|image_pad|>"))
+        vision_end = str(getattr(self.processor, "vision_end_token", "<|vision_end|>"))
+        image_unit = f"{vision_start}{image_token}{vision_end}"
+        return " ".join([image_unit] * image_count)
 
     def _split_aux_batched_processor_output(
         self,
@@ -1664,7 +1875,6 @@ class RayPPOTrainer:
             return ([{} for _ in texts], 0)
 
         outputs: list[dict[str, torch.Tensor]] = [{} for _ in texts]
-        fallback_rows = 0
         for start in range(0, len(texts), max(1, int(chunk_size))):
             end = min(len(texts), start + max(1, int(chunk_size)))
             chunk_texts = texts[start:end]
@@ -1677,21 +1887,23 @@ class RayPPOTrainer:
                     return_tensors="pt",
                     do_sample_frames=False,
                 )
-                batched_multi_modal_inputs.pop("input_ids", None)
-                batched_multi_modal_inputs.pop("attention_mask", None)
-                batched_multi_modal_inputs = dict(batched_multi_modal_inputs.convert_to_tensors("pt"))
-                chunk_outputs = self._split_aux_batched_processor_output(
-                    batched_outputs=batched_multi_modal_inputs,
-                    image_counts=image_counts,
-                )
-                for idx, chunk_output in enumerate(chunk_outputs):
-                    outputs[start + idx] = chunk_output
-            except Exception:
-                fallback_rows += end - start
-                for local_idx, (text, images) in enumerate(zip(chunk_texts, chunk_images, strict=True)):
-                    outputs[start + local_idx] = self._compute_aux_multi_modal_inputs(text=text, images=images)
+            except Exception as exc:
+                raise RuntimeError(
+                    "Failed batched verifier multimodal preprocessing. "
+                    "This path no longer falls back to per-row processing."
+                ) from exc
 
-        return outputs, fallback_rows
+            batched_multi_modal_inputs.pop("input_ids", None)
+            batched_multi_modal_inputs.pop("attention_mask", None)
+            batched_multi_modal_inputs = dict(batched_multi_modal_inputs.convert_to_tensors("pt"))
+            chunk_outputs = self._split_aux_batched_processor_output(
+                batched_outputs=batched_multi_modal_inputs,
+                image_counts=image_counts,
+            )
+            for idx, chunk_output in enumerate(chunk_outputs):
+                outputs[start + idx] = chunk_output
+
+        return outputs, 0
 
     def _compute_aux_position_ids(
         self,
@@ -1721,6 +1933,7 @@ class RayPPOTrainer:
     def _build_sttv_loc_verifier_aux_batch(
         self, batch: DataProto
     ) -> tuple[Optional[DataProto], dict[str, float]]:
+        t_total_start = time.perf_counter()
         verifier_calls_raw = batch.non_tensor_batch.get("sttv_loc_verifier_calls")
         if verifier_calls_raw is None:
             return None, {
@@ -1728,6 +1941,14 @@ class RayPPOTrainer:
                 "sttv/aux_response_len": 0.0,
                 "sttv/aux_rows_dropped_no_images": 0.0,
                 "sttv/aux_multimodal_fallback_rows": 0.0,
+                "sttv/aux_build_time_total_s": 0.0,
+                "sttv/aux_build_time_collect_rows_s": 0.0,
+                "sttv/aux_build_time_pack_tensors_s": 0.0,
+                "sttv/aux_build_time_mm_inputs_s": 0.0,
+                "sttv/aux_build_time_position_ids_s": 0.0,
+                "sttv/aux_decode_cache_hits": 0.0,
+                "sttv/aux_decode_cache_misses": 0.0,
+                "sttv/aux_decode_errors": 0.0,
             }
 
         max_prompt_len = int(self.config.actor_rollout_ref.rollout.prompt_length)
@@ -1742,6 +1963,8 @@ class RayPPOTrainer:
 
         aux_rows: list[dict[str, Any]] = []
         dropped_no_images = 0
+        decode_stats = {"cache_hits": 0, "cache_misses": 0, "decode_errors": 0}
+        t_collect_rows_start = time.perf_counter()
 
         for row_idx in range(len(batch)):
             uid = str(batch.non_tensor_batch["uid"][row_idx])
@@ -1771,11 +1994,19 @@ class RayPPOTrainer:
                     continue
 
                 if len(prompt_token_ids) > max_prompt_len:
-                    prompt_token_ids = prompt_token_ids[-max_prompt_len:]
+                    raise RuntimeError(
+                        "Aux verifier prompt exceeds configured prompt length and truncation is disabled: "
+                        f"prompt_tokens={len(prompt_token_ids)} > rollout.prompt_length={max_prompt_len}. "
+                        "Increase data.max_prompt_length (and rollout.prompt_length) in the launch config."
+                    )
                 if len(output_token_ids) > max_response_len:
-                    output_token_ids = output_token_ids[:max_response_len]
+                    raise RuntimeError(
+                        "Aux verifier response exceeds configured response length and truncation is disabled: "
+                        f"response_tokens={len(output_token_ids)} > rollout.response_length={max_response_len}. "
+                        "Increase data.max_response_length (and rollout.response_length) in the launch config."
+                    )
 
-                images = self._deserialize_sttv_images(call_record.get("verifier_images", []))
+                images = self._deserialize_sttv_images(call_record.get("verifier_images", []), stats=decode_stats)
                 if self.processor is not None and len(images) == 0:
                     # Verifier calls in VLM mode require image tensors for image placeholder tokens.
                     dropped_no_images += 1
@@ -1803,6 +2034,7 @@ class RayPPOTrainer:
                         "images": images,
                     }
                 )
+        t_collect_rows = time.perf_counter() - t_collect_rows_start
 
         if len(aux_rows) == 0:
             return None, {
@@ -1810,6 +2042,14 @@ class RayPPOTrainer:
                 "sttv/aux_response_len": 0.0,
                 "sttv/aux_rows_dropped_no_images": float(dropped_no_images),
                 "sttv/aux_multimodal_fallback_rows": 0.0,
+                "sttv/aux_build_time_total_s": float(time.perf_counter() - t_total_start),
+                "sttv/aux_build_time_collect_rows_s": float(t_collect_rows),
+                "sttv/aux_build_time_pack_tensors_s": 0.0,
+                "sttv/aux_build_time_mm_inputs_s": 0.0,
+                "sttv/aux_build_time_position_ids_s": 0.0,
+                "sttv/aux_decode_cache_hits": float(decode_stats["cache_hits"]),
+                "sttv/aux_decode_cache_misses": float(decode_stats["cache_misses"]),
+                "sttv/aux_decode_errors": float(decode_stats["decode_errors"]),
             }
 
         aux_prompt_len = min(max_prompt_len, max(1, max(len(row["prompt_token_ids"]) for row in aux_rows)))
@@ -1833,6 +2073,7 @@ class RayPPOTrainer:
         aux_solution_strs: list[str] = []
         aux_extra_infos: list[dict[str, Any]] = []
 
+        t_pack_tensors_start = time.perf_counter()
         for row in aux_rows:
             prompt_token_ids = row["prompt_token_ids"]
             output_token_ids = row["output_token_ids"]
@@ -1857,7 +2098,7 @@ class RayPPOTrainer:
             response_masks.append(response_mask)
             input_ids_all.append(input_ids)
             attention_masks.append(attention_mask)
-            aux_texts.append(self.tokenizer.decode(input_ids, skip_special_tokens=True))
+            aux_texts.append(self._build_aux_mm_processor_text(len(row["images"])))
             aux_images.append(row["images"])
 
             uid = row["uid"]
@@ -1871,7 +2112,9 @@ class RayPPOTrainer:
             aux_ground_truths.append(row["ground_truth"])
             aux_solution_strs.append(row["parent_solution_str"])
             aux_extra_infos.append(row["extra_info"])
+        t_pack_tensors = time.perf_counter() - t_pack_tensors_start
 
+        t_mm_inputs_start = time.perf_counter()
         if self.processor is not None:
             multi_modal_inputs_list, fallback_rows = self._compute_aux_multi_modal_inputs_batched(
                 texts=aux_texts,
@@ -1880,7 +2123,9 @@ class RayPPOTrainer:
         else:
             multi_modal_inputs_list = [{} for _ in aux_rows]
             fallback_rows = 0
+        t_mm_inputs = time.perf_counter() - t_mm_inputs_start
 
+        t_position_ids_start = time.perf_counter()
         position_ids_all: list[torch.Tensor] = []
         for input_ids, attention_mask, multi_modal_inputs in zip(
             input_ids_all, attention_masks, multi_modal_inputs_list, strict=True
@@ -1891,6 +2136,7 @@ class RayPPOTrainer:
                 multi_modal_inputs,
             ).squeeze(0)
             position_ids_all.append(position_ids)
+        t_position_ids = time.perf_counter() - t_position_ids_start
 
         tensors = {
             "prompts": torch.stack(prompts, dim=0),
@@ -1918,6 +2164,14 @@ class RayPPOTrainer:
             "sttv/aux_response_len": float(aux_response_len),
             "sttv/aux_rows_dropped_no_images": float(dropped_no_images),
             "sttv/aux_multimodal_fallback_rows": float(fallback_rows),
+            "sttv/aux_build_time_total_s": float(time.perf_counter() - t_total_start),
+            "sttv/aux_build_time_collect_rows_s": float(t_collect_rows),
+            "sttv/aux_build_time_pack_tensors_s": float(t_pack_tensors),
+            "sttv/aux_build_time_mm_inputs_s": float(t_mm_inputs),
+            "sttv/aux_build_time_position_ids_s": float(t_position_ids),
+            "sttv/aux_decode_cache_hits": float(decode_stats["cache_hits"]),
+            "sttv/aux_decode_cache_misses": float(decode_stats["cache_misses"]),
+            "sttv/aux_decode_errors": float(decode_stats["decode_errors"]),
         }
         return aux_batch, aux_metrics
 
@@ -2050,6 +2304,136 @@ class RayPPOTrainer:
         zero_count = int(zero_adv.sum().item())
         return zero_count, active_count
 
+    def _build_sttv_batch_view(
+        self,
+        batch: DataProto,
+        *,
+        tensor_keys: Sequence[str],
+        non_tensor_keys: Sequence[str],
+    ) -> DataProto:
+        tensors = {key: batch.batch[key] for key in tensor_keys if key in batch.batch}
+        non_tensors: dict[str, np.ndarray] = {}
+        for key in non_tensor_keys:
+            if key in batch.non_tensor_batch:
+                non_tensors[key] = batch.non_tensor_batch[key]
+            else:
+                non_tensors[key] = np.array([None] * len(batch), dtype=object)
+        return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=deepcopy(batch.meta_info))
+
+    def _align_sttv_aux_tensor_to_main_template(
+        self,
+        *,
+        key: str,
+        aux_tensor: torch.Tensor,
+        template: torch.Tensor,
+        aux_rows: int,
+        main_prompt_len: int,
+        main_response_len: int,
+        aux_prompt_len: int,
+        aux_response_len: int,
+        response_tensor_keys: set[str],
+        full_seq_tensor_keys: set[str],
+    ) -> torch.Tensor:
+        if tuple(aux_tensor.shape[1:]) == tuple(template.shape[1:]):
+            return aux_tensor.to(dtype=template.dtype, device=template.device)
+
+        target = torch.zeros(
+            (aux_rows,) + tuple(template.shape[1:]),
+            dtype=template.dtype,
+            device=template.device,
+        )
+        src = aux_tensor.to(dtype=template.dtype, device=template.device)
+
+        if key == "prompts":
+            copy_len = min(src.shape[-1], target.shape[-1], aux_prompt_len, main_prompt_len)
+            if copy_len > 0:
+                target[..., -copy_len:] = src[..., -copy_len:]
+            return target
+
+        if key in response_tensor_keys:
+            copy_len = min(src.shape[-1], target.shape[-1], aux_response_len, main_response_len)
+            if copy_len > 0:
+                target[..., :copy_len] = src[..., :copy_len]
+            return target
+
+        if key in full_seq_tensor_keys:
+            prompt_copy_len = min(aux_prompt_len, main_prompt_len)
+            if prompt_copy_len > 0:
+                target[..., main_prompt_len - prompt_copy_len : main_prompt_len] = src[
+                    ..., aux_prompt_len - prompt_copy_len : aux_prompt_len
+                ]
+            response_copy_len = min(aux_response_len, main_response_len)
+            if response_copy_len > 0:
+                target[..., main_prompt_len : main_prompt_len + response_copy_len] = src[
+                    ..., aux_prompt_len : aux_prompt_len + response_copy_len
+                ]
+            return target
+
+        raise RuntimeError(
+            f"Unsupported aux/main tensor shape mismatch for key '{key}': "
+            f"aux={tuple(aux_tensor.shape[1:])}, main={tuple(template.shape[1:])}"
+        )
+
+    def _build_sttv_aligned_main_aux_batches(
+        self,
+        main_batch: DataProto,
+        aux_batch: Optional[DataProto],
+        *,
+        tensor_keys: Sequence[str],
+        non_tensor_keys: Sequence[str],
+        response_tensor_keys: set[str],
+        full_seq_tensor_keys: set[str],
+    ) -> tuple[DataProto, Optional[DataProto]]:
+        main_view = self._build_sttv_batch_view(
+            main_batch,
+            tensor_keys=tensor_keys,
+            non_tensor_keys=non_tensor_keys,
+        )
+        if aux_batch is None or len(aux_batch) == 0:
+            return main_view, None
+
+        aux_rows = len(aux_batch)
+        main_prompt_len = int(main_view.batch["prompts"].shape[-1]) if "prompts" in main_view.batch else 0
+        main_response_len = int(main_view.batch["responses"].shape[-1]) if "responses" in main_view.batch else 0
+        aux_prompt_len = int(aux_batch.batch["prompts"].shape[-1]) if "prompts" in aux_batch.batch else 0
+        aux_response_len = int(aux_batch.batch["responses"].shape[-1]) if "responses" in aux_batch.batch else 0
+
+        aux_tensors: dict[str, torch.Tensor] = {}
+        for key, template in main_view.batch.items():
+            if key in aux_batch.batch:
+                aux_tensors[key] = self._align_sttv_aux_tensor_to_main_template(
+                    key=key,
+                    aux_tensor=aux_batch.batch[key],
+                    template=template,
+                    aux_rows=aux_rows,
+                    main_prompt_len=main_prompt_len,
+                    main_response_len=main_response_len,
+                    aux_prompt_len=aux_prompt_len,
+                    aux_response_len=aux_response_len,
+                    response_tensor_keys=response_tensor_keys,
+                    full_seq_tensor_keys=full_seq_tensor_keys,
+                )
+            else:
+                aux_tensors[key] = torch.zeros(
+                    (aux_rows,) + tuple(template.shape[1:]),
+                    dtype=template.dtype,
+                    device=template.device,
+                )
+
+        aux_non_tensors: dict[str, np.ndarray] = {}
+        for key in non_tensor_keys:
+            if key in aux_batch.non_tensor_batch:
+                aux_non_tensors[key] = aux_batch.non_tensor_batch[key]
+            else:
+                aux_non_tensors[key] = np.array([None] * aux_rows, dtype=object)
+
+        aux_view = DataProto.from_dict(
+            tensors=aux_tensors,
+            non_tensors=aux_non_tensors,
+            meta_info=deepcopy(main_batch.meta_info),
+        )
+        return main_view, aux_view
+
     def _compose_sttv_actor_batch(self, main_batch: DataProto, aux_batch: Optional[DataProto]) -> DataProto:
         tensor_keys = [
             "prompts",
@@ -2070,27 +2454,7 @@ class RayPPOTrainer:
         if "ref_log_prob" in main_batch.batch:
             tensor_keys.append("ref_log_prob")
 
-        main_tensors = {key: main_batch.batch[key] for key in tensor_keys if key in main_batch.batch}
         non_tensor_keys = ["uid", "multi_modal_inputs"]
-        main_non_tensors = {}
-        for key in non_tensor_keys:
-            if key in main_batch.non_tensor_batch:
-                main_non_tensors[key] = main_batch.non_tensor_batch[key]
-            else:
-                main_non_tensors[key] = np.array([None] * len(main_batch), dtype=object)
-        main_actor_batch = DataProto.from_dict(
-            tensors=main_tensors,
-            non_tensors=main_non_tensors,
-            meta_info=deepcopy(main_batch.meta_info),
-        )
-        if aux_batch is None or len(aux_batch) == 0:
-            return main_actor_batch
-
-        main_prompt_len = int(main_tensors["prompts"].shape[-1]) if "prompts" in main_tensors else 0
-        main_response_len = int(main_tensors["responses"].shape[-1]) if "responses" in main_tensors else 0
-        aux_prompt_len = int(aux_batch.batch["prompts"].shape[-1]) if "prompts" in aux_batch.batch else 0
-        aux_response_len = int(aux_batch.batch["responses"].shape[-1]) if "responses" in aux_batch.batch else 0
-
         response_tensor_keys = {
             "responses",
             "response_mask",
@@ -2105,71 +2469,16 @@ class RayPPOTrainer:
             "ref_log_prob",
         }
         full_seq_tensor_keys = {"input_ids", "attention_mask", "position_ids"}
-
-        def _align_aux_tensor(key: str, aux_tensor: torch.Tensor, template: torch.Tensor) -> torch.Tensor:
-            if tuple(aux_tensor.shape[1:]) == tuple(template.shape[1:]):
-                return aux_tensor.to(dtype=template.dtype, device=template.device)
-
-            target = torch.zeros(
-                (len(aux_batch),) + tuple(template.shape[1:]),
-                dtype=template.dtype,
-                device=template.device,
-            )
-            src = aux_tensor.to(dtype=template.dtype, device=template.device)
-
-            if key == "prompts":
-                copy_len = min(src.shape[-1], target.shape[-1], aux_prompt_len, main_prompt_len)
-                if copy_len > 0:
-                    target[..., -copy_len:] = src[..., -copy_len:]
-                return target
-
-            if key in response_tensor_keys:
-                copy_len = min(src.shape[-1], target.shape[-1], aux_response_len, main_response_len)
-                if copy_len > 0:
-                    target[..., :copy_len] = src[..., :copy_len]
-                return target
-
-            if key in full_seq_tensor_keys:
-                prompt_copy_len = min(aux_prompt_len, main_prompt_len)
-                if prompt_copy_len > 0:
-                    target[..., main_prompt_len - prompt_copy_len : main_prompt_len] = src[
-                        ..., aux_prompt_len - prompt_copy_len : aux_prompt_len
-                    ]
-                response_copy_len = min(aux_response_len, main_response_len)
-                if response_copy_len > 0:
-                    target[..., main_prompt_len : main_prompt_len + response_copy_len] = src[
-                        ..., aux_prompt_len : aux_prompt_len + response_copy_len
-                    ]
-                return target
-
-            raise RuntimeError(
-                f"Unsupported aux/main tensor shape mismatch for key '{key}': "
-                f"aux={tuple(aux_tensor.shape[1:])}, main={tuple(template.shape[1:])}"
-            )
-
-        aux_tensors: dict[str, torch.Tensor] = {}
-        for key, template in main_tensors.items():
-            if key in aux_batch.batch:
-                aux_tensors[key] = _align_aux_tensor(key, aux_batch.batch[key], template)
-            else:
-                aux_tensors[key] = torch.zeros(
-                    (len(aux_batch),) + tuple(template.shape[1:]),
-                    dtype=template.dtype,
-                    device=template.device,
-                )
-
-        aux_non_tensors: dict[str, np.ndarray] = {}
-        for key in non_tensor_keys:
-            if key in aux_batch.non_tensor_batch:
-                aux_non_tensors[key] = aux_batch.non_tensor_batch[key]
-            else:
-                aux_non_tensors[key] = np.array([None] * len(aux_batch), dtype=object)
-
-        aux_actor_batch = DataProto.from_dict(
-            tensors=aux_tensors,
-            non_tensors=aux_non_tensors,
-            meta_info=deepcopy(main_batch.meta_info),
+        main_actor_batch, aux_actor_batch = self._build_sttv_aligned_main_aux_batches(
+            main_batch,
+            aux_batch,
+            tensor_keys=tensor_keys,
+            non_tensor_keys=non_tensor_keys,
+            response_tensor_keys=response_tensor_keys,
+            full_seq_tensor_keys=full_seq_tensor_keys,
         )
+        if aux_actor_batch is None:
+            return main_actor_batch
 
         merged = DataProto.concat([main_actor_batch, aux_actor_batch])
         merged.meta_info = deepcopy(main_batch.meta_info)
@@ -2193,33 +2502,31 @@ class RayPPOTrainer:
         old_log_prob = unpad_dataproto(old_log_prob, pad_size=pad_size)
         return old_log_prob, mfu
 
-    def _can_merge_old_log_prob_batches(self, main_batch: DataProto, aux_batch: Optional[DataProto]) -> bool:
-        if aux_batch is None or len(aux_batch) == 0:
-            return False
-        if "multi_modal_inputs" not in main_batch.non_tensor_batch or "multi_modal_inputs" not in aux_batch.non_tensor_batch:
-            return False
-        required_keys = ("responses", "input_ids", "attention_mask", "position_ids")
-        for key in required_keys:
-            if key not in main_batch.batch or key not in aux_batch.batch:
-                return False
-            main_shape = tuple(main_batch.batch[key].shape[1:])
-            aux_shape = tuple(aux_batch.batch[key].shape[1:])
-            if main_shape != aux_shape:
-                return False
-        return True
-
     def _compute_main_aux_old_log_prob(
         self, main_batch: DataProto, aux_batch: Optional[DataProto]
     ) -> tuple[DataProto, Optional[DataProto], float, bool]:
-        if not self._can_merge_old_log_prob_batches(main_batch, aux_batch):
+        if aux_batch is None or len(aux_batch) == 0:
             main_old_log_prob, mfu = self._compute_old_log_prob_with_padding(main_batch)
-            aux_old_log_prob = None
-            if aux_batch is not None and len(aux_batch) > 0:
-                aux_old_log_prob, _ = self._compute_old_log_prob_with_padding(aux_batch)
-            return main_old_log_prob, aux_old_log_prob, mfu, False
+            return main_old_log_prob, None, mfu, False
+
+        tensor_keys = ["responses", "input_ids", "attention_mask", "position_ids", "prompts", "response_mask"]
+        non_tensor_keys = ["uid", "multi_modal_inputs"]
+        response_tensor_keys = {"responses", "response_mask"}
+        full_seq_tensor_keys = {"input_ids", "attention_mask", "position_ids"}
+        main_log_prob_batch, aux_log_prob_batch = self._build_sttv_aligned_main_aux_batches(
+            main_batch,
+            aux_batch,
+            tensor_keys=tensor_keys,
+            non_tensor_keys=non_tensor_keys,
+            response_tensor_keys=response_tensor_keys,
+            full_seq_tensor_keys=full_seq_tensor_keys,
+        )
+        if aux_log_prob_batch is None:
+            main_old_log_prob, mfu = self._compute_old_log_prob_with_padding(main_batch)
+            return main_old_log_prob, None, mfu, False
 
         merged_log_prob_batch = DataProto.concat(
-            [self._prepare_batch_for_log_prob(main_batch), self._prepare_batch_for_log_prob(aux_batch)]
+            [self._prepare_batch_for_log_prob(main_log_prob_batch), self._prepare_batch_for_log_prob(aux_log_prob_batch)]
         )
         merged_old_log_prob, mfu = self._compute_old_log_prob_with_padding(merged_log_prob_batch)
         main_rows = len(main_batch)
@@ -3297,7 +3604,9 @@ class RayPPOTrainer:
                             raise ValueError(
                                 "STTV multi-objective currently does not support algorithm.use_kl_in_reward=True."
                             )
+                        t_aux_batch_start = time.perf_counter()
                         aux_batch, aux_batch_metrics = self._build_sttv_loc_verifier_aux_batch(batch)
+                        metrics["sttv/aux_batch_build_time_s"] = float(time.perf_counter() - t_aux_batch_start)
                         if aux_batch_metrics:
                             metrics.update(aux_batch_metrics)
 
@@ -3469,11 +3778,13 @@ class RayPPOTrainer:
 
                             # Objective 3: loc calls.
                             loc_mask = self._extract_sttv_mask_tensor(batch, "sttv_loc_mask")
+                            t_loc_reward_start = time.perf_counter()
                             loc_score_tensor, total_loc_calls, discard_rows = self._compute_sttv_loc_call_reward_tensor(
                                 batch,
                                 sttv_reward_fns.get("loc"),
                                 reward_kwargs=sttv_reward_kwargs,
                             )
+                            metrics["sttv/loc_reward_eval_time_s"] = float(time.perf_counter() - t_loc_reward_start)
                             discard_count = int(sum(1 for dropped in discard_rows if dropped))
                             if discard_count > 0:
                                 discard_mask = torch.tensor(discard_rows, dtype=torch.bool, device=answer_mask.device)
@@ -3557,10 +3868,14 @@ class RayPPOTrainer:
                                     aux_ref_log_prob = self._compute_ref_log_prob_with_padding(aux_batch)
                                     aux_batch = aux_batch.union(aux_ref_log_prob)
 
+                                t_loc_verifier_reward_start = time.perf_counter()
                                 aux_verifier_scores, total_loc_verifier_calls = self._compute_sttv_loc_verifier_reward_tensor(
                                     aux_batch,
                                     sttv_reward_fns.get("loc_verifier"),
                                     reward_kwargs=sttv_reward_kwargs,
+                                )
+                                metrics["sttv/loc_verifier_reward_eval_time_s"] = float(
+                                    time.perf_counter() - t_loc_verifier_reward_start
                                 )
                                 aux_verifier_mask = aux_batch.batch["response_mask"].to(dtype=answer_mask.dtype)
                                 if discard_count > 0:

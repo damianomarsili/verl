@@ -648,6 +648,7 @@ class AgentLoopWorker:
             output,
             prompts=prompt_output["input_ids"],
             responses=response_output["input_ids"],
+            response_mask=response_mask,
             attention_mask=attention_mask,
             input_ids=input_ids,
             position_ids=position_ids,
@@ -730,7 +731,17 @@ class AgentLoopWorker:
         position_ids = torch.cat((text_position_ids, vision_position_ids), dim=1)  # (1, 4, seq_length)
         return position_ids
 
-    async def _compute_score(self, output, prompts, responses, attention_mask, input_ids, position_ids, kwargs):
+    async def _compute_score(
+        self,
+        output,
+        prompts,
+        responses,
+        response_mask,
+        attention_mask,
+        input_ids,
+        position_ids,
+        kwargs,
+    ):
         """Compute reward score for single sample."""
         enable_async_reward = (
             self.reward_router_address is not None and self.config.reward_model.enable_resource_pool
@@ -741,6 +752,7 @@ class AgentLoopWorker:
                 {
                     "prompts": prompts,  # [1, prompt_length]
                     "responses": responses,  # [1, response_length]
+                    "response_mask": response_mask,  # [1, response_length]
                     "attention_mask": attention_mask,  # [1, prompt_length + response_length]
                     "input_ids": input_ids,  # [1, prompt_length + response_length]
                     "position_ids": position_ids,
