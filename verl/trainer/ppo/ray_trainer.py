@@ -1911,7 +1911,13 @@ class RayPPOTrainer:
         attention_mask: torch.Tensor,
         multi_modal_inputs: dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        if self.processor is None or ("image_grid_thw" not in multi_modal_inputs and "video_grid_thw" not in multi_modal_inputs):
+        use_vision_rope = (
+            self.processor is not None
+            and getattr(self.processor, "_verl_use_vision_rope", False)
+            and hasattr(self.processor, "get_rope_index")
+            and ("image_grid_thw" in multi_modal_inputs or "video_grid_thw" in multi_modal_inputs)
+        )
+        if not use_vision_rope:
             return compute_position_id_with_mask(attention_mask)
 
         image_grid_thw = multi_modal_inputs.get("image_grid_thw")

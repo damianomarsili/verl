@@ -709,7 +709,13 @@ class AgentLoopWorker:
 
     def _compute_position_ids(self, input_ids, attention_mask, multi_modal_inputs) -> torch.Tensor:
         """Compute position ids for multi-modal inputs."""
-        if self.processor is None:
+        use_vision_rope = (
+            self.processor is not None
+            and getattr(self.processor, "_verl_use_vision_rope", False)
+            and hasattr(self.processor, "get_rope_index")
+            and ("image_grid_thw" in multi_modal_inputs or "video_grid_thw" in multi_modal_inputs)
+        )
+        if not use_vision_rope:
             return compute_position_id_with_mask(attention_mask)  # (1, seq_len)
 
         image_grid_thw = multi_modal_inputs.get("image_grid_thw")
