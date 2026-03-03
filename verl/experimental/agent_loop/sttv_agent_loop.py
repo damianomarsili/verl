@@ -13,7 +13,6 @@
 # limitations under the License.
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -24,6 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 from PIL import Image, ImageDraw, ImageFont
+import torch
 from transformers import AutoProcessor, AutoTokenizer
 
 from verl.experimental.agent_loop.agent_loop import (
@@ -39,15 +39,23 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 BOX_COLOR = (0, 0, 255)
-BOX_FILL_RGBA = (0, 0, 255, 25)
 FONT_SCALE = 0.022
 BOX_OUTLINE_SCALE = 0.005
 LABEL_PADDING = 2
 VERIFIER_IMAGE_JPEG_QUALITY = 85
 BBOX_2D_ENTRY_PATTERN = re.compile(
-    r'^\s*label\s*=\s*"(?P<label>[^"\n]+?)"\s*,\s*\[(?P<coords>[^\]]+)\]\s*$',
+    r'^\s*(?P<idx>\d+)\s*:\s*label\s*=\s*"(?P<label>[^"\n]+?)"\s*,\s*\[(?P<coords>[^\]]+)\]\s*$',
     flags=re.IGNORECASE,
 )
+VERIFIER_EDIT_PATTERN = re.compile(r"(?i)^EDIT\s+(?P<idx>\d+)\s*:\s*(?P<body>.+)$")
+VERIFIER_REMOVE_PATTERN = re.compile(r"(?i)^REMOVE\s+(?P<idx>\d+)\s*$")
+VERIFIER_ADD_PATTERN = re.compile(
+    r'(?i)^ADD\s+label\s*=\s*"(?P<label>[^"\n]+?)"\s*,\s*\['
+    r"\s*(?P<x1>-?\d+(?:\.\d+)?)\s*,\s*(?P<y1>-?\d+(?:\.\d+)?)\s*,\s*"
+    r"(?P<x2>-?\d+(?:\.\d+)?)\s*,\s*(?P<y2>-?\d+(?:\.\d+)?)\s*\]\s*$"
+)
+VERIFIER_COORD_KEYWORD_PATTERN = re.compile(r"(?i)\b(x_min|x_max|y_min|y_max|left|right|top|bottom|width|height)\b")
+VERIFIER_NUMBER_PATTERN = re.compile(r"-?\d+(?:\.\d+)?")
 
 
 @dataclass(frozen=True)
@@ -87,6 +95,11 @@ class SttvAgentLoop(AgentLoopBase):
         self.verifier_image_side = int(verifier_image_side)
         self.loc_verifier_rounds = max(0, int(loc_verifier_rounds))
         self.verifier_max_new_tokens = int(verifier_max_new_tokens)
+        sttv_perf_cfg = config.algorithm.get("sttv_perf", {}) if "algorithm" in config else {}
+        self.aux_mm_reuse_enable = self._coerce_bool(sttv_perf_cfg.get("aux_mm_reuse_enable", True), True)
+        self.agent_loop_cpu_cleanup_enable = self._coerce_bool(
+            sttv_perf_cfg.get("agent_loop_cpu_cleanup_enable", True), True
+        )
 
         self.max_new_tokens_per_chunk = int(max_new_tokens_per_chunk)
 
@@ -95,6 +108,21 @@ class SttvAgentLoop(AgentLoopBase):
         self.prompt_template = self._read_prompt_file(prompt_file)
         self.instruction_text = self._read_prompt_file(prompts_dir / "instructions_box.txt")
         self.verifier_template = self._read_prompt_file(prompts_dir / "verifier_instructions.txt")
+
+    @staticmethod
+    def _coerce_bool(value: Any, default: bool) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        normalized = str(value).strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+        return default
 
     def _resolve_prompts_dir(self) -> Path:
         here = Path(__file__).resolve()
@@ -158,8 +186,8 @@ class SttvAgentLoop(AgentLoopBase):
     def _build_messages(self, prompt: str, images: list[Image.Image]) -> list[dict[str, object]]:
         content: list[dict[str, object]] = []
         for image in images:
-            resized = self._resize_longest_side(image.convert("RGB"), self.max_image_side)
-            content.append({"type": "image", "image": resized})
+            # `images` are expected to be pre-resized RGB images.
+            content.append({"type": "image", "image": image})
         content.append({"type": "text", "text": prompt})
         return [{"role": "user", "content": content}]
 
@@ -214,8 +242,15 @@ class SttvAgentLoop(AgentLoopBase):
 
         width, height = base.size
         outline_width = max(2, int(min(width, height) * BOX_OUTLINE_SCALE))
-        idx = 1
-        for entry in entries:
+        indexed_entries: list[tuple[int, LocEntry, float]] = []
+        for idx, entry in enumerate(entries, start=1):
+            x1, y1, x2, y2 = entry.coords[:4]
+            area = max(0.0, float(x2 - x1)) * max(0.0, float(y2 - y1))
+            indexed_entries.append((idx, entry, area))
+        # Draw larger boxes first so smaller nested boxes remain visible on top.
+        indexed_entries.sort(key=lambda item: item[2], reverse=True)
+
+        for idx, entry, _ in indexed_entries:
             x1, y1, x2, y2 = entry.coords[:4]
             left, top = self._scale_point(x1, y1, width, height)
             right, bottom = self._scale_point(x2, y2, width, height)
@@ -227,7 +262,6 @@ class SttvAgentLoop(AgentLoopBase):
                 (left, top, right, bottom),
                 outline=BOX_COLOR,
                 width=outline_width,
-                fill=BOX_FILL_RGBA,
             )
             label = f"{idx}:{entry.label}" if entry.label else str(idx)
             text_w, text_h = self._measure_text(draw, label, font)
@@ -238,7 +272,6 @@ class SttvAgentLoop(AgentLoopBase):
                 fill=(255, 255, 255, 200),
             )
             draw.text((text_x, text_y), label, fill=BOX_COLOR, font=font)
-            idx += 1
 
         return Image.alpha_composite(base, overlay).convert("RGB")
 
@@ -359,6 +392,12 @@ class SttvAgentLoop(AgentLoopBase):
             match = BBOX_2D_ENTRY_PATTERN.fullmatch(line)
             if match is None:
                 return []
+            try:
+                idx = int(match.group("idx"))
+            except (TypeError, ValueError):
+                return []
+            if idx != len(entries) + 1:
+                return []
 
             label = match.group("label").strip()
             if not label:
@@ -368,6 +407,11 @@ class SttvAgentLoop(AgentLoopBase):
             if len(numbers) != 4:
                 return []
             coords_tuple = tuple(float(n) for n in numbers[:4])
+            x1, y1, x2, y2 = coords_tuple
+            if not (0.0 <= x1 <= 1000.0 and 0.0 <= y1 <= 1000.0 and 0.0 <= x2 <= 1000.0 and 0.0 <= y2 <= 1000.0):
+                return []
+            if x2 <= x1 or y2 <= y1:
+                return []
 
             entries.append(LocEntry(image_index=1, label=label, coords=coords_tuple))
         if nonempty_line_count == 0:
@@ -390,7 +434,9 @@ class SttvAgentLoop(AgentLoopBase):
             if len(entry.coords) < 4:
                 continue
             x1, y1, x2, y2 = entry.coords[:4]
-            if x2 < x1 or y2 < y1:
+            if x2 <= x1 or y2 <= y1:
+                return True
+            if not (0.0 <= x1 <= 1000.0 and 0.0 <= y1 <= 1000.0 and 0.0 <= x2 <= 1000.0 and 0.0 <= y2 <= 1000.0):
                 return True
         return False
 
@@ -407,48 +453,84 @@ class SttvAgentLoop(AgentLoopBase):
         preds_str = "\n".join(lines) if lines else "(none)"
         return self.verifier_template.format(targets=targets_str, preds=preds_str)
 
-    def _parse_verifier_feedback(self, text: str) -> tuple[float, str, str]:
+    def _parse_verifier_feedback(self, text: str, entries: list[LocEntry]) -> tuple[str, str]:
         cleaned = text.replace("<|im_end|>", "").strip()
-        pq_score = 0.0
-        corrections = ""
-        payload_obj: Any = None
+        valid_indices = set(range(1, len(entries) + 1))
+        index_actions: dict[int, tuple[str, int]] = {}
+        add_actions: list[tuple[str, int]] = []
+        add_seen: set[str] = set()
+        line_order = 0
 
-        candidates: list[str] = []
-        fenced_match = re.search(r"(?is)```(?:json)?\s*(\{.*?\})\s*```", cleaned)
-        if fenced_match:
-            candidates.append(fenced_match.group(1).strip())
-        brace_match = re.search(r"(?is)\{.*\}", cleaned)
-        if brace_match:
-            candidates.append(brace_match.group(0).strip())
-        if cleaned:
-            candidates.append(cleaned)
+        def _format_coord(value: float) -> str:
+            if float(value).is_integer():
+                return str(int(value))
+            return f"{float(value):.3f}".rstrip("0").rstrip(".")
 
-        for candidate in candidates:
-            try:
-                parsed = json.loads(candidate)
-            except (TypeError, ValueError):
+        for raw_line in cleaned.splitlines():
+            line = raw_line.strip()
+            if not line:
                 continue
-            if isinstance(parsed, dict):
-                payload_obj = parsed
-                break
+            line = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
+            if not line:
+                continue
+            if line.lower().startswith("corrections:"):
+                line = line.split(":", 1)[1].strip()
+                if not line:
+                    continue
 
-        if isinstance(payload_obj, dict):
-            raw_pq = payload_obj.get("pq_score_estimate", payload_obj.get("pq_score", payload_obj.get("pq", 0.0)))
-            try:
-                pq_score = float(raw_pq)
-            except (TypeError, ValueError):
-                pq_score = 0.0
-            pq_score = max(0.0, min(1.0, pq_score))
+            edit_match = VERIFIER_EDIT_PATTERN.match(line)
+            if edit_match is not None:
+                idx = int(edit_match.group("idx"))
+                body = edit_match.group("body").strip()
+                has_coord_keyword = VERIFIER_COORD_KEYWORD_PATTERN.search(body) is not None
+                has_numeric_value = VERIFIER_NUMBER_PATTERN.search(body) is not None
+                if idx in valid_indices and body and has_coord_keyword and has_numeric_value:
+                    index_actions[idx] = (f"EDIT {idx}: {body}", line_order)
+                    line_order += 1
+                continue
 
-            raw_corrections = payload_obj.get("corrections", "")
-            if isinstance(raw_corrections, list):
-                corrections = " ".join(str(item).strip() for item in raw_corrections if str(item).strip())
-            else:
-                corrections = str(raw_corrections).strip()
+            remove_match = VERIFIER_REMOVE_PATTERN.match(line)
+            if remove_match is not None:
+                idx = int(remove_match.group("idx"))
+                if idx in valid_indices:
+                    index_actions[idx] = (f"REMOVE {idx}", line_order)
+                    line_order += 1
+                continue
 
-        if not corrections:
-            corrections = cleaned
-        return pq_score, corrections, cleaned
+            add_match = VERIFIER_ADD_PATTERN.match(line)
+            if add_match is not None:
+                label = add_match.group("label").strip()
+                if not label:
+                    continue
+                x1 = float(add_match.group("x1"))
+                y1 = float(add_match.group("y1"))
+                x2 = float(add_match.group("x2"))
+                y2 = float(add_match.group("y2"))
+                if not (
+                    0.0 <= x1 <= 1000.0
+                    and 0.0 <= y1 <= 1000.0
+                    and 0.0 <= x2 <= 1000.0
+                    and 0.0 <= y2 <= 1000.0
+                    and x2 > x1
+                    and y2 > y1
+                ):
+                    continue
+                normalized = (
+                    f'ADD label="{label}", '
+                    f"[{_format_coord(x1)}, {_format_coord(y1)}, {_format_coord(x2)}, {_format_coord(y2)}]"
+                )
+                if normalized not in add_seen:
+                    add_seen.add(normalized)
+                    add_actions.append((normalized, line_order))
+                    line_order += 1
+
+        normalized_lines: list[tuple[str, int]] = list(index_actions.values()) + add_actions
+        normalized_lines.sort(key=lambda item: item[1])
+        if len(normalized_lines) == 0:
+            no_op = "NO_VALID_CORRECTIONS. Re-emit all boxes unchanged in one <bbox_2d> block."
+            return no_op, cleaned
+        corrections = "\n".join(line for line, _ in normalized_lines)
+        return corrections, cleaned
 
     async def _generate_once(
         self,
@@ -504,7 +586,7 @@ class SttvAgentLoop(AgentLoopBase):
         response_mask: list[int],
         response_logprobs: Optional[list[float]],
         images: Optional[list[Image.Image]] = None,
-    ) -> int:
+    ) -> list[int]:
         add_messages = [{"role": "user", "content": [{"type": "text", "text": text}]}]
         messages.extend(add_messages)
         extra_prompt_ids = await self.apply_chat_template(
@@ -514,7 +596,33 @@ class SttvAgentLoop(AgentLoopBase):
         response_mask.extend([0] * len(extra_prompt_ids))
         if response_logprobs is not None:
             response_logprobs.extend([0.0] * len(extra_prompt_ids))
-        return len(extra_prompt_ids)
+        return extra_prompt_ids
+
+    async def _generate_once_with_cached_prompt_ids(
+        self,
+        prompt_ids: list[int],
+        images: list[Image.Image],
+        sampling_params: dict[str, Any],
+        stop_sequences: Optional[list[str]] = None,
+        max_new_tokens: int = 256,
+        metrics: Optional[dict[str, Any]] = None,
+    ) -> Tuple[str, list[int], list[float]]:
+        if stop_sequences:
+            sampling_params = dict(sampling_params)
+            sampling_params["stop"] = stop_sequences
+        sampling_params = dict(sampling_params)
+        sampling_params["max_tokens"] = max_new_tokens
+        output = await self.server_manager.generate(
+            request_id=uuid4().hex,
+            prompt_ids=prompt_ids,
+            sampling_params=sampling_params,
+            image_data=images,
+        )
+        chunk = self.tokenizer.decode(output.token_ids, skip_special_tokens=True)
+        log_probs = output.log_probs or []
+        if metrics is not None and metrics.get("num_preempted", -1) == -1:
+            metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
+        return chunk, output.token_ids, log_probs
 
     def _append_assistant_tokens(
         self,
@@ -536,13 +644,53 @@ class SttvAgentLoop(AgentLoopBase):
                 response_logprobs.extend([0.0] * len(token_ids))
         return len(token_ids)
 
+    async def _build_verifier_prompt_ids_and_mm_inputs(
+        self,
+        messages: list[dict[str, object]],
+        verifier_images: list[Image.Image],
+    ) -> tuple[list[int], dict[str, torch.Tensor]]:
+        # Keep verifier generation path identical across modes: prompt_ids always come
+        # from the standard chat-template tokenizer path.
+        prompt_ids = await self.apply_chat_template(messages, images=verifier_images)
+        if self.processor is None or not self.aux_mm_reuse_enable:
+            return prompt_ids, {}
+
+        raw_prompt = await self.loop.run_in_executor(
+            None,
+            lambda: self.processor.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=False,
+                **self.apply_chat_template_kwargs,
+            ),
+        )
+        model_inputs = self.processor(
+            text=[raw_prompt],
+            images=verifier_images,
+            return_tensors="pt",
+            do_sample_frames=False,
+        )
+        model_inputs.pop("input_ids", None)
+        model_inputs.pop("attention_mask", None)
+        multi_modal_inputs = dict(model_inputs.convert_to_tensors("pt"))
+        image_grid_thw = multi_modal_inputs.get("image_grid_thw")
+        if image_grid_thw is not None:
+            images_seqlens = torch.repeat_interleave(image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0])
+            multi_modal_inputs["images_seqlens"] = images_seqlens
+        normalized: dict[str, torch.Tensor] = {}
+        for key, value in multi_modal_inputs.items():
+            if isinstance(value, torch.Tensor):
+                normalized[key] = value.detach().cpu().contiguous()
+        return prompt_ids, normalized
+
     async def _build_verifier_messages(
         self,
         originals: list[Image.Image],
         overlays: list[Image.Image],
         prompt: str,
+        generate_logprobs: bool,
         metrics: dict[str, Any],
-    ) -> Tuple[str, list[int], list[int], list[dict[str, Any]]]:
+    ) -> Tuple[str, list[int], list[int], list[float], list[dict[str, Any]], dict[str, torch.Tensor]]:
         resized_originals = [self._resize_longest_side(img, self.verifier_image_side) for img in originals]
         resized_overlays = [self._resize_longest_side(img, self.verifier_image_side) for img in overlays]
 
@@ -554,29 +702,56 @@ class SttvAgentLoop(AgentLoopBase):
             verifier_images.extend([original, overlay])
         content.append({"type": "text", "text": prompt})
         messages = [{"role": "user", "content": content}]
-
-        sampling_params = {"temperature": 0.0, "top_p": 1.0, "top_k": -1, "logprobs": False}
-        text, output_ids, _, prompt_ids = await self._generate_once_with_prompt_ids(
-            messages=messages,
-            images=verifier_images,
-            sampling_params=sampling_params,
-            max_new_tokens=self.verifier_max_new_tokens,
-            metrics=metrics,
+        prompt_ids, verifier_multi_modal_inputs = await self._build_verifier_prompt_ids_and_mm_inputs(
+            messages,
+            verifier_images,
         )
+
+        sampling_params = {
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": -1,
+            "logprobs": bool(generate_logprobs),
+            "max_tokens": int(self.verifier_max_new_tokens),
+        }
+        output = await self.server_manager.generate(
+            request_id=uuid4().hex,
+            prompt_ids=prompt_ids,
+            sampling_params=sampling_params,
+            image_data=verifier_images,
+        )
+        text = self.tokenizer.decode(output.token_ids, skip_special_tokens=True)
+        output_ids = output.token_ids
+        output_log_probs = output.log_probs or []
+        if metrics is not None and metrics.get("num_preempted", -1) == -1:
+            metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
+        if output_log_probs:
+            verifier_output_log_probs = [float(x) for x in output_log_probs]
+        else:
+            verifier_output_log_probs = [0.0] * len(output_ids)
         serialized_images = [self._serialize_image_bytes(image) for image in verifier_images]
-        return text, prompt_ids, output_ids, serialized_images
+        return (
+            text,
+            prompt_ids,
+            output_ids,
+            verifier_output_log_probs,
+            serialized_images,
+            verifier_multi_modal_inputs,
+        )
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         raw_messages = list(kwargs["raw_prompt"])
         query = self._extract_query(raw_messages)
         multi_modal_data = await self.process_vision_info(raw_messages)
         raw_images = self._normalize_images(multi_modal_data.get("images"))
+        raw_images_rgb = [img.convert("RGB") for img in raw_images]
         # Resize images for model input so prompt/image token length reflects STTV_MAX_IMAGE_SIDE.
-        images = [self._resize_longest_side(img, self.max_image_side) for img in raw_images]
+        images = [self._resize_longest_side(img, self.max_image_side) for img in raw_images_rgb]
 
         prompted_query = self._build_prompted_context(query)
         messages = self._build_messages(prompted_query, images)
         initial_prompt_ids = await self.apply_chat_template(messages, images=images)
+        model_prompt_ids = list(initial_prompt_ids)
 
         train_prompt_ids = list(initial_prompt_ids)
         response_mask: list[int] = []
@@ -590,7 +765,7 @@ class SttvAgentLoop(AgentLoopBase):
         output_chunks: list[str] = []
         max_total_tokens = self.response_length
         total_generated_tokens = 0
-        bbox_line_format = 'label="object_name", [x_min, y_min, x_max, y_max]'
+        bbox_line_format = '1: label="object_name", [x_min, y_min, x_max, y_max]'
 
         metrics: dict[str, Any] = {"generate_sequences": 0.0, "tool_calls": 0.0, "num_preempted": -1}
         user_turns = 1
@@ -603,25 +778,16 @@ class SttvAgentLoop(AgentLoopBase):
             sttv_loc_mask.extend([loc_value] * count)
 
         async def _append_user_turn(text: str) -> None:
-            appended = await self._append_user_message(
+            extra_prompt_ids = await self._append_user_message(
                 messages,
                 text,
                 train_prompt_ids,
                 response_mask,
                 response_logprobs,
             )
-            _extend_objective_masks(answer_value=0, loc_value=0, count=appended)
-
-        def _append_verifier_injection(text: str) -> None:
-            # Verifier injections are tool-like metadata: keep them in trajectory text,
-            # but mask them out of response tokens and all objectives.
-            output_chunks.append(text)
-            token_ids = self.tokenizer(text, add_special_tokens=False)["input_ids"]
-            train_prompt_ids.extend(token_ids)
-            response_mask.extend([0] * len(token_ids))
-            if response_logprobs is not None:
-                response_logprobs.extend([0.0] * len(token_ids))
-            appended = len(token_ids)
+            if self.agent_loop_cpu_cleanup_enable and extra_prompt_ids:
+                model_prompt_ids.extend(extra_prompt_ids)
+            appended = len(extra_prompt_ids)
             _extend_objective_masks(answer_value=0, loc_value=0, count=appended)
 
         def _append_assistant_turn(chunk: str, token_ids: list[int], log_probs: list[float]) -> None:
@@ -636,7 +802,10 @@ class SttvAgentLoop(AgentLoopBase):
                 response_logprobs,
                 log_probs,
             )
+            # Match no-verifier semantics: assistant tokens are answer-objective by default.
+            # Then explicitly remove non-answer spans below.
             _extend_objective_masks(answer_value=1, loc_value=0, count=appended)
+
             for loc_span in self._extract_loc_token_spans(
                 chunk,
                 chunk_start=chunk_start,
@@ -649,13 +818,33 @@ class SttvAgentLoop(AgentLoopBase):
                 # Decouple objectives: do not optimize answer loss on bbox tokens.
                 sttv_answer_mask[span_start:span_end] = [0] * (span_end - span_start)
                 sttv_loc_mask[span_start:span_end] = [1] * (span_end - span_start)
+                loc_text = str(loc_span.get("text", chunk))
+                parsed_entries_1000: list[dict[str, Any]] = []
+                payloads = self._extract_bbox_2d_payloads(loc_text)
+                if len(payloads) == 1:
+                    parsed_entries = self._parse_bbox_2d_entries(payloads[0])
+                    if len(parsed_entries) > 0:
+                        parsed_entries_1000 = [
+                            {
+                                "image_index": int(entry.image_index),
+                                "label": str(entry.label),
+                                "box_1000": [
+                                    float(entry.coords[0]),
+                                    float(entry.coords[1]),
+                                    float(entry.coords[2]),
+                                    float(entry.coords[3]),
+                                ],
+                            }
+                            for entry in parsed_entries
+                        ]
                 sttv_loc_calls.append(
                     {
                         "call_index": loc_call_counter,
                         "token_start": span_start,
                         "token_end": span_end,
-                        "text": loc_span.get("text", chunk),
+                        "text": loc_text,
                         "span_type": loc_span.get("span_type", "chunk_fallback"),
+                        "parsed_entries_1000": parsed_entries_1000,
                     }
                 )
                 loc_call_counter += 1
@@ -693,20 +882,32 @@ class SttvAgentLoop(AgentLoopBase):
             if len(response_mask) >= self.response_length:
                 return _return_output()
 
-            chunk, token_ids, log_probs = await self._generate_once(
-                messages,
-                images=images,
-                sampling_params=sampling_params,
-                stop_sequences=["</bbox_2d>"],
-                max_new_tokens=self.max_new_tokens_per_chunk,
-                metrics=metrics,
-            )
+            if self.agent_loop_cpu_cleanup_enable:
+                chunk, token_ids, log_probs = await self._generate_once_with_cached_prompt_ids(
+                    prompt_ids=model_prompt_ids,
+                    images=images,
+                    sampling_params=sampling_params,
+                    stop_sequences=["</bbox_2d>"],
+                    max_new_tokens=self.max_new_tokens_per_chunk,
+                    metrics=metrics,
+                )
+            else:
+                chunk, token_ids, log_probs = await self._generate_once(
+                    messages,
+                    images=images,
+                    sampling_params=sampling_params,
+                    stop_sequences=["</bbox_2d>"],
+                    max_new_tokens=self.max_new_tokens_per_chunk,
+                    metrics=metrics,
+                )
             if not token_ids and not chunk.strip():
                 return _return_output()
 
             total_generated_tokens += len(token_ids)
             assistant_turns += 1
             _append_assistant_turn(chunk, token_ids, log_probs)
+            if self.agent_loop_cpu_cleanup_enable and token_ids:
+                model_prompt_ids.extend(token_ids)
             messages.append({"role": "assistant", "content": [{"type": "text", "text": chunk}]})
 
             if total_generated_tokens >= max_total_tokens:
@@ -736,63 +937,82 @@ class SttvAgentLoop(AgentLoopBase):
 
                 originals: list[Image.Image] = []
                 overlays: list[Image.Image] = []
-                for image_idx in range(1, len(raw_images) + 1):
-                    original = raw_images[image_idx - 1].convert("RGB")
+                for image_idx in range(1, len(raw_images_rgb) + 1):
+                    original = raw_images_rgb[image_idx - 1]
                     image_entries = entries_by_image.get(image_idx, [])
                     overlay = self._overlay_boxes(original, image_entries)
                     originals.append(original)
                     overlays.append(overlay)
 
                 verifier_prompt = self._build_verifier_prompt(current_entries, len(images))
-                verifier_output, verifier_prompt_ids, verifier_output_ids, verifier_images = await self._build_verifier_messages(
+                (
+                    verifier_output,
+                    verifier_prompt_ids,
+                    verifier_output_ids,
+                    verifier_output_log_probs,
+                    verifier_images,
+                    verifier_multi_modal_inputs,
+                ) = await self._build_verifier_messages(
                     originals,
                     overlays,
                     verifier_prompt,
-                    metrics,
+                    generate_logprobs=bool(sampling_params.get("logprobs", False)),
+                    metrics=metrics,
                 )
-                pq_score, corrections, _ = self._parse_verifier_feedback(verifier_output)
+                corrections, _ = self._parse_verifier_feedback(verifier_output, current_entries)
                 current_loc_call_index = sttv_loc_calls[-1]["call_index"] if sttv_loc_calls else -1
                 if current_loc_call_index >= 0:
                     sttv_loc_verifier_calls.append(
                         {
                             "call_index": int(current_loc_call_index),
                             "round_index": int(verifier_round),
-                            "pq_score_estimate": float(pq_score),
                             "corrections": str(corrections),
                             "verifier_prompt_text": verifier_prompt,
                             "verifier_output_text": verifier_output,
                             "verifier_prompt_token_ids": verifier_prompt_ids,
                             "verifier_output_token_ids": verifier_output_ids,
+                            "verifier_output_log_probs": verifier_output_log_probs,
                             "verifier_images": verifier_images,
+                            "verifier_multi_modal_inputs": verifier_multi_modal_inputs,
                         }
                     )
 
-                round_message = (
-                    f"Verifier round {verifier_round + 1}/{self.loc_verifier_rounds}: "
-                    f"estimated PQ={pq_score:.3f}. Corrections: {corrections}"
-                )
-                _append_verifier_injection(f"<verifier>{round_message}</verifier>")
                 await _append_user_turn(
                     (
                         "I have some feedback for you to incorporate. "
                         f"Please output ONLY one <bbox_2d> block using lines formatted as {bbox_line_format} "
                         "that incorporates the feedback.\n"
                         f"Feedback: {corrections}\n"
-                        "You MUST update the boxes."
+                        "You MUST re-predict ALL boxes, including unchanged ones, and keep indices sequential "
+                        "starting at 1. You MUST incorporate the feedback and MUST NOT make unrelated changes."
                     )
                 )
 
-                correction_chunk, correction_token_ids, correction_log_probs = await self._generate_once(
-                    messages,
-                    images=images,
-                    sampling_params=sampling_params,
-                    stop_sequences=["</bbox_2d>"],
-                    max_new_tokens=self.max_new_tokens_per_chunk,
-                    metrics=metrics,
-                )
+                if self.agent_loop_cpu_cleanup_enable:
+                    correction_chunk, correction_token_ids, correction_log_probs = (
+                        await self._generate_once_with_cached_prompt_ids(
+                            prompt_ids=model_prompt_ids,
+                            images=images,
+                            sampling_params=sampling_params,
+                            stop_sequences=["</bbox_2d>"],
+                            max_new_tokens=self.max_new_tokens_per_chunk,
+                            metrics=metrics,
+                        )
+                    )
+                else:
+                    correction_chunk, correction_token_ids, correction_log_probs = await self._generate_once(
+                        messages,
+                        images=images,
+                        sampling_params=sampling_params,
+                        stop_sequences=["</bbox_2d>"],
+                        max_new_tokens=self.max_new_tokens_per_chunk,
+                        metrics=metrics,
+                    )
                 total_generated_tokens += len(correction_token_ids)
                 assistant_turns += 1
                 _append_assistant_turn(correction_chunk, correction_token_ids, correction_log_probs)
+                if self.agent_loop_cpu_cleanup_enable and correction_token_ids:
+                    model_prompt_ids.extend(correction_token_ids)
                 messages.append({"role": "assistant", "content": [{"type": "text", "text": correction_chunk}]})
 
                 corrected_payloads = self._extract_bbox_2d_payloads(correction_chunk)
@@ -813,16 +1033,28 @@ class SttvAgentLoop(AgentLoopBase):
                 "inside <answer>. Do not round answers, express all ratios as unrounded decimals. "
                 "Do not output another <bbox_2d>."
             )
-            final_chunk, final_token_ids, final_log_probs = await self._generate_once(
-                messages,
-                images=images,
-                sampling_params=sampling_params,
-                stop_sequences=["</answer>"],
-                max_new_tokens=self.max_new_tokens_per_chunk,
-                metrics=metrics,
-            )
+            if self.agent_loop_cpu_cleanup_enable:
+                final_chunk, final_token_ids, final_log_probs = await self._generate_once_with_cached_prompt_ids(
+                    prompt_ids=model_prompt_ids,
+                    images=images,
+                    sampling_params=sampling_params,
+                    stop_sequences=["</answer>"],
+                    max_new_tokens=self.max_new_tokens_per_chunk,
+                    metrics=metrics,
+                )
+            else:
+                final_chunk, final_token_ids, final_log_probs = await self._generate_once(
+                    messages,
+                    images=images,
+                    sampling_params=sampling_params,
+                    stop_sequences=["</answer>"],
+                    max_new_tokens=self.max_new_tokens_per_chunk,
+                    metrics=metrics,
+                )
             total_generated_tokens += len(final_token_ids)
             assistant_turns += 1
             _append_assistant_turn(final_chunk, final_token_ids, final_log_probs)
+            if self.agent_loop_cpu_cleanup_enable and final_token_ids:
+                model_prompt_ids.extend(final_token_ids)
             messages.append({"role": "assistant", "content": [{"type": "text", "text": final_chunk}]})
             return _return_output()

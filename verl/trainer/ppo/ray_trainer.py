@@ -690,6 +690,10 @@ class RayPPOTrainer:
             "loc_verifier": float(cfg.get("loc_verifier_weight", 1.0)),
         }
 
+    def _get_sttv_perf_flag(self, key: str, default: bool) -> bool:
+        cfg = self.config.algorithm.get("sttv_perf", {})
+        return self._coerce_sttv_bool(cfg.get(key, default), default)
+
     def _load_sttv_reward_functions(self) -> dict[str, Optional[Callable[..., Any]]]:
         if hasattr(self, "_sttv_reward_fn_cache"):
             return self._sttv_reward_fn_cache
@@ -739,6 +743,8 @@ class RayPPOTrainer:
         return {
             "sttv_sam3_confidence_threshold": _coerce_float("sttv_sam3_confidence_threshold", 0.5),
             "sttv_sam3_device": str(reward_cfg.get("sttv_sam3_device", "cuda") or "cuda"),
+            "sttv_sam3_devices": reward_cfg.get("sttv_sam3_devices", ""),
+            "sttv_sam3_shard_workers": reward_cfg.get("sttv_sam3_shard_workers", 0),
             "sttv_sam3_checkpoint_path": str(reward_cfg.get("sttv_sam3_checkpoint_path", "") or ""),
             "sttv_sam3_load_from_hf": self._coerce_sttv_bool(
                 reward_cfg.get("sttv_sam3_load_from_hf", True),
@@ -747,6 +753,26 @@ class RayPPOTrainer:
             "sttv_discard_on_empty_sam3": self._coerce_sttv_bool(
                 reward_cfg.get("sttv_discard_on_empty_sam3", False),
                 False,
+            ),
+            "sttv_sam3_cache_shard_enable": self._coerce_sttv_bool(
+                reward_cfg.get(
+                    "sttv_sam3_cache_shard_enable",
+                    reward_cfg.get(
+                        "sttv_sam3_shard_enable",
+                        self._get_sttv_perf_flag("sam3_cache_shard_enable", True),
+                    ),
+                ),
+                True,
+            ),
+            "sttv_sam3_shard_enable": self._coerce_sttv_bool(
+                reward_cfg.get(
+                    "sttv_sam3_shard_enable",
+                    reward_cfg.get(
+                        "sttv_sam3_cache_shard_enable",
+                        self._get_sttv_perf_flag("sam3_cache_shard_enable", True),
+                    ),
+                ),
+                True,
             ),
         }
 
@@ -943,6 +969,13 @@ class RayPPOTrainer:
         originals = [image for idx, image in enumerate(decoded_images) if idx % 2 == 0]
         return originals if len(originals) > 0 else decoded_images
 
+    def _extract_overlay_images_from_verifier_call(self, verifier_call: dict[str, Any]) -> list[Image.Image]:
+        decoded_images = self._deserialize_sttv_images(verifier_call.get("verifier_images", []))
+        if len(decoded_images) == 0:
+            return []
+        overlays = [image for idx, image in enumerate(decoded_images) if idx % 2 == 1]
+        return overlays
+
     def _decode_prompt_image_entry(self, image_entry: Any) -> Optional[Image.Image]:
         if isinstance(image_entry, Image.Image):
             return image_entry.convert("RGB")
@@ -1016,28 +1049,6 @@ class RayPPOTrainer:
             float(max(left_top[1], right_bottom[1])),
         )
 
-    def _extract_loc_box_xyxy_from_diagnostic(
-        self,
-        diagnostic: dict[str, Any],
-        image: Image.Image,
-    ) -> Optional[tuple[float, float, float, float]]:
-        predicted_box_xyxy = diagnostic.get("predicted_box_xyxy")
-        if isinstance(predicted_box_xyxy, (list, tuple)) and len(predicted_box_xyxy) >= 4:
-            try:
-                return (
-                    float(predicted_box_xyxy[0]),
-                    float(predicted_box_xyxy[1]),
-                    float(predicted_box_xyxy[2]),
-                    float(predicted_box_xyxy[3]),
-                )
-            except (TypeError, ValueError):
-                pass
-
-        predicted_box_1000 = diagnostic.get("predicted_box_1000")
-        if predicted_box_1000 is None:
-            predicted_box_1000 = diagnostic.get("matched_loc_box_1000")
-        return self._box_1000_to_xyxy_pixels(predicted_box_1000, image)
-
     def _extract_sam3_boxes_from_diagnostic(self, diagnostic: dict[str, Any]) -> list[Any]:
         boxes: list[Any] = []
         sam3_boxes = diagnostic.get("sam3_boxes_xyxy")
@@ -1077,17 +1088,110 @@ class RayPPOTrainer:
                 round_idx = -1
             return call_idx, round_idx
 
-        # Prefer verifier rounds when they have real diagnostics; otherwise fallback to loc call diagnostics.
+        def _call_index(call: dict[str, Any]) -> int:
+            try:
+                return int(call.get("call_index", -1))
+            except (TypeError, ValueError):
+                return -1
+
+        def _parsed_entries_for_call(call: dict[str, Any]) -> list[dict[str, Any]]:
+            raw_entries = call.get("parsed_entries_1000", [])
+            if isinstance(raw_entries, np.ndarray):
+                raw_entries = raw_entries.tolist()
+            if not isinstance(raw_entries, (list, tuple)):
+                return []
+            entries: list[dict[str, Any]] = []
+            for entry_idx, raw_entry in enumerate(raw_entries, start=1):
+                if not isinstance(raw_entry, dict):
+                    continue
+                box = raw_entry.get("box_1000")
+                if not isinstance(box, (list, tuple)) or len(box) < 4:
+                    continue
+                try:
+                    image_index = int(raw_entry.get("image_index", 1))
+                    x1, y1, x2, y2 = float(box[0]), float(box[1]), float(box[2]), float(box[3])
+                except (TypeError, ValueError):
+                    continue
+                entries.append(
+                    {
+                        "idx": int(entry_idx),
+                        "image_index": int(max(1, image_index)),
+                        "label": str(raw_entry.get("label", "obj")),
+                        "box_1000": (x1, y1, x2, y2),
+                    }
+                )
+            return entries
+
+        # Build displayed rounds by call_index: include all loc calls with diagnostics,
+        # and prefer verifier rows (latest round) when present for the same call.
         verifier_diag_calls = [call for call in verifier_calls if len(_prediction_diagnostics(call)) > 0]
-        if len(verifier_diag_calls) > 0:
-            diagnostic_calls = sorted(verifier_diag_calls, key=_call_sort_key)
-        else:
-            loc_diag_calls = [call for call in loc_calls if len(_prediction_diagnostics(call)) > 0]
-            if len(loc_diag_calls) == 0:
-                return None, None
-            diagnostic_calls = sorted(loc_diag_calls, key=_call_sort_key)
+        loc_diag_calls = [call for call in loc_calls if len(_prediction_diagnostics(call)) > 0]
+        call_by_index: dict[int, dict[str, Any]] = {}
+        for loc_call in loc_diag_calls:
+            call_idx = _call_index(loc_call)
+            if call_idx >= 0 and call_idx not in call_by_index:
+                call_by_index[call_idx] = loc_call
+        for verifier_call in verifier_diag_calls:
+            call_idx = _call_index(verifier_call)
+            if call_idx < 0:
+                continue
+            existing = call_by_index.get(call_idx)
+            if existing is None:
+                call_by_index[call_idx] = verifier_call
+                continue
+            try:
+                existing_round = int(existing.get("round_index", -1))
+            except (TypeError, ValueError):
+                existing_round = -1
+            try:
+                current_round = int(verifier_call.get("round_index", -1))
+            except (TypeError, ValueError):
+                current_round = -1
+            if current_round >= existing_round:
+                call_by_index[call_idx] = verifier_call
+        if len(call_by_index) == 0:
+            return None, None
+        diagnostic_calls = sorted(call_by_index.values(), key=_call_sort_key)
+        loc_call_by_index: dict[int, dict[str, Any]] = {}
+        for loc_call in loc_calls:
+            if not isinstance(loc_call, dict):
+                continue
+            call_idx = _call_index(loc_call)
+            if call_idx >= 0:
+                loc_call_by_index[call_idx] = loc_call
+
+        # Loc call records do not always carry verifier_images; map by call_index
+        # to the verifier record that does, preferring later rounds.
+        verifier_image_source_by_call_index: dict[int, dict[str, Any]] = {}
+        for verifier_call in verifier_calls:
+            if not isinstance(verifier_call, dict):
+                continue
+            raw_images = verifier_call.get("verifier_images", [])
+            if not isinstance(raw_images, (list, tuple)) or len(raw_images) == 0:
+                continue
+            try:
+                call_index = int(verifier_call.get("call_index", -1))
+            except (TypeError, ValueError):
+                call_index = -1
+            if call_index < 0:
+                continue
+            existing = verifier_image_source_by_call_index.get(call_index)
+            if existing is None:
+                verifier_image_source_by_call_index[call_index] = verifier_call
+                continue
+            try:
+                existing_round = int(existing.get("round_index", -1))
+            except (TypeError, ValueError):
+                existing_round = -1
+            try:
+                current_round = int(verifier_call.get("round_index", -1))
+            except (TypeError, ValueError):
+                current_round = -1
+            if current_round >= existing_round:
+                verifier_image_source_by_call_index[call_index] = verifier_call
 
         default_originals = self._extract_original_images_from_raw_prompt(raw_prompt)
+        sam3_base_originals = [img.copy() for img in default_originals] if len(default_originals) > 0 else []
         loc_round_panels: list[Image.Image] = []
         sam3_round_panels: list[Image.Image] = []
 
@@ -1096,11 +1200,52 @@ class RayPPOTrainer:
             if len(diagnostics) == 0:
                 continue
 
-            originals = self._extract_original_images_from_verifier_call(call)
+            image_source_call = call
+            if not isinstance(call.get("verifier_images"), (list, tuple)) or len(call.get("verifier_images", [])) == 0:
+                try:
+                    call_index = int(call.get("call_index", -1))
+                except (TypeError, ValueError):
+                    call_index = -1
+                if call_index >= 0:
+                    mapped = verifier_image_source_by_call_index.get(call_index)
+                    if mapped is not None:
+                        image_source_call = mapped
+
+            overlays = self._extract_overlay_images_from_verifier_call(image_source_call)
+            originals = self._extract_original_images_from_verifier_call(image_source_call)
+            if len(originals) == 0 and len(overlays) > 0:
+                # Keep plotting available even if raw originals are absent:
+                # verifier overlays already contain the same scene.
+                originals = [img.copy() for img in overlays]
             if len(originals) == 0:
                 originals = default_originals
-            if len(originals) == 0:
-                continue
+            if len(originals) == 0 and len(overlays) > 0:
+                originals = [img.copy() for img in overlays]
+
+            # If verifier overlays are unavailable for this call (commonly the last
+            # loc call after final feedback), synthesize the same blue overlay from
+            # the exact parsed model entries used for reward.
+            if len(overlays) == 0 and len(originals) > 0:
+                overlays = [img.copy() for img in originals]
+                overlay_draws = [ImageDraw.Draw(img) for img in overlays]
+                source_call_idx = _call_index(call)
+                source_loc_call = loc_call_by_index.get(source_call_idx, call)
+                parsed_entries = _parsed_entries_for_call(source_loc_call)
+                for entry in parsed_entries:
+                    image_index = int(entry["image_index"])
+                    if image_index < 1 or image_index > len(overlays):
+                        continue
+                    target_image = overlays[image_index - 1]
+                    box_xyxy = self._box_1000_to_xyxy_pixels(entry.get("box_1000"), target_image)
+                    if box_xyxy is None:
+                        continue
+                    self._draw_box_with_label(
+                        overlay_draws[image_index - 1],
+                        box_xyxy,
+                        label=f'{int(entry["idx"])}:{str(entry["label"])}',
+                        outline=(0, 0, 255),
+                        image_size=target_image.size,
+                    )
 
             diagnostics_by_image: dict[int, list[dict[str, Any]]] = defaultdict(list)
             for diagnostic in diagnostics:
@@ -1110,23 +1255,79 @@ class RayPPOTrainer:
                     image_index = 1
                 diagnostics_by_image[image_index].append(diagnostic)
 
+            # If raw prompt originals are unavailable, build SAM3 base canvases in the
+            # same coordinate space as reward diagnostics, rather than reusing verifier
+            # images (which may have a different resolution).
+            sam3_fallback_base_by_image: dict[int, Image.Image] = {}
+            if len(sam3_base_originals) == 0:
+                for diag_image_index, image_diagnostics in diagnostics_by_image.items():
+                    max_x = 1000.0
+                    max_y = 1000.0
+                    for diagnostic in image_diagnostics:
+                        pred_xyxy = diagnostic.get("predicted_box_xyxy")
+                        if isinstance(pred_xyxy, (list, tuple)) and len(pred_xyxy) >= 4:
+                            try:
+                                max_x = max(max_x, float(pred_xyxy[0]), float(pred_xyxy[2]))
+                                max_y = max(max_y, float(pred_xyxy[1]), float(pred_xyxy[3]))
+                            except (TypeError, ValueError):
+                                pass
+                        sam3_boxes = self._extract_sam3_boxes_from_diagnostic(diagnostic)
+                        for sam3_box in sam3_boxes:
+                            try:
+                                max_x = max(max_x, float(sam3_box[0]), float(sam3_box[2]))
+                                max_y = max(max_y, float(sam3_box[1]), float(sam3_box[3]))
+                            except (TypeError, ValueError):
+                                continue
+                    width = max(1024, int(min(4096, round(max_x + 32.0))))
+                    height = max(1024, int(min(4096, round(max_y + 32.0))))
+                    sam3_fallback_base_by_image[int(diag_image_index)] = Image.new(
+                        "RGB",
+                        (width, height),
+                        color=(255, 255, 255),
+                    )
+            if len(originals) == 0:
+                # Final fallback: render boxes on a deterministic blank canvas so
+                # plot columns are never empty when diagnostics exist.
+                max_x = 1000.0
+                max_y = 1000.0
+                for image_diagnostics in diagnostics_by_image.values():
+                    for diagnostic in image_diagnostics:
+                        pred_xyxy = diagnostic.get("predicted_box_xyxy")
+                        if isinstance(pred_xyxy, (list, tuple)) and len(pred_xyxy) >= 4:
+                            try:
+                                max_x = max(max_x, float(pred_xyxy[0]), float(pred_xyxy[2]))
+                                max_y = max(max_y, float(pred_xyxy[1]), float(pred_xyxy[3]))
+                            except (TypeError, ValueError):
+                                pass
+                        sam3_boxes = self._extract_sam3_boxes_from_diagnostic(diagnostic)
+                        for sam3_box in sam3_boxes:
+                            try:
+                                max_x = max(max_x, float(sam3_box[0]), float(sam3_box[2]))
+                                max_y = max(max_y, float(sam3_box[1]), float(sam3_box[3]))
+                            except (TypeError, ValueError):
+                                continue
+                width = max(1024, int(min(4096, round(max_x + 32.0))))
+                height = max(1024, int(min(4096, round(max_y + 32.0))))
+                max_image_index = max(diagnostics_by_image.keys(), default=1)
+                originals = [Image.new("RGB", (width, height), color=(255, 255, 255)) for _ in range(max(1, max_image_index))]
+
             loc_panels: list[Image.Image] = []
             sam3_panels: list[Image.Image] = []
             for image_index, image in enumerate(originals, start=1):
-                loc_image = image.copy()
-                sam3_image = image.copy()
-                loc_draw = ImageDraw.Draw(loc_image)
+                if image_index - 1 < len(overlays):
+                    loc_image = overlays[image_index - 1].copy()
+                else:
+                    loc_image = image.copy()
+                if image_index - 1 < len(sam3_base_originals):
+                    sam3_image = sam3_base_originals[image_index - 1].copy()
+                elif image_index in sam3_fallback_base_by_image:
+                    sam3_image = sam3_fallback_base_by_image[image_index].copy()
+                else:
+                    sam3_image = image.copy()
                 sam3_draw = ImageDraw.Draw(sam3_image)
-                for diagnostic in diagnostics_by_image.get(image_index, []):
+                image_diagnostics = diagnostics_by_image.get(image_index, [])
+                for diagnostic in image_diagnostics:
                     label = str(diagnostic.get("label", "obj"))
-                    loc_box_xyxy = self._extract_loc_box_xyxy_from_diagnostic(diagnostic, image)
-                    self._draw_box_with_label(
-                        loc_draw,
-                        loc_box_xyxy,
-                        label=f"loc:{label}",
-                        outline=(220, 20, 20),
-                        image_size=image.size,
-                    )
                     sam3_boxes = self._extract_sam3_boxes_from_diagnostic(diagnostic)
                     for box_idx, sam3_box in enumerate(sam3_boxes):
                         self._draw_box_with_label(
@@ -1262,6 +1463,7 @@ class RayPPOTrainer:
         )
 
         loc_outputs_normalized: list[list[dict[str, Any]]] = []
+        loc_parsed_boxes: list[list[dict[str, Any]]] = []
         sam3_outputs: list[list[dict[str, Any]]] = []
         loc_call_rewards: list[list[dict[str, Any]]] = []
         loc_reward_components: list[list[dict[str, Any]]] = []
@@ -1279,7 +1481,6 @@ class RayPPOTrainer:
                         "token_end": int(call.get("token_end", -1)),
                         "loc_reward": _as_float(call.get("sttv_loc_reward", 0.0)),
                         "loc_reward_quality": _as_float(call.get("sttv_loc_reward_quality", 0.0)),
-                        "loc_reward_improve": _as_float(call.get("sttv_loc_reward_improve", 0.0)),
                         "loc_reward_raw": _as_float(call.get("sttv_loc_reward_raw", 0.0)),
                     }
                 )
@@ -1296,12 +1497,9 @@ class RayPPOTrainer:
                     {
                         "call_index": int(call.get("call_index", -1)),
                         "round_index": int(call.get("round_index", -1)),
-                        "pq_score_estimate": _as_float(
-                            call.get("pq_score_estimate", sttv_sam_eval.get("pq_score_estimate", 0.0))
-                        ),
                         "pq_true": _as_float(sttv_sam_eval.get("pq", 0.0)),
                         "verifier_reward": _as_float(call.get("sttv_loc_verifier_reward", 0.0)),
-                        "verifier_accuracy": _as_float(call.get("sttv_loc_verifier_accuracy", 0.0)),
+                        "verifier_delta_pq": _as_float(call.get("sttv_loc_verifier_delta_pq", 0.0)),
                         "verifier_usefulness": _as_float(call.get("sttv_loc_verifier_usefulness", 0.0)),
                         "verifier_reward_raw": _as_float(call.get("sttv_loc_verifier_reward_raw", 0.0)),
                     }
@@ -1314,6 +1512,35 @@ class RayPPOTrainer:
                 ),
             )
             verifier_reward_components.append(verifier_entries)
+
+            parsed_entries: list[dict[str, Any]] = []
+            for loc_call in loc_calls_per_sample[sample_idx]:
+                call_index = int(loc_call.get("call_index", -1))
+                raw_entries = loc_call.get("parsed_entries_1000", [])
+                if isinstance(raw_entries, np.ndarray):
+                    raw_entries = raw_entries.tolist()
+                if not isinstance(raw_entries, (list, tuple)):
+                    continue
+                for raw_entry in raw_entries:
+                    if not isinstance(raw_entry, dict):
+                        continue
+                    box_1000 = raw_entry.get("box_1000")
+                    if not isinstance(box_1000, (list, tuple)) or len(box_1000) < 4:
+                        continue
+                    parsed_entries.append(
+                        {
+                            "call_index": call_index,
+                            "image_index": int(raw_entry.get("image_index", 1)),
+                            "label": str(raw_entry.get("label", "")),
+                            "box_1000": [
+                                float(box_1000[0]),
+                                float(box_1000[1]),
+                                float(box_1000[2]),
+                                float(box_1000[3]),
+                            ],
+                        }
+                    )
+            loc_parsed_boxes.append(parsed_entries)
 
             normalized_entries: list[dict[str, Any]] = []
             sam3_entries: list[dict[str, Any]] = []
@@ -1444,39 +1671,33 @@ class RayPPOTrainer:
         for call_index in range(max_loc_call_index + 1):
             reward_col: list[Any] = []
             quality_col: list[Any] = []
-            improve_col: list[Any] = []
             raw_col: list[Any] = []
             for sample_idx in range(batch_size):
                 entry = loc_component_maps[sample_idx].get(call_index)
                 reward_col.append(None if entry is None else _as_float(entry.get("loc_reward", 0.0)))
                 quality_col.append(None if entry is None else _as_float(entry.get("loc_reward_quality", 0.0)))
-                improve_col.append(None if entry is None else _as_float(entry.get("loc_reward_improve", 0.0)))
                 raw_col.append(None if entry is None else _as_float(entry.get("loc_reward_raw", 0.0)))
             per_step_columns[f"sttv_loc_call_{call_index}_reward"] = reward_col
             per_step_columns[f"sttv_loc_call_{call_index}_quality"] = quality_col
-            per_step_columns[f"sttv_loc_call_{call_index}_improve"] = improve_col
             per_step_columns[f"sttv_loc_call_{call_index}_raw"] = raw_col
 
         for round_index in range(max_verifier_round_index + 1):
             reward_col = []
-            accuracy_col = []
+            delta_pq_col = []
             usefulness_col = []
-            pq_estimate_col = []
             pq_true_col = []
             raw_col = []
             for sample_idx in range(batch_size):
                 entry = verifier_component_maps[sample_idx].get(round_index)
                 reward_col.append(None if entry is None else _as_float(entry.get("verifier_reward", 0.0)))
-                accuracy_col.append(None if entry is None else _as_float(entry.get("verifier_accuracy", 0.0)))
+                delta_pq_col.append(None if entry is None else _as_float(entry.get("verifier_delta_pq", 0.0)))
                 usefulness_col.append(None if entry is None else _as_float(entry.get("verifier_usefulness", 0.0)))
-                pq_estimate_col.append(None if entry is None else _as_float(entry.get("pq_score_estimate", 0.0)))
                 pq_true_col.append(None if entry is None else _as_float(entry.get("pq_true", 0.0)))
                 raw_col.append(None if entry is None else _as_float(entry.get("verifier_reward_raw", 0.0)))
             round_label = round_index + 1
             per_step_columns[f"sttv_verifier_round_{round_label}_reward"] = reward_col
-            per_step_columns[f"sttv_verifier_round_{round_label}_accuracy"] = accuracy_col
+            per_step_columns[f"sttv_verifier_round_{round_label}_delta_pq"] = delta_pq_col
             per_step_columns[f"sttv_verifier_round_{round_label}_usefulness"] = usefulness_col
-            per_step_columns[f"sttv_verifier_round_{round_label}_pq_estimate"] = pq_estimate_col
             per_step_columns[f"sttv_verifier_round_{round_label}_pq_true"] = pq_true_col
             per_step_columns[f"sttv_verifier_round_{round_label}_raw"] = raw_col
 
@@ -1488,16 +1709,16 @@ class RayPPOTrainer:
             "sttv_loc_reward_weighted": loc_rewards_weighted,
             "sttv_loc_verifier_reward_weighted": loc_verifier_rewards_weighted,
             "sttv_global_reward": global_rewards,
-        }
-        # Keep per-step scalars close to core rewards so they are visible
-        # in default W&B table views (instead of far-right after JSON blobs).
-        sample_columns.update(per_step_columns)
-        sample_columns.update(
-            {
             "sttv_loc_plot": loc_plots,
             "sttv_sam3_plot": sam3_plots,
             "sttv_loc_reward_plot": loc_reward_plots,
+        }
+        sample_columns.update(per_step_columns)
+        sample_columns.update(
+            {
             "sttv_loc_outputs_norm": loc_outputs_normalized,
+            "sttv_loc_parsed_boxes": loc_parsed_boxes,
+            "sttv_loc_sam3_diagnostics": sam3_outputs,
             "sttv_sam3_outputs": sam3_outputs,
             "sttv_loc_call_rewards": loc_call_rewards,
             "sttv_loc_reward_components": loc_reward_components,
@@ -1610,17 +1831,18 @@ class RayPPOTrainer:
         batch: DataProto,
         reward_fn: Optional[Callable[..., Any]],
         reward_kwargs: Optional[dict[str, Any]] = None,
-    ) -> tuple[torch.Tensor, int, list[bool]]:
+    ) -> tuple[torch.Tensor, int, list[bool], dict[str, dict[str, Any]]]:
         response_mask = batch.batch["response_mask"]
         bsz = response_mask.shape[0]
         response_len = response_mask.shape[1]
         loc_rewards = torch.zeros_like(response_mask, dtype=torch.float32)
         discard_rows = [False] * bsz
+        loc_eval_lookup: dict[str, dict[str, Any]] = {}
         discard_on_empty_sam3 = bool((reward_kwargs or {}).get("sttv_discard_on_empty_sam3", False))
 
         raw_calls = batch.non_tensor_batch.get("sttv_loc_calls")
         if raw_calls is None:
-            return loc_rewards, 0, discard_rows
+            return loc_rewards, 0, discard_rows, loc_eval_lookup
 
         loc_call_records: list[list[dict[str, Any]]] = []
         for row in raw_calls:
@@ -1633,7 +1855,7 @@ class RayPPOTrainer:
 
         total_calls = sum(len(records) for records in loc_call_records)
         if total_calls == 0:
-            return loc_rewards, 0, discard_rows
+            return loc_rewards, 0, discard_rows, loc_eval_lookup
 
         reward_values = [[0.0] * len(records) for records in loc_call_records]
         if reward_fn is not None:
@@ -1672,23 +1894,35 @@ class RayPPOTrainer:
                     loc_verifier_call_records.append([entry for entry in row if isinstance(entry, dict)])
                 if len(loc_verifier_call_records) < len(batch):
                     loc_verifier_call_records.extend([[] for _ in range(len(batch) - len(loc_verifier_call_records))])
-            try:
-                raw_reward_values = reward_fn(
-                    data_sources=data_sources,
-                    loc_call_records=loc_call_records,
-                    solution_strs=solution_strs,
-                    ground_truths=ground_truths,
-                    extra_infos=extra_infos,
-                    uids=uids,
-                    raw_prompts=raw_prompts,
-                    loc_verifier_call_records=loc_verifier_call_records,
-                    **(reward_kwargs or {}),
-                )
-            except TypeError:
-                raw_reward_values = reward_fn(data_sources, loc_call_records, solution_strs, ground_truths, extra_infos)
+            raw_reward_values = reward_fn(
+                data_sources=data_sources,
+                loc_call_records=loc_call_records,
+                solution_strs=solution_strs,
+                ground_truths=ground_truths,
+                extra_infos=extra_infos,
+                uids=uids,
+                raw_prompts=raw_prompts,
+                loc_verifier_call_records=loc_verifier_call_records,
+                **(reward_kwargs or {}),
+            )
             reward_values = self._normalize_per_sample_call_rewards(raw_reward_values, loc_call_records)
 
         for row_idx, (call_records, call_rewards) in enumerate(zip(loc_call_records, reward_values, strict=True)):
+            for local_idx, call_record in enumerate(call_records):
+                call_index = int(call_record.get("call_index", local_idx))
+                eval_result = call_record.get("sttv_sam3_eval")
+                if not isinstance(eval_result, dict):
+                    continue
+                payload = {
+                    "pq": float(eval_result.get("pq", 0.0)),
+                    "num_sam_boxes": int(eval_result.get("num_sam_boxes", 0)),
+                    "num_loc_boxes": int(eval_result.get("num_loc_boxes", 0)),
+                    "tp": int(eval_result.get("tp", 0)),
+                    "fp": int(eval_result.get("fp", 0)),
+                    "fn": int(eval_result.get("fn", 0)),
+                }
+                loc_eval_lookup[f"{int(row_idx)}:{int(call_index)}"] = dict(payload)
+                call_record["sttv_loc_eval"] = dict(payload)
             if discard_on_empty_sam3 and call_records:
                 sam_counts: list[int] = []
                 has_sam_eval = False
@@ -1717,7 +1951,7 @@ class RayPPOTrainer:
                 endpoint = end - 1
                 loc_rewards[row_idx, endpoint] += float(reward)
 
-        return loc_rewards, total_calls, discard_rows
+        return loc_rewards, total_calls, discard_rows, loc_eval_lookup
 
     def _deserialize_sttv_images(
         self,
@@ -1761,27 +1995,26 @@ class RayPPOTrainer:
             images.append(decoded.copy())
         return images
 
-    def _compute_aux_multi_modal_inputs(
-        self,
-        text: str,
-        images: list[Image.Image],
-    ) -> dict[str, torch.Tensor]:
-        if self.processor is None or not images:
-            return {}
-        multi_modal_inputs = self.processor(
-            text=[text],
-            images=images,
-            return_tensors="pt",
-            do_sample_frames=False,
-        )
-        multi_modal_inputs.pop("input_ids", None)
-        multi_modal_inputs.pop("attention_mask", None)
-        multi_modal_inputs = dict(multi_modal_inputs.convert_to_tensors("pt"))
-        image_grid_thw = multi_modal_inputs.get("image_grid_thw")
-        if image_grid_thw is not None:
-            images_seqlens = torch.repeat_interleave(image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0])
-            multi_modal_inputs["images_seqlens"] = images_seqlens
-        return multi_modal_inputs
+    def _normalize_reused_aux_multi_modal_inputs(self, raw_inputs: Any) -> Optional[dict[str, torch.Tensor]]:
+        if not isinstance(raw_inputs, dict) or len(raw_inputs) == 0:
+            return None
+        normalized: dict[str, torch.Tensor] = {}
+        for key, value in raw_inputs.items():
+            if isinstance(value, torch.Tensor):
+                normalized[str(key)] = value.detach().cpu().contiguous()
+                continue
+            if isinstance(value, np.ndarray):
+                normalized[str(key)] = torch.from_numpy(value).contiguous()
+                continue
+        if len(normalized) == 0:
+            return None
+        image_grid_thw = normalized.get("image_grid_thw")
+        if isinstance(image_grid_thw, torch.Tensor) and "images_seqlens" not in normalized:
+            normalized["images_seqlens"] = torch.repeat_interleave(
+                image_grid_thw[:, 1] * image_grid_thw[:, 2],
+                image_grid_thw[:, 0],
+            )
+        return normalized
 
     def _build_aux_mm_processor_text(self, image_count: int) -> str:
         """Build canonical multimodal text for processor() with exact image token count.
@@ -1947,6 +2180,8 @@ class RayPPOTrainer:
                 "sttv/aux_response_len": 0.0,
                 "sttv/aux_rows_dropped_no_images": 0.0,
                 "sttv/aux_multimodal_fallback_rows": 0.0,
+                "sttv/aux_mm_reuse_rows": 0.0,
+                "sttv/aux_mm_reuse_missing_rows": 0.0,
                 "sttv/aux_build_time_total_s": 0.0,
                 "sttv/aux_build_time_collect_rows_s": 0.0,
                 "sttv/aux_build_time_pack_tensors_s": 0.0,
@@ -1969,7 +2204,9 @@ class RayPPOTrainer:
 
         aux_rows: list[dict[str, Any]] = []
         dropped_no_images = 0
+        mm_reuse_missing_rows = 0
         decode_stats = {"cache_hits": 0, "cache_misses": 0, "decode_errors": 0}
+        aux_mm_reuse_enabled = self._get_sttv_perf_flag("aux_mm_reuse_enable", True)
         t_collect_rows_start = time.perf_counter()
 
         for row_idx in range(len(batch)):
@@ -1998,6 +2235,27 @@ class RayPPOTrainer:
                         output_token_ids = self.tokenizer(output_text, add_special_tokens=False)["input_ids"]
                 if len(output_token_ids) == 0:
                     continue
+                output_log_probs_raw = call_record.get("verifier_output_log_probs", [])
+                if isinstance(output_log_probs_raw, np.ndarray):
+                    output_log_probs_raw = output_log_probs_raw.tolist()
+                if isinstance(output_log_probs_raw, (list, tuple)):
+                    output_log_probs = []
+                    for value in output_log_probs_raw:
+                        try:
+                            output_log_probs.append(float(value))
+                        except (TypeError, ValueError):
+                            output_log_probs.append(0.0)
+                else:
+                    output_log_probs = []
+                if len(output_log_probs) > len(output_token_ids):
+                    output_log_probs = output_log_probs[: len(output_token_ids)]
+                reused_multi_modal_inputs = None
+                if aux_mm_reuse_enabled and self.processor is not None:
+                    reused_multi_modal_inputs = self._normalize_reused_aux_multi_modal_inputs(
+                        call_record.get("verifier_multi_modal_inputs")
+                    )
+                    if reused_multi_modal_inputs is None:
+                        mm_reuse_missing_rows += 1
 
                 if len(prompt_token_ids) > max_prompt_len:
                     raise RuntimeError(
@@ -2012,13 +2270,16 @@ class RayPPOTrainer:
                         "Increase data.max_response_length (and rollout.response_length) in the launch config."
                     )
 
-                images = self._deserialize_sttv_images(call_record.get("verifier_images", []), stats=decode_stats)
-                if self.processor is not None and len(images) == 0:
+                images: list[Image.Image] = []
+                if self.processor is not None and reused_multi_modal_inputs is None:
+                    images = self._deserialize_sttv_images(call_record.get("verifier_images", []), stats=decode_stats)
+                if self.processor is not None and reused_multi_modal_inputs is None and len(images) == 0:
                     # Verifier calls in VLM mode require image tensors for image placeholder tokens.
                     dropped_no_images += 1
                     continue
 
                 call_index = int(call_record.get("call_index", -1))
+                round_index = int(call_record.get("round_index", -1))
                 if not prompt_text and prompt_token_ids:
                     prompt_text = self.tokenizer.decode(prompt_token_ids, skip_special_tokens=True)
                 if not output_text and output_token_ids:
@@ -2028,6 +2289,7 @@ class RayPPOTrainer:
                         "parent_row_index": row_idx,
                         "uid": uid,
                         "call_index": call_index,
+                        "round_index": round_index,
                         "call_record": call_record,
                         "data_source": str(data_sources[row_idx]),
                         "ground_truth": str(ground_truths[row_idx]),
@@ -2037,6 +2299,8 @@ class RayPPOTrainer:
                         "output_token_ids": output_token_ids,
                         "prompt_text": prompt_text,
                         "output_text": output_text,
+                        "output_log_probs": output_log_probs,
+                        "reused_multi_modal_inputs": reused_multi_modal_inputs,
                         "images": images,
                     }
                 )
@@ -2048,6 +2312,8 @@ class RayPPOTrainer:
                 "sttv/aux_response_len": 0.0,
                 "sttv/aux_rows_dropped_no_images": float(dropped_no_images),
                 "sttv/aux_multimodal_fallback_rows": 0.0,
+                "sttv/aux_mm_reuse_rows": 0.0,
+                "sttv/aux_mm_reuse_missing_rows": float(mm_reuse_missing_rows),
                 "sttv/aux_build_time_total_s": float(time.perf_counter() - t_total_start),
                 "sttv/aux_build_time_collect_rows_s": float(t_collect_rows),
                 "sttv/aux_build_time_pack_tensors_s": 0.0,
@@ -2064,15 +2330,17 @@ class RayPPOTrainer:
         prompts: list[torch.Tensor] = []
         responses: list[torch.Tensor] = []
         response_masks: list[torch.Tensor] = []
+        rollout_log_probs: list[torch.Tensor] = []
         input_ids_all: list[torch.Tensor] = []
         attention_masks: list[torch.Tensor] = []
-        aux_texts: list[str] = []
-        aux_images: list[list[Image.Image]] = []
+        aux_texts_for_compute: list[str] = []
+        aux_images_for_compute: list[list[Image.Image]] = []
+        mm_compute_row_indices: list[int] = []
 
         aux_uids: list[str] = []
-        parent_uids: list[str] = []
         parent_row_indices: list[int] = []
         call_indices: list[int] = []
+        round_indices: list[int] = []
         call_records: list[dict[str, Any]] = []
         aux_data_sources: list[str] = []
         aux_ground_truths: list[str] = []
@@ -2080,7 +2348,7 @@ class RayPPOTrainer:
         aux_extra_infos: list[dict[str, Any]] = []
 
         t_pack_tensors_start = time.perf_counter()
-        for row in aux_rows:
+        for row_idx, row in enumerate(aux_rows):
             prompt_token_ids = row["prompt_token_ids"]
             output_token_ids = row["output_token_ids"]
 
@@ -2094,6 +2362,11 @@ class RayPPOTrainer:
             response_attention = torch.zeros((aux_response_len,), dtype=torch.long)
             response_tensor[: len(output_token_ids)] = torch.tensor(output_token_ids, dtype=torch.long)
             response_attention[: len(output_token_ids)] = 1
+            rollout_log_prob_tensor = torch.zeros((aux_response_len,), dtype=torch.float32)
+            output_log_probs = row.get("output_log_probs", [])
+            if isinstance(output_log_probs, (list, tuple)) and len(output_log_probs) > 0:
+                valid_len = min(len(output_token_ids), len(output_log_probs), aux_response_len)
+                rollout_log_prob_tensor[:valid_len] = torch.tensor(output_log_probs[:valid_len], dtype=torch.float32)
 
             input_ids = torch.cat([prompt_tensor, response_tensor], dim=0)
             attention_mask = torch.cat([prompt_attention, response_attention], dim=0)
@@ -2102,17 +2375,24 @@ class RayPPOTrainer:
             prompts.append(prompt_tensor)
             responses.append(response_tensor)
             response_masks.append(response_mask)
+            rollout_log_probs.append(rollout_log_prob_tensor)
             input_ids_all.append(input_ids)
             attention_masks.append(attention_mask)
-            aux_texts.append(self._build_aux_mm_processor_text(len(row["images"])))
-            aux_images.append(row["images"])
+            if self.processor is not None and row.get("reused_multi_modal_inputs") is None:
+                aux_texts_for_compute.append(self._build_aux_mm_processor_text(len(row["images"])))
+                aux_images_for_compute.append(row["images"])
+                mm_compute_row_indices.append(row_idx)
 
             uid = row["uid"]
             call_index = int(row["call_index"])
-            aux_uids.append(f"{uid}::locv::{call_index}")
-            parent_uids.append(uid)
+            round_index = int(row.get("round_index", -1))
+            if round_index >= 0:
+                aux_uids.append(f"{uid}::locv::r{round_index}")
+            else:
+                aux_uids.append(f"{uid}::locv::c{call_index}")
             parent_row_indices.append(int(row["parent_row_index"]))
             call_indices.append(call_index)
+            round_indices.append(round_index)
             call_records.append(row["call_record"])
             aux_data_sources.append(row["data_source"])
             aux_ground_truths.append(row["ground_truth"])
@@ -2122,12 +2402,24 @@ class RayPPOTrainer:
 
         t_mm_inputs_start = time.perf_counter()
         if self.processor is not None:
-            multi_modal_inputs_list, fallback_rows = self._compute_aux_multi_modal_inputs_batched(
-                texts=aux_texts,
-                images_per_row=aux_images,
-            )
+            multi_modal_inputs_list: list[dict[str, torch.Tensor]] = [{} for _ in aux_rows]
+            mm_reuse_rows = 0
+            for row_idx, row in enumerate(aux_rows):
+                reused_inputs = row.get("reused_multi_modal_inputs")
+                if isinstance(reused_inputs, dict) and len(reused_inputs) > 0:
+                    multi_modal_inputs_list[row_idx] = reused_inputs
+                    mm_reuse_rows += 1
+            fallback_rows = 0
+            if mm_compute_row_indices:
+                computed_inputs, fallback_rows = self._compute_aux_multi_modal_inputs_batched(
+                    texts=aux_texts_for_compute,
+                    images_per_row=aux_images_for_compute,
+                )
+                for row_idx, computed in zip(mm_compute_row_indices, computed_inputs, strict=True):
+                    multi_modal_inputs_list[row_idx] = computed
         else:
             multi_modal_inputs_list = [{} for _ in aux_rows]
+            mm_reuse_rows = 0
             fallback_rows = 0
         t_mm_inputs = time.perf_counter() - t_mm_inputs_start
 
@@ -2148,15 +2440,16 @@ class RayPPOTrainer:
             "prompts": torch.stack(prompts, dim=0),
             "responses": torch.stack(responses, dim=0),
             "response_mask": torch.stack(response_masks, dim=0),
+            "rollout_log_probs": torch.stack(rollout_log_probs, dim=0),
             "input_ids": torch.stack(input_ids_all, dim=0),
             "attention_mask": torch.stack(attention_masks, dim=0),
             "position_ids": torch.stack(position_ids_all, dim=0),
         }
         non_tensors: dict[str, np.ndarray] = {
             "uid": np.array(aux_uids, dtype=object),
-            "sttv_parent_uid": np.array(parent_uids, dtype=object),
             "sttv_parent_row_index": np.array(parent_row_indices, dtype=np.int32),
             "sttv_loc_call_index": np.array(call_indices, dtype=np.int32),
+            "sttv_loc_round_index": np.array(round_indices, dtype=np.int32),
             "sttv_loc_verifier_call_record": np.array(call_records, dtype=object),
             "data_source": np.array(aux_data_sources, dtype=object),
             "sttv_ground_truth": np.array(aux_ground_truths, dtype=object),
@@ -2170,6 +2463,8 @@ class RayPPOTrainer:
             "sttv/aux_response_len": float(aux_response_len),
             "sttv/aux_rows_dropped_no_images": float(dropped_no_images),
             "sttv/aux_multimodal_fallback_rows": float(fallback_rows),
+            "sttv/aux_mm_reuse_rows": float(mm_reuse_rows),
+            "sttv/aux_mm_reuse_missing_rows": float(mm_reuse_missing_rows),
             "sttv/aux_build_time_total_s": float(time.perf_counter() - t_total_start),
             "sttv/aux_build_time_collect_rows_s": float(t_collect_rows),
             "sttv/aux_build_time_pack_tensors_s": float(t_pack_tensors),
@@ -2198,17 +2493,16 @@ class RayPPOTrainer:
         if reward_fn is not None:
             call_records_raw = aux_batch.non_tensor_batch.get("sttv_loc_verifier_call_record", np.array([], dtype=object))
             call_records = call_records_raw.tolist() if isinstance(call_records_raw, np.ndarray) else list(call_records_raw)
-            parent_uids_raw = aux_batch.non_tensor_batch.get(
-                "sttv_parent_uid",
-                np.array(["unknown"] * len(aux_batch), dtype=object),
+            parent_row_indices_raw = aux_batch.non_tensor_batch.get(
+                "sttv_parent_row_index",
+                np.array(list(range(len(aux_batch))), dtype=np.int32),
             )
-            parent_uids = (
-                [str(x) for x in parent_uids_raw.tolist()]
-                if isinstance(parent_uids_raw, np.ndarray)
-                else [str(x) for x in list(parent_uids_raw)]
-            )
-            if len(parent_uids) < len(aux_batch):
-                parent_uids.extend(["unknown"] * (len(aux_batch) - len(parent_uids)))
+            if isinstance(parent_row_indices_raw, np.ndarray):
+                parent_row_indices = parent_row_indices_raw.tolist()
+            else:
+                parent_row_indices = list(parent_row_indices_raw)
+            if len(parent_row_indices) < len(aux_batch):
+                parent_row_indices.extend(list(range(len(parent_row_indices), len(aux_batch))))
             data_sources_raw = aux_batch.non_tensor_batch.get("data_source", np.array(["unknown"] * len(aux_batch), dtype=object))
             data_sources = data_sources_raw.tolist() if isinstance(data_sources_raw, np.ndarray) else list(data_sources_raw)
             ground_truths_raw = aux_batch.non_tensor_batch.get(
@@ -2230,18 +2524,15 @@ class RayPPOTrainer:
                 np.array([{}] * len(aux_batch), dtype=object),
             )
             extra_infos = extra_infos_raw.tolist() if isinstance(extra_infos_raw, np.ndarray) else list(extra_infos_raw)
-            try:
-                raw_rewards = reward_fn(
-                    data_sources=data_sources,
-                    loc_verifier_call_records=call_records,
-                    solution_strs=solution_strs,
-                    ground_truths=ground_truths,
-                    extra_infos=extra_infos,
-                    parent_uids=parent_uids,
-                    **(reward_kwargs or {}),
-                )
-            except TypeError:
-                raw_rewards = reward_fn(data_sources, call_records, solution_strs, ground_truths, extra_infos)
+            raw_rewards = reward_fn(
+                data_sources=data_sources,
+                loc_verifier_call_records=call_records,
+                solution_strs=solution_strs,
+                ground_truths=ground_truths,
+                extra_infos=extra_infos,
+                parent_row_indices=parent_row_indices,
+                **(reward_kwargs or {}),
+            )
             reward_values = self._normalize_flat_rewards(raw_rewards, expected_len=total_calls)
 
         for row_idx, reward in enumerate(reward_values):
@@ -2252,6 +2543,51 @@ class RayPPOTrainer:
             verifier_rewards[row_idx, endpoint] = float(reward)
 
         return verifier_rewards, total_calls
+
+    def _build_aux_verifier_objective_mask(self, aux_batch: DataProto) -> torch.Tensor:
+        """Verifier objective mask with any accidental <bbox_2d> spans zeroed out."""
+        base_mask = aux_batch.batch["response_mask"].clone()
+        call_records_raw = aux_batch.non_tensor_batch.get("sttv_loc_verifier_call_record")
+        if call_records_raw is None:
+            return base_mask
+        if isinstance(call_records_raw, np.ndarray):
+            call_records = call_records_raw.tolist()
+        else:
+            call_records = list(call_records_raw)
+
+        rows = min(int(base_mask.shape[0]), len(call_records))
+        for row_idx in range(rows):
+            call_record = call_records[row_idx]
+            if not isinstance(call_record, dict):
+                continue
+            text = str(call_record.get("verifier_output_text", "") or "")
+            if "<bbox_2d" not in text.lower():
+                continue
+
+            spans = list(re.finditer(r"(?is)<bbox_2d>.*?</bbox_2d>", text))
+            if not spans:
+                open_match = re.search(r"(?is)<bbox_2d>", text)
+                if open_match is not None:
+                    span = (open_match.start(), len(text))
+                    spans = [span]
+
+            for span in spans:
+                if isinstance(span, tuple):
+                    start_char, end_char = int(span[0]), int(span[1])
+                else:
+                    start_char, end_char = int(span.start()), int(span.end())
+                if end_char <= start_char:
+                    continue
+                prefix = text[:start_char]
+                body = text[start_char:end_char]
+                start_tok = len(self.tokenizer(prefix, add_special_tokens=False)["input_ids"])
+                span_tok = max(1, len(self.tokenizer(body, add_special_tokens=False)["input_ids"]))
+                end_tok = min(int(base_mask.shape[1]), int(start_tok + span_tok))
+                start_tok = max(0, min(int(base_mask.shape[1]), int(start_tok)))
+                if end_tok <= start_tok:
+                    continue
+                base_mask[row_idx, start_tok:end_tok] = 0
+        return base_mask
 
     def _compute_sttv_grpo_advantages(
         self,
@@ -2488,6 +2824,42 @@ class RayPPOTrainer:
 
         merged = DataProto.concat([main_actor_batch, aux_actor_batch])
         merged.meta_info = deepcopy(main_batch.meta_info)
+        # Interleave rows as [main_i, aux_i_*] instead of [all main][all aux].
+        # Without this, many PPO mini-batches become aux-only and can suppress the
+        # aggregate grad_norm even when main objectives have healthy signal.
+        if aux_batch is not None and "sttv_parent_row_index" in aux_batch.non_tensor_batch:
+            parent_rows_raw = aux_batch.non_tensor_batch["sttv_parent_row_index"]
+            if isinstance(parent_rows_raw, np.ndarray):
+                parent_rows = parent_rows_raw.tolist()
+            else:
+                parent_rows = list(parent_rows_raw)
+
+            main_rows = len(main_actor_batch)
+            aux_rows = len(aux_actor_batch)
+            aux_offset = main_rows
+
+            buckets: list[list[int]] = [[] for _ in range(main_rows)]
+            unassigned_aux: list[int] = []
+            for aux_idx in range(aux_rows):
+                parent_row = parent_rows[aux_idx] if aux_idx < len(parent_rows) else -1
+                try:
+                    parent_int = int(parent_row)
+                except (TypeError, ValueError):
+                    parent_int = -1
+                merged_aux_index = aux_offset + aux_idx
+                if 0 <= parent_int < main_rows:
+                    buckets[parent_int].append(merged_aux_index)
+                else:
+                    unassigned_aux.append(merged_aux_index)
+
+            ordered_indices: list[int] = []
+            for main_idx in range(main_rows):
+                ordered_indices.append(main_idx)
+                ordered_indices.extend(buckets[main_idx])
+            ordered_indices.extend(unassigned_aux)
+
+            if len(ordered_indices) == len(merged):
+                merged.reorder(torch.tensor(ordered_indices, dtype=torch.long))
         return merged
 
     def _get_actor_dp_size(self) -> int:
@@ -2507,38 +2879,6 @@ class RayPPOTrainer:
         old_log_prob, mfu = self._compute_old_log_prob(padded_batch)
         old_log_prob = unpad_dataproto(old_log_prob, pad_size=pad_size)
         return old_log_prob, mfu
-
-    def _compute_main_aux_old_log_prob(
-        self, main_batch: DataProto, aux_batch: Optional[DataProto]
-    ) -> tuple[DataProto, Optional[DataProto], float, bool]:
-        if aux_batch is None or len(aux_batch) == 0:
-            main_old_log_prob, mfu = self._compute_old_log_prob_with_padding(main_batch)
-            return main_old_log_prob, None, mfu, False
-
-        tensor_keys = ["responses", "input_ids", "attention_mask", "position_ids", "prompts", "response_mask"]
-        non_tensor_keys = ["uid", "multi_modal_inputs"]
-        response_tensor_keys = {"responses", "response_mask"}
-        full_seq_tensor_keys = {"input_ids", "attention_mask", "position_ids"}
-        main_log_prob_batch, aux_log_prob_batch = self._build_sttv_aligned_main_aux_batches(
-            main_batch,
-            aux_batch,
-            tensor_keys=tensor_keys,
-            non_tensor_keys=non_tensor_keys,
-            response_tensor_keys=response_tensor_keys,
-            full_seq_tensor_keys=full_seq_tensor_keys,
-        )
-        if aux_log_prob_batch is None:
-            main_old_log_prob, mfu = self._compute_old_log_prob_with_padding(main_batch)
-            return main_old_log_prob, None, mfu, False
-
-        merged_log_prob_batch = DataProto.concat(
-            [self._prepare_batch_for_log_prob(main_log_prob_batch), self._prepare_batch_for_log_prob(aux_log_prob_batch)]
-        )
-        merged_old_log_prob, mfu = self._compute_old_log_prob_with_padding(merged_log_prob_batch)
-        main_rows = len(main_batch)
-        main_old_log_prob = merged_old_log_prob[:main_rows]
-        aux_old_log_prob = merged_old_log_prob[main_rows:]
-        return main_old_log_prob, aux_old_log_prob, mfu, True
 
     def _compute_ref_log_prob_with_padding(self, batch: DataProto) -> DataProto:
         dp_size = self._get_actor_dp_size()
@@ -2639,6 +2979,7 @@ class RayPPOTrainer:
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+        raw_prompt_value = batch.non_tensor_batch.get("raw_prompt")
 
         # pop those keys for generation
         batch_keys_to_pop = []
@@ -2647,6 +2988,14 @@ class RayPPOTrainer:
             batch_keys=batch_keys_to_pop,
             non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
         )
+
+        # raw_prompt must be available in both paths:
+        # - generation/agent-loop input
+        # - post-generation reward + sample-table plotting
+        if raw_prompt_value is not None:
+            batch.non_tensor_batch["raw_prompt"] = raw_prompt_value
+            if "raw_prompt" not in gen_batch.non_tensor_batch:
+                gen_batch.non_tensor_batch["raw_prompt"] = raw_prompt_value
 
         # For agent loop, we need reward model keys to compute score.
         if self.async_rollout_mode:
@@ -3616,13 +3965,19 @@ class RayPPOTrainer:
                         if aux_batch_metrics:
                             metrics.update(aux_batch_metrics)
 
-                    # Operating Mode Selection:
-                    # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
-                    # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
-                    #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
-                    bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
-                    if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
+                    # Make bypass strictly config-controlled so STTV multi-objective can be
+                    # A/B tested against legacy old-logprob recomputation.
+                    bypass_recomputing_logprobs = bool(
+                        rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+                    )
+                    if sttv_multi_objective_enabled:
+                        metrics["sttv/old_log_prob_bypass"] = 1.0 if bypass_recomputing_logprobs else 0.0
+                    if bypass_recomputing_logprobs:
+                        if rollout_corr_config is None:
+                            raise RuntimeError(
+                                "Bypass mode requires algorithm.rollout_correction config, but it is missing."
+                            )
                         from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
 
                         apply_bypass_mode(
@@ -3630,16 +3985,19 @@ class RayPPOTrainer:
                             rollout_corr_config=rollout_corr_config,
                             policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
                         )
-                    else:  # Recompute old_log_probs
-                        with marked_timer("old_log_prob", timing_raw, color="blue"):
-                            old_log_prob_merged = False
-                            if sttv_multi_objective_enabled and aux_batch is not None and len(aux_batch) > 0:
-                                old_log_prob, aux_old_log_prob, old_log_prob_mfu, old_log_prob_merged = (
-                                    self._compute_main_aux_old_log_prob(batch, aux_batch)
+                        if sttv_multi_objective_enabled and aux_batch is not None and len(aux_batch) > 0:
+                            if "rollout_log_probs" not in aux_batch.batch:
+                                raise RuntimeError(
+                                    "Bypass mode for STTV multi-objective requires aux rollout_log_probs. "
+                                    "Verifier calls must include per-token verifier_output_log_probs."
                                 )
-                                metrics["sttv/old_log_prob_merged"] = float(old_log_prob_merged)
-                            else:
-                                old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                            aux_old_log_prob = DataProto.from_dict(
+                                tensors={"old_log_probs": aux_batch.batch["rollout_log_probs"].clone()},
+                                meta_info=deepcopy(aux_batch.meta_info),
+                            )
+                    else:
+                        with marked_timer("old_log_prob", timing_raw, color="blue"):
+                            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
                             actor_config = self.config.actor_rollout_ref.actor
@@ -3655,8 +4013,6 @@ class RayPPOTrainer:
                             }
                             metrics.update(old_log_prob_metrics)
                             old_log_prob.batch.pop("entropys")
-                            if aux_old_log_prob is not None and "entropys" in aux_old_log_prob.batch:
-                                aux_old_log_prob.batch.pop("entropys")
                             if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
                                 router_mode = getattr(
                                     self.config.actor_rollout_ref.actor.router_replay, "mode", "disabled"
@@ -3671,6 +4027,10 @@ class RayPPOTrainer:
                                 from verl.utils.debug.metrics import calculate_debug_metrics
 
                                 metrics.update(calculate_debug_metrics(batch))
+                            if sttv_multi_objective_enabled and aux_batch is not None and len(aux_batch) > 0:
+                                aux_old_log_prob, _ = self._compute_old_log_prob_with_padding(aux_batch)
+                                if "entropys" in aux_old_log_prob.batch:
+                                    aux_old_log_prob.batch.pop("entropys")
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
@@ -3785,7 +4145,12 @@ class RayPPOTrainer:
                             # Objective 3: loc calls.
                             loc_mask = self._extract_sttv_mask_tensor(batch, "sttv_loc_mask")
                             t_loc_reward_start = time.perf_counter()
-                            loc_score_tensor, total_loc_calls, discard_rows = self._compute_sttv_loc_call_reward_tensor(
+                            (
+                                loc_score_tensor,
+                                total_loc_calls,
+                                discard_rows,
+                                loc_eval_lookup,
+                            ) = self._compute_sttv_loc_call_reward_tensor(
                                 batch,
                                 sttv_reward_fns.get("loc"),
                                 reward_kwargs=sttv_reward_kwargs,
@@ -3805,6 +4170,11 @@ class RayPPOTrainer:
                             metrics["sttv/sam3_empty_sample_discard_count"] = float(discard_count)
                             metrics["sttv/sam3_empty_sample_discard_frac"] = (
                                 float(discard_count) / float(len(discard_rows)) if len(discard_rows) > 0 else 0.0
+                            )
+                            metrics["sttv/mask_tokens_answer_main"] = float(answer_mask.sum().item())
+                            metrics["sttv/mask_tokens_loc_main"] = float(loc_mask.sum().item())
+                            metrics["sttv/mask_overlap_answer_loc_main"] = float(
+                                ((answer_mask > 0) & (loc_mask > 0)).sum().item()
                             )
                             group_index_main = self._build_sttv_group_index_with_discard(
                                 batch.non_tensor_batch["uid"],
@@ -3833,6 +4203,12 @@ class RayPPOTrainer:
                                 if answer_active_count > 0
                                 else 0.0
                             )
+                            answer_active_tokens = float(answer_mask.sum().item())
+                            metrics["sttv/adv_abs_mean_answer"] = (
+                                float((answer_advantages.abs() * answer_mask).sum().item() / answer_active_tokens)
+                                if answer_active_tokens > 0.0
+                                else 0.0
+                            )
 
                             loc_advantages, _ = self._compute_sttv_grpo_advantages(
                                 token_level_rewards=loc_score_tensor,
@@ -3854,17 +4230,29 @@ class RayPPOTrainer:
                             metrics["sttv/adv_zero_frac_loc"] = (
                                 float(loc_zero_count) / float(loc_active_count) if loc_active_count > 0 else 0.0
                             )
+                            loc_active_tokens = float(loc_mask.sum().item())
+                            metrics["sttv/adv_abs_mean_loc"] = (
+                                float((loc_advantages.abs() * loc_mask).sum().item() / loc_active_tokens)
+                                if loc_active_tokens > 0.0
+                                else 0.0
+                            )
 
                             # Objective 2: verifier calls after <bbox_2d> (separate aux sub-batch).
                             aux_rows = len(aux_batch) if aux_batch is not None else 0
+                            metrics["sttv/adv_abs_mean_loc_verifier"] = 0.0
                             total_loc_verifier_calls = 0
+                            verifier_rows_missing_next_call = 0
+                            verifier_rows_invalid_for_reward = 0
+                            verifier_rows_rewarded = 0
+                            aux_invalid_for_reward_rows = [False] * aux_rows
                             aux_verifier_scores: Optional[torch.Tensor] = None
                             aux_discard_rows = [False] * aux_rows
                             if aux_batch is not None and aux_rows > 0:
                                 if aux_old_log_prob is None:
-                                    aux_old_log_prob, _ = self._compute_old_log_prob_with_padding(aux_batch)
-                                if "entropys" in aux_old_log_prob.batch:
-                                    aux_old_log_prob.batch.pop("entropys")
+                                    raise RuntimeError(
+                                        "Missing aux old_log_probs for STTV multi-objective. "
+                                        "Either enable bypass mode or ensure aux old-logprob recomputation runs."
+                                    )
                                 aux_batch = aux_batch.union(aux_old_log_prob)
 
                                 need_aux_ref_log_prob = self.use_reference_policy and bool(
@@ -3875,15 +4263,37 @@ class RayPPOTrainer:
                                     aux_batch = aux_batch.union(aux_ref_log_prob)
 
                                 t_loc_verifier_reward_start = time.perf_counter()
+                                verifier_reward_kwargs = dict(sttv_reward_kwargs)
+                                verifier_reward_kwargs["_sttv_loc_eval_lookup"] = loc_eval_lookup
                                 aux_verifier_scores, total_loc_verifier_calls = self._compute_sttv_loc_verifier_reward_tensor(
                                     aux_batch,
                                     sttv_reward_fns.get("loc_verifier"),
-                                    reward_kwargs=sttv_reward_kwargs,
+                                    reward_kwargs=verifier_reward_kwargs,
                                 )
+                                verifier_records_raw = aux_batch.non_tensor_batch.get("sttv_loc_verifier_call_record")
+                                if verifier_records_raw is not None:
+                                    verifier_records = (
+                                        verifier_records_raw.tolist()
+                                        if isinstance(verifier_records_raw, np.ndarray)
+                                        else list(verifier_records_raw)
+                                    )
+                                    for record_idx, record in enumerate(verifier_records):
+                                        if not isinstance(record, dict):
+                                            continue
+                                        if bool(record.get("sttv_loc_verifier_missing_next_call", False)):
+                                            verifier_rows_missing_next_call += 1
+                                        if bool(record.get("sttv_loc_verifier_valid_for_reward", False)):
+                                            verifier_rows_rewarded += 1
+                                        else:
+                                            verifier_rows_invalid_for_reward += 1
+                                            if 0 <= record_idx < len(aux_invalid_for_reward_rows):
+                                                aux_invalid_for_reward_rows[record_idx] = True
                                 metrics["sttv/loc_verifier_reward_eval_time_s"] = float(
                                     time.perf_counter() - t_loc_verifier_reward_start
                                 )
-                                aux_verifier_mask = aux_batch.batch["response_mask"].to(dtype=answer_mask.dtype)
+                                aux_verifier_mask = self._build_aux_verifier_objective_mask(aux_batch).to(
+                                    dtype=answer_mask.dtype
+                                )
                                 if discard_count > 0:
                                     parent_rows_raw = aux_batch.non_tensor_batch.get("sttv_parent_row_index")
                                     if parent_rows_raw is not None:
@@ -3910,6 +4320,18 @@ class RayPPOTrainer:
                                     if aux_verifier_scores is not None:
                                         aux_verifier_scores = aux_verifier_scores.clone()
                                         aux_verifier_scores[aux_discard_mask] = 0.0
+                                if any(aux_invalid_for_reward_rows):
+                                    aux_invalid_mask = torch.tensor(
+                                        aux_invalid_for_reward_rows,
+                                        dtype=torch.bool,
+                                        device=aux_verifier_mask.device,
+                                    )
+                                    aux_verifier_mask = aux_verifier_mask.clone()
+                                    aux_verifier_mask[aux_invalid_mask] = 0
+                                    if aux_verifier_scores is not None:
+                                        aux_verifier_scores = aux_verifier_scores.clone()
+                                        aux_verifier_scores[aux_invalid_mask] = 0.0
+                                metrics["sttv/mask_tokens_loc_verifier_aux"] = float(aux_verifier_mask.sum().item())
                                 aux_group_index = self._build_sttv_group_index_with_discard(
                                     aux_batch.non_tensor_batch["uid"],
                                     aux_discard_rows,
@@ -3931,9 +4353,21 @@ class RayPPOTrainer:
                                 aux_batch.batch["sttv_mask_loc"] = torch.zeros_like(aux_verifier_mask)
                                 aux_batch.batch["sttv_adv_loc_verifier"] = aux_verifier_advantages
                                 aux_batch.batch["sttv_mask_loc_verifier"] = aux_verifier_mask
+                                aux_active_tokens = float(aux_verifier_mask.sum().item())
+                                metrics["sttv/adv_abs_mean_loc_verifier"] = (
+                                    float(
+                                        (aux_verifier_advantages.abs() * aux_verifier_mask).sum().item()
+                                        / aux_active_tokens
+                                    )
+                                    if aux_active_tokens > 0.0
+                                    else 0.0
+                                )
 
                             metrics["sttv/loc_verifier_aux_rows"] = float(aux_rows)
                             metrics["sttv/loc_verifier_call_count"] = float(total_loc_verifier_calls)
+                            metrics["sttv/verifier_rows_missing_next_call"] = float(verifier_rows_missing_next_call)
+                            metrics["sttv/verifier_rows_invalid_for_reward"] = float(verifier_rows_invalid_for_reward)
+                            metrics["sttv/verifier_rows_rewarded"] = float(verifier_rows_rewarded)
 
                             actor_train_batch = self._compose_sttv_actor_batch(batch, aux_batch)
                             actor_train_batch.meta_info.update(

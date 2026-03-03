@@ -535,6 +535,11 @@ class MegatronPPOActor(BasePPOActor):
                     and "sttv_adv_loc_verifier" in data
                     and "sttv_mask_loc_verifier" in data
                 ):
+                    # Normalize each objective by its own active token count.
+                    objective_loss_agg_mode = "token-mean"
+                    clip_ratio = self.config.clip_ratio
+                    clip_ratio_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
+                    clip_ratio_high = self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
                     objective_specs = [
                         ("answer", "sttv_adv_answer", "sttv_mask_answer", sttv_weight_answer),
                         ("loc", "sttv_adv_loc", "sttv_mask_loc", sttv_weight_loc),
@@ -547,10 +552,20 @@ class MegatronPPOActor(BasePPOActor):
                     ]
                     # Keep a differentiable zero so backward is valid when all objective masks are empty.
                     pg_loss = log_prob.sum() * 0.0
+                    agg_active_tokens = 0.0
+                    agg_kl_old_new = 0.0
+                    agg_logp_abs_diff = 0.0
+                    agg_clipfrac = 0.0
+                    agg_clipfrac_lower = 0.0
                     for objective_name, adv_key, mask_key, objective_weight in objective_specs:
                         objective_mask = data[mask_key].to(bool)
-                        if float(objective_mask.sum().item()) <= 0:
+                        objective_active_tokens = float(objective_mask.sum().item())
+                        if objective_active_tokens <= 0:
                             stats[f"actor/pg_loss_{objective_name}"] = 0.0
+                            stats[f"actor/ppo_kl_{objective_name}"] = 0.0
+                            stats[f"actor/logp_abs_diff_{objective_name}"] = 0.0
+                            stats[f"actor/pg_clipfrac_{objective_name}"] = 0.0
+                            stats[f"actor/pg_clipfrac_lower_{objective_name}"] = 0.0
                             continue
                         objective_advantages = data[adv_key]
                         objective_pg_loss, objective_pg_metrics = policy_loss_fn(
@@ -558,12 +573,46 @@ class MegatronPPOActor(BasePPOActor):
                             log_prob=log_prob,
                             advantages=objective_advantages,
                             response_mask=objective_mask,
-                            loss_agg_mode=loss_agg_mode,
+                            loss_agg_mode=objective_loss_agg_mode,
                             config=self.config,
                             rollout_is_weights=rollout_is_weights,
                         )
                         pg_loss = pg_loss + objective_pg_loss * objective_weight
                         stats[f"actor/pg_loss_{objective_name}"] = objective_pg_loss.detach().item()
+                        logp_delta = log_prob - old_log_prob
+                        kl_old_new = verl_F.masked_mean(old_log_prob - log_prob, objective_mask).detach().item()
+                        logp_abs_diff = verl_F.masked_mean(logp_delta.abs(), objective_mask).detach().item()
+                        ratio = torch.exp(torch.clamp(logp_delta, min=-20.0, max=20.0))
+                        clipped_ratio = torch.clamp(ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
+                        clipfrac = verl_F.masked_mean((ratio != clipped_ratio).float(), objective_mask).detach().item()
+                        clipfrac_lower = verl_F.masked_mean(
+                            (ratio < (1 - clip_ratio_low)).float(),
+                            objective_mask,
+                        ).detach().item()
+                        stats[f"actor/ppo_kl_{objective_name}"] = kl_old_new
+                        stats[f"actor/logp_abs_diff_{objective_name}"] = logp_abs_diff
+                        stats[f"actor/pg_clipfrac_{objective_name}"] = clipfrac
+                        stats[f"actor/pg_clipfrac_lower_{objective_name}"] = clipfrac_lower
+
+                        agg_active_tokens += objective_active_tokens
+                        agg_kl_old_new += kl_old_new * objective_active_tokens
+                        agg_logp_abs_diff += logp_abs_diff * objective_active_tokens
+                        agg_clipfrac += clipfrac * objective_active_tokens
+                        agg_clipfrac_lower += clipfrac_lower * objective_active_tokens
+                        for metric_key, metric_value in objective_pg_metrics.items():
+                            if metric_key.startswith("rollout_corr/"):
+                                stats[f"{metric_key}_{objective_name}"] = metric_value
+
+                    if agg_active_tokens > 0:
+                        stats["actor/ppo_kl"] = agg_kl_old_new / agg_active_tokens
+                        stats["actor/logp_abs_diff"] = agg_logp_abs_diff / agg_active_tokens
+                        stats["actor/pg_clipfrac"] = agg_clipfrac / agg_active_tokens
+                        stats["actor/pg_clipfrac_lower"] = agg_clipfrac_lower / agg_active_tokens
+                    else:
+                        stats["actor/ppo_kl"] = 0.0
+                        stats["actor/logp_abs_diff"] = 0.0
+                        stats["actor/pg_clipfrac"] = 0.0
+                        stats["actor/pg_clipfrac_lower"] = 0.0
                     response_mask_for_regularizers = (
                         (data["sttv_mask_answer"] > 0)
                         | (data["sttv_mask_loc"] > 0)
