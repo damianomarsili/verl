@@ -453,18 +453,47 @@ class SttvAgentLoop(AgentLoopBase):
         preds_str = "\n".join(lines) if lines else "(none)"
         return self.verifier_template.format(targets=targets_str, preds=preds_str)
 
-    def _parse_verifier_feedback(self, text: str, entries: list[LocEntry]) -> tuple[str, str]:
+    def _parse_verifier_feedback(self, text: str, entries: list[LocEntry]) -> tuple[str, str, dict[str, Any]]:
         cleaned = text.replace("<|im_end|>", "").strip()
         valid_indices = set(range(1, len(entries) + 1))
         index_actions: dict[int, tuple[str, int]] = {}
-        add_actions: list[tuple[str, int]] = []
-        add_seen: set[str] = set()
+        raw_add_actions: list[tuple[str, int, tuple[str, float, float, float, float]]] = []
         line_order = 0
 
         def _format_coord(value: float) -> str:
             if float(value).is_integer():
                 return str(int(value))
             return f"{float(value):.3f}".rstrip("0").rstrip(".")
+
+        def _normalize_label(label: str) -> str:
+            return " ".join(str(label).strip().lower().split())
+
+        def _canonical_signature(
+            *,
+            label: str,
+            x1: float,
+            y1: float,
+            x2: float,
+            y2: float,
+        ) -> tuple[str, float, float, float, float]:
+            return (
+                _normalize_label(label),
+                round(float(x1), 3),
+                round(float(y1), 3),
+                round(float(x2), 3),
+                round(float(y2), 3),
+            )
+
+        existing_signatures_by_idx: dict[int, tuple[str, float, float, float, float]] = {}
+        existing_signatures: set[tuple[str, float, float, float, float]] = set()
+        for idx, entry in enumerate(entries, start=1):
+            x1, y1, x2, y2 = entry.coords[:4]
+            signature = _canonical_signature(label=entry.label, x1=x1, y1=y1, x2=x2, y2=y2)
+            existing_signatures_by_idx[idx] = signature
+            existing_signatures.add(signature)
+
+        duplicate_add_existing_count = 0
+        redundant_remove_add_count = 0
 
         for raw_line in cleaned.splitlines():
             line = raw_line.strip()
@@ -519,18 +548,65 @@ class SttvAgentLoop(AgentLoopBase):
                     f'ADD label="{label}", '
                     f"[{_format_coord(x1)}, {_format_coord(y1)}, {_format_coord(x2)}, {_format_coord(y2)}]"
                 )
-                if normalized not in add_seen:
-                    add_seen.add(normalized)
-                    add_actions.append((normalized, line_order))
-                    line_order += 1
+                signature = _canonical_signature(label=label, x1=x1, y1=y1, x2=x2, y2=y2)
+                raw_add_actions.append((normalized, line_order, signature))
+                line_order += 1
+
+        remove_indices: set[int] = set()
+        for idx, (line, _) in index_actions.items():
+            if line.upper().startswith("REMOVE "):
+                remove_indices.add(idx)
+
+        removed_by_redundant_pair: set[int] = set()
+        used_add_indices: set[int] = set()
+        for idx in sorted(remove_indices):
+            signature = existing_signatures_by_idx.get(idx)
+            if signature is None:
+                continue
+            for add_idx, (_, _, add_signature) in enumerate(raw_add_actions):
+                if add_idx in used_add_indices:
+                    continue
+                if add_signature == signature:
+                    removed_by_redundant_pair.add(idx)
+                    used_add_indices.add(add_idx)
+                    redundant_remove_add_count += 1
+                    break
+
+        for idx in removed_by_redundant_pair:
+            index_actions.pop(idx, None)
+
+        add_actions: list[tuple[str, int]] = []
+        add_seen: set[tuple[str, float, float, float, float]] = set()
+        for add_idx, (line, order, signature) in enumerate(raw_add_actions):
+            if add_idx in used_add_indices:
+                continue
+            if signature in existing_signatures:
+                duplicate_add_existing_count += 1
+                continue
+            if signature in add_seen:
+                continue
+            add_seen.add(signature)
+            add_actions.append((line, order))
 
         normalized_lines: list[tuple[str, int]] = list(index_actions.values()) + add_actions
         normalized_lines.sort(key=lambda item: item[1])
+        has_effect = len(normalized_lines) > 0
+        feedback_valid_for_reward = (
+            has_effect and duplicate_add_existing_count == 0 and redundant_remove_add_count == 0
+        )
+        feedback_info = {
+            "feedback_has_effect": bool(has_effect),
+            "feedback_valid_for_reward": bool(feedback_valid_for_reward),
+            "feedback_has_duplicate_add_existing": bool(duplicate_add_existing_count > 0),
+            "feedback_has_redundant_remove_add": bool(redundant_remove_add_count > 0),
+            "feedback_duplicate_add_existing_count": int(duplicate_add_existing_count),
+            "feedback_redundant_remove_add_count": int(redundant_remove_add_count),
+        }
         if len(normalized_lines) == 0:
             no_op = "NO_VALID_CORRECTIONS. Re-emit all boxes unchanged in one <bbox_2d> block."
-            return no_op, cleaned
+            return no_op, cleaned, feedback_info
         corrections = "\n".join(line for line, _ in normalized_lines)
-        return corrections, cleaned
+        return corrections, cleaned, feedback_info
 
     async def _generate_once(
         self,
@@ -644,14 +720,41 @@ class SttvAgentLoop(AgentLoopBase):
                 response_logprobs.extend([0.0] * len(token_ids))
         return len(token_ids)
 
-    async def _build_verifier_prompt_ids_and_mm_inputs(
+    def _format_bbox_block(self, entries: list[LocEntry]) -> str:
+        def _format_coord(value: float) -> str:
+            if float(value).is_integer():
+                return str(int(value))
+            return f"{float(value):.3f}".rstrip("0").rstrip(".")
+
+        lines: list[str] = []
+        for idx, entry in enumerate(entries, start=1):
+            x1, y1, x2, y2 = entry.coords[:4]
+            lines.append(
+                f'{idx}: label="{entry.label}", '
+                f'[{_format_coord(x1)}, {_format_coord(y1)}, {_format_coord(x2)}, {_format_coord(y2)}]'
+            )
+        return "<bbox_2d>\n" + "\n".join(lines) + "\n</bbox_2d>"
+
+    def _build_clean_answer_prompt(self, query: str, latest_bbox_block: str) -> str:
+        query_text = query.strip()
+        return (
+            f"{self.instruction_text}\n\n"
+            f"Original query:\n{query_text}\n\n"
+            f"Detected objects:\n{latest_bbox_block}\n\n"
+            f"Here is the query again:\n{query_text}\n\n"
+            "Please now answer the query by first reasoning inside <reason> tags and then putting ONLY your final "
+            "answer inside <answer>. Do not round answers, express all ratios as unrounded decimals. "
+            "Do not output another <bbox_2d>."
+        )
+
+    async def _build_prompt_ids_and_mm_inputs(
         self,
         messages: list[dict[str, object]],
-        verifier_images: list[Image.Image],
+        images: list[Image.Image],
     ) -> tuple[list[int], dict[str, torch.Tensor]]:
-        # Keep verifier generation path identical across modes: prompt_ids always come
+        # Keep aux-generation prompt_ids identical across modes: prompt_ids always come
         # from the standard chat-template tokenizer path.
-        prompt_ids = await self.apply_chat_template(messages, images=verifier_images)
+        prompt_ids = await self.apply_chat_template(messages, images=images)
         if self.processor is None or not self.aux_mm_reuse_enable:
             return prompt_ids, {}
 
@@ -666,7 +769,7 @@ class SttvAgentLoop(AgentLoopBase):
         )
         model_inputs = self.processor(
             text=[raw_prompt],
-            images=verifier_images,
+            images=images,
             return_tensors="pt",
             do_sample_frames=False,
         )
@@ -702,7 +805,7 @@ class SttvAgentLoop(AgentLoopBase):
             verifier_images.extend([original, overlay])
         content.append({"type": "text", "text": prompt})
         messages = [{"role": "user", "content": content}]
-        prompt_ids, verifier_multi_modal_inputs = await self._build_verifier_prompt_ids_and_mm_inputs(
+        prompt_ids, verifier_multi_modal_inputs = await self._build_prompt_ids_and_mm_inputs(
             messages,
             verifier_images,
         )
@@ -739,7 +842,48 @@ class SttvAgentLoop(AgentLoopBase):
             verifier_multi_modal_inputs,
         )
 
+    async def _build_answer_aux_messages(
+        self,
+        images: list[Image.Image],
+        query: str,
+        latest_bbox_block: str,
+        sampling_params: dict[str, Any],
+        metrics: dict[str, Any],
+    ) -> tuple[str, str, list[int], list[int], list[float], list[dict[str, Any]], dict[str, torch.Tensor]]:
+        answer_prompt = self._build_clean_answer_prompt(query, latest_bbox_block)
+        messages = self._build_messages(answer_prompt, images)
+        prompt_ids, answer_multi_modal_inputs = await self._build_prompt_ids_and_mm_inputs(messages, images)
+        answer_sampling_params = dict(sampling_params)
+        answer_sampling_params["max_tokens"] = self.max_new_tokens_per_chunk
+        answer_sampling_params["stop"] = ["</answer>"]
+        output = await self.server_manager.generate(
+            request_id=uuid4().hex,
+            prompt_ids=prompt_ids,
+            sampling_params=answer_sampling_params,
+            image_data=images,
+        )
+        output_text = self.tokenizer.decode(output.token_ids, skip_special_tokens=True)
+        output_ids = output.token_ids
+        output_log_probs_raw = output.log_probs or []
+        if metrics is not None and metrics.get("num_preempted", -1) == -1:
+            metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
+        if output_log_probs_raw:
+            output_log_probs = [float(x) for x in output_log_probs_raw]
+        else:
+            output_log_probs = [0.0] * len(output_ids)
+        serialized_images = [self._serialize_image_bytes(image) for image in images]
+        return (
+            answer_prompt,
+            output_text,
+            prompt_ids,
+            output_ids,
+            output_log_probs,
+            serialized_images,
+            answer_multi_modal_inputs,
+        )
+
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
+        validate_mode = bool(kwargs.get("validate", False))
         raw_messages = list(kwargs["raw_prompt"])
         query = self._extract_query(raw_messages)
         multi_modal_data = await self.process_vision_info(raw_messages)
@@ -760,6 +904,7 @@ class SttvAgentLoop(AgentLoopBase):
         sttv_loc_mask: list[int] = []
         sttv_loc_calls: list[dict[str, Any]] = []
         sttv_loc_verifier_calls: list[dict[str, Any]] = []
+        sttv_answer_aux_call: Optional[dict[str, Any]] = None
         loc_call_counter = 0
 
         output_chunks: list[str] = []
@@ -875,6 +1020,7 @@ class SttvAgentLoop(AgentLoopBase):
                     "sttv_loc_mask": sttv_loc_mask[: self.response_length],
                     "sttv_loc_calls": clipped_loc_calls,
                     "sttv_loc_verifier_calls": sttv_loc_verifier_calls,
+                    "sttv_answer_aux_call": sttv_answer_aux_call,
                 },
             )
 
@@ -959,7 +1105,7 @@ class SttvAgentLoop(AgentLoopBase):
                     generate_logprobs=bool(sampling_params.get("logprobs", False)),
                     metrics=metrics,
                 )
-                corrections, _ = self._parse_verifier_feedback(verifier_output, current_entries)
+                corrections, _, feedback_info = self._parse_verifier_feedback(verifier_output, current_entries)
                 current_loc_call_index = sttv_loc_calls[-1]["call_index"] if sttv_loc_calls else -1
                 if current_loc_call_index >= 0:
                     sttv_loc_verifier_calls.append(
@@ -974,6 +1120,24 @@ class SttvAgentLoop(AgentLoopBase):
                             "verifier_output_log_probs": verifier_output_log_probs,
                             "verifier_images": verifier_images,
                             "verifier_multi_modal_inputs": verifier_multi_modal_inputs,
+                            "sttv_loc_verifier_feedback_has_effect": bool(
+                                feedback_info.get("feedback_has_effect", False)
+                            ),
+                            "sttv_loc_verifier_feedback_valid_for_reward": bool(
+                                feedback_info.get("feedback_valid_for_reward", False)
+                            ),
+                            "sttv_loc_verifier_feedback_has_duplicate_add_existing": bool(
+                                feedback_info.get("feedback_has_duplicate_add_existing", False)
+                            ),
+                            "sttv_loc_verifier_feedback_has_redundant_remove_add": bool(
+                                feedback_info.get("feedback_has_redundant_remove_add", False)
+                            ),
+                            "sttv_loc_verifier_feedback_duplicate_add_existing_count": int(
+                                feedback_info.get("feedback_duplicate_add_existing_count", 0)
+                            ),
+                            "sttv_loc_verifier_feedback_redundant_remove_add_count": int(
+                                feedback_info.get("feedback_redundant_remove_add_count", 0)
+                            ),
                         }
                     )
 
@@ -1028,33 +1192,38 @@ class SttvAgentLoop(AgentLoopBase):
                     continue
                 current_entries = corrected_entries
 
-            await _append_user_turn(
-                "Please now answer the query by first reasoning inside <reason> tags and then putting ONLY your final answer "
-                "inside <answer>. Do not round answers, express all ratios as unrounded decimals. "
-                "Do not output another <bbox_2d>."
+            latest_bbox_block = self._format_bbox_block(current_entries)
+            (
+                answer_prompt_text,
+                answer_output_text,
+                answer_prompt_token_ids,
+                answer_output_token_ids,
+                answer_output_log_probs,
+                answer_images,
+                answer_multi_modal_inputs,
+            ) = await self._build_answer_aux_messages(
+                images=images,
+                query=query,
+                latest_bbox_block=latest_bbox_block,
+                sampling_params=sampling_params,
+                metrics=metrics,
             )
-            if self.agent_loop_cpu_cleanup_enable:
-                final_chunk, final_token_ids, final_log_probs = await self._generate_once_with_cached_prompt_ids(
-                    prompt_ids=model_prompt_ids,
-                    images=images,
-                    sampling_params=sampling_params,
-                    stop_sequences=["</answer>"],
-                    max_new_tokens=self.max_new_tokens_per_chunk,
-                    metrics=metrics,
-                )
-            else:
-                final_chunk, final_token_ids, final_log_probs = await self._generate_once(
-                    messages,
-                    images=images,
-                    sampling_params=sampling_params,
-                    stop_sequences=["</answer>"],
-                    max_new_tokens=self.max_new_tokens_per_chunk,
-                    metrics=metrics,
-                )
-            total_generated_tokens += len(final_token_ids)
-            assistant_turns += 1
-            _append_assistant_turn(final_chunk, final_token_ids, final_log_probs)
-            if self.agent_loop_cpu_cleanup_enable and final_token_ids:
-                model_prompt_ids.extend(final_token_ids)
-            messages.append({"role": "assistant", "content": [{"type": "text", "text": final_chunk}]})
+            sttv_answer_aux_call = {
+                "answer_prompt_text": answer_prompt_text,
+                "answer_output_text": answer_output_text,
+                "answer_prompt_token_ids": answer_prompt_token_ids,
+                "answer_output_token_ids": answer_output_token_ids,
+                "answer_output_log_probs": answer_output_log_probs,
+                "answer_images": answer_images,
+                "answer_multi_modal_inputs": answer_multi_modal_inputs,
+                "answer_latest_bbox_block": latest_bbox_block,
+                "answer_solution_str": f"{latest_bbox_block}\n{answer_output_text}",
+            }
+            if validate_mode:
+                total_generated_tokens += len(answer_output_token_ids)
+                assistant_turns += 1
+                _append_assistant_turn(answer_output_text, answer_output_token_ids, answer_output_log_probs)
+                if self.agent_loop_cpu_cleanup_enable and answer_output_token_ids:
+                    model_prompt_ids.extend(answer_output_token_ids)
+                messages.append({"role": "assistant", "content": [{"type": "text", "text": answer_output_text}]})
             return _return_output()

@@ -700,14 +700,20 @@ class RayPPOTrainer:
 
         reward_cfg = self.config.get("custom_reward_function") or {}
         module_path = reward_cfg.get("path")
+        answer_fn_name = reward_cfg.get("name", "compute_score_batched")
         loc_fn_name = reward_cfg.get("loc_call_name", "compute_loc_call_rewards_batched")
         loc_verifier_fn_name = reward_cfg.get("loc_verifier_name", "compute_loc_verifier_rewards_batched")
         reward_fns: dict[str, Optional[Callable[..., Any]]] = {
+            "answer": None,
             "loc": None,
             "loc_verifier": None,
         }
         if module_path:
-            for key, fn_name in (("loc", loc_fn_name), ("loc_verifier", loc_verifier_fn_name)):
+            for key, fn_name in (
+                ("answer", answer_fn_name),
+                ("loc", loc_fn_name),
+                ("loc_verifier", loc_verifier_fn_name),
+            ):
                 try:
                     reward_fns[key] = load_extern_object(module_path=module_path, object_name=fn_name)
                 except Exception as exc:
@@ -1439,6 +1445,8 @@ class RayPPOTrainer:
         global_rewards: list[float],
         weights: dict[str, float],
         raw_prompts: Optional[list[object]] = None,
+        answer_aux_outputs: Optional[list[str]] = None,
+        answer_aux_prompts: Optional[list[str]] = None,
     ) -> dict[str, list[Any]]:
         def _as_float(value: Any, default: float = 0.0) -> float:
             try:
@@ -1713,6 +1721,27 @@ class RayPPOTrainer:
             "sttv_sam3_plot": sam3_plots,
             "sttv_loc_reward_plot": loc_reward_plots,
         }
+        answer_aux_output_values = list(answer_aux_outputs) if isinstance(answer_aux_outputs, list) else []
+        if len(answer_aux_output_values) < batch_size:
+            answer_aux_output_values.extend([""] * (batch_size - len(answer_aux_output_values)))
+        answer_aux_output_values = answer_aux_output_values[:batch_size]
+        answer_aux_prompt_values = list(answer_aux_prompts) if isinstance(answer_aux_prompts, list) else []
+        if len(answer_aux_prompt_values) < batch_size:
+            answer_aux_prompt_values.extend([""] * (batch_size - len(answer_aux_prompt_values)))
+        answer_aux_prompt_values = [
+            (prompt[:1200] + "...") if isinstance(prompt, str) and len(prompt) > 1200 else prompt
+            for prompt in answer_aux_prompt_values[:batch_size]
+        ]
+        answer_aux_final_answers = [
+            self._extract_final_answer(str(output_text or "")) for output_text in answer_aux_output_values
+        ]
+        sample_columns.update(
+            {
+                "sttv_answer_aux_output": answer_aux_output_values,
+                "sttv_answer_aux_final_answer": answer_aux_final_answers,
+                "sttv_answer_aux_prompt": answer_aux_prompt_values,
+            }
+        )
         sample_columns.update(per_step_columns)
         sample_columns.update(
             {
@@ -1825,6 +1854,57 @@ class RayPPOTrainer:
                 endpoint = int(fallback[-1, 0].item()) if fallback.numel() > 0 else response_len - 1
             relocated[row_idx, endpoint] = sample_scores[row_idx]
         return relocated
+
+    def _compute_sttv_answer_aux_reward_tensor(
+        self,
+        aux_batch: Optional[DataProto],
+        reward_fn: Optional[Callable[..., Any]],
+    ) -> tuple[Optional[torch.Tensor], int, list[float]]:
+        if aux_batch is None or len(aux_batch) == 0:
+            return None, 0, []
+
+        response_mask = aux_batch.batch["response_mask"]
+        answer_rewards = torch.zeros_like(response_mask, dtype=torch.float32)
+        total_rows = len(aux_batch)
+        reward_values = [0.0] * total_rows
+        if reward_fn is not None:
+            data_sources_raw = aux_batch.non_tensor_batch.get("data_source", np.array(["unknown"] * total_rows, dtype=object))
+            data_sources = data_sources_raw.tolist() if isinstance(data_sources_raw, np.ndarray) else list(data_sources_raw)
+            ground_truths_raw = aux_batch.non_tensor_batch.get(
+                "sttv_ground_truth",
+                np.array([""] * total_rows, dtype=object),
+            )
+            ground_truths = ground_truths_raw.tolist() if isinstance(ground_truths_raw, np.ndarray) else list(ground_truths_raw)
+            extra_infos_raw = aux_batch.non_tensor_batch.get(
+                "sttv_extra_info",
+                np.array([{}] * total_rows, dtype=object),
+            )
+            extra_infos = extra_infos_raw.tolist() if isinstance(extra_infos_raw, np.ndarray) else list(extra_infos_raw)
+            solution_strs_raw = aux_batch.non_tensor_batch.get(
+                "sttv_answer_solution_str",
+                np.array([""] * total_rows, dtype=object),
+            )
+            solution_strs = (
+                solution_strs_raw.tolist() if isinstance(solution_strs_raw, np.ndarray) else list(solution_strs_raw)
+            )
+            if len(solution_strs) < total_rows:
+                solution_strs.extend([""] * (total_rows - len(solution_strs)))
+            raw_rewards = reward_fn(
+                data_sources=data_sources,
+                solution_strs=solution_strs,
+                ground_truths=ground_truths,
+                extra_infos=extra_infos,
+            )
+            reward_values = self._normalize_flat_rewards(raw_rewards, expected_len=total_rows)
+
+        for row_idx, reward in enumerate(reward_values):
+            response_len = int(response_mask[row_idx].sum().item())
+            if response_len <= 0:
+                continue
+            endpoint = response_len - 1
+            answer_rewards[row_idx, endpoint] = float(reward)
+
+        return answer_rewards, total_rows, reward_values
 
     def _compute_sttv_loc_call_reward_tensor(
         self,
@@ -2476,6 +2556,314 @@ class RayPPOTrainer:
         }
         return aux_batch, aux_metrics
 
+    def _build_sttv_answer_aux_batch(
+        self, batch: DataProto
+    ) -> tuple[Optional[DataProto], dict[str, float]]:
+        t_total_start = time.perf_counter()
+        answer_calls_raw = batch.non_tensor_batch.get("sttv_answer_aux_call")
+        if answer_calls_raw is None:
+            return None, {
+                "sttv/answer_aux_prompt_len": 0.0,
+                "sttv/answer_aux_response_len": 0.0,
+                "sttv/answer_aux_rows_dropped_no_images": 0.0,
+                "sttv/answer_aux_multimodal_fallback_rows": 0.0,
+                "sttv/answer_aux_mm_reuse_rows": 0.0,
+                "sttv/answer_aux_mm_reuse_missing_rows": 0.0,
+                "sttv/answer_aux_build_time_total_s": 0.0,
+                "sttv/answer_aux_build_time_collect_rows_s": 0.0,
+                "sttv/answer_aux_build_time_pack_tensors_s": 0.0,
+                "sttv/answer_aux_build_time_mm_inputs_s": 0.0,
+                "sttv/answer_aux_build_time_position_ids_s": 0.0,
+                "sttv/answer_aux_decode_cache_hits": 0.0,
+                "sttv/answer_aux_decode_cache_misses": 0.0,
+                "sttv/answer_aux_decode_errors": 0.0,
+            }
+
+        max_prompt_len = int(self.config.actor_rollout_ref.rollout.prompt_length)
+        max_response_len = int(self.config.actor_rollout_ref.rollout.response_length)
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id if self.tokenizer.eos_token_id is not None else 0
+
+        data_sources, solution_strs, ground_truths, extra_infos = self._extract_reward_context(
+            batch, include_solution_strs=True
+        )
+
+        aux_rows: list[dict[str, Any]] = []
+        dropped_no_images = 0
+        mm_reuse_missing_rows = 0
+        decode_stats = {"cache_hits": 0, "cache_misses": 0, "decode_errors": 0}
+        aux_mm_reuse_enabled = self._get_sttv_perf_flag("aux_mm_reuse_enable", True)
+        t_collect_rows_start = time.perf_counter()
+
+        for row_idx in range(len(batch)):
+            uid = str(batch.non_tensor_batch["uid"][row_idx])
+            call_record = answer_calls_raw[row_idx]
+            if isinstance(call_record, np.ndarray):
+                call_record = call_record.tolist()
+            if isinstance(call_record, list) and len(call_record) > 0:
+                call_record = call_record[0]
+            if not isinstance(call_record, dict):
+                continue
+
+            prompt_text = str(call_record.get("answer_prompt_text", "") or "")
+            output_text = str(call_record.get("answer_output_text", "") or "")
+            latest_bbox_block = str(call_record.get("answer_latest_bbox_block", "") or "")
+            solution_str = str(call_record.get("answer_solution_str", "") or "")
+
+            prompt_token_ids = list(call_record.get("answer_prompt_token_ids", []) or [])
+            if len(prompt_token_ids) == 0 and prompt_text:
+                prompt_token_ids = self.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+
+            output_token_ids = list(call_record.get("answer_output_token_ids", []) or [])
+            if len(output_token_ids) == 0 and output_text:
+                output_token_ids = self.tokenizer(output_text, add_special_tokens=False)["input_ids"]
+            if len(output_token_ids) == 0:
+                continue
+
+            output_log_probs_raw = call_record.get("answer_output_log_probs", [])
+            if isinstance(output_log_probs_raw, np.ndarray):
+                output_log_probs_raw = output_log_probs_raw.tolist()
+            if isinstance(output_log_probs_raw, (list, tuple)):
+                output_log_probs = []
+                for value in output_log_probs_raw:
+                    try:
+                        output_log_probs.append(float(value))
+                    except (TypeError, ValueError):
+                        output_log_probs.append(0.0)
+            else:
+                output_log_probs = []
+            if len(output_log_probs) > len(output_token_ids):
+                output_log_probs = output_log_probs[: len(output_token_ids)]
+
+            reused_multi_modal_inputs = None
+            if aux_mm_reuse_enabled and self.processor is not None:
+                reused_multi_modal_inputs = self._normalize_reused_aux_multi_modal_inputs(
+                    call_record.get("answer_multi_modal_inputs")
+                )
+                if reused_multi_modal_inputs is None:
+                    mm_reuse_missing_rows += 1
+
+            if len(prompt_token_ids) > max_prompt_len:
+                raise RuntimeError(
+                    "Aux answer prompt exceeds configured prompt length and truncation is disabled: "
+                    f"prompt_tokens={len(prompt_token_ids)} > rollout.prompt_length={max_prompt_len}. "
+                    "Increase data.max_prompt_length (and rollout.prompt_length) in the launch config."
+                )
+            if len(output_token_ids) > max_response_len:
+                raise RuntimeError(
+                    "Aux answer response exceeds configured response length and truncation is disabled: "
+                    f"response_tokens={len(output_token_ids)} > rollout.response_length={max_response_len}. "
+                    "Increase data.max_response_length (and rollout.response_length) in the launch config."
+                )
+
+            images: list[Image.Image] = []
+            if self.processor is not None and reused_multi_modal_inputs is None:
+                images = self._deserialize_sttv_images(call_record.get("answer_images", []), stats=decode_stats)
+            if self.processor is not None and reused_multi_modal_inputs is None and len(images) == 0:
+                dropped_no_images += 1
+                continue
+
+            if not prompt_text and prompt_token_ids:
+                prompt_text = self.tokenizer.decode(prompt_token_ids, skip_special_tokens=True)
+            if not output_text and output_token_ids:
+                output_text = self.tokenizer.decode(output_token_ids, skip_special_tokens=True)
+            if not solution_str:
+                if latest_bbox_block:
+                    solution_str = f"{latest_bbox_block}\n{output_text}"
+                else:
+                    solution_str = output_text
+
+            aux_rows.append(
+                {
+                    "parent_row_index": row_idx,
+                    "uid": uid,
+                    "call_record": call_record,
+                    "data_source": str(data_sources[row_idx]),
+                    "ground_truth": str(ground_truths[row_idx]),
+                    "parent_solution_str": str(solution_strs[row_idx]),
+                    "extra_info": extra_infos[row_idx],
+                    "prompt_token_ids": prompt_token_ids,
+                    "output_token_ids": output_token_ids,
+                    "prompt_text": prompt_text,
+                    "output_text": output_text,
+                    "solution_str": solution_str,
+                    "output_log_probs": output_log_probs,
+                    "reused_multi_modal_inputs": reused_multi_modal_inputs,
+                    "images": images,
+                }
+            )
+        t_collect_rows = time.perf_counter() - t_collect_rows_start
+
+        if len(aux_rows) == 0:
+            return None, {
+                "sttv/answer_aux_prompt_len": 0.0,
+                "sttv/answer_aux_response_len": 0.0,
+                "sttv/answer_aux_rows_dropped_no_images": float(dropped_no_images),
+                "sttv/answer_aux_multimodal_fallback_rows": 0.0,
+                "sttv/answer_aux_mm_reuse_rows": 0.0,
+                "sttv/answer_aux_mm_reuse_missing_rows": float(mm_reuse_missing_rows),
+                "sttv/answer_aux_build_time_total_s": float(time.perf_counter() - t_total_start),
+                "sttv/answer_aux_build_time_collect_rows_s": float(t_collect_rows),
+                "sttv/answer_aux_build_time_pack_tensors_s": 0.0,
+                "sttv/answer_aux_build_time_mm_inputs_s": 0.0,
+                "sttv/answer_aux_build_time_position_ids_s": 0.0,
+                "sttv/answer_aux_decode_cache_hits": float(decode_stats["cache_hits"]),
+                "sttv/answer_aux_decode_cache_misses": float(decode_stats["cache_misses"]),
+                "sttv/answer_aux_decode_errors": float(decode_stats["decode_errors"]),
+            }
+
+        aux_prompt_len = min(max_prompt_len, max(1, max(len(row["prompt_token_ids"]) for row in aux_rows)))
+        aux_response_len = min(max_response_len, max(1, max(len(row["output_token_ids"]) for row in aux_rows)))
+
+        prompts: list[torch.Tensor] = []
+        responses: list[torch.Tensor] = []
+        response_masks: list[torch.Tensor] = []
+        rollout_log_probs: list[torch.Tensor] = []
+        input_ids_all: list[torch.Tensor] = []
+        attention_masks: list[torch.Tensor] = []
+        aux_texts_for_compute: list[str] = []
+        aux_images_for_compute: list[list[Image.Image]] = []
+        mm_compute_row_indices: list[int] = []
+
+        aux_uids: list[str] = []
+        parent_row_indices: list[int] = []
+        call_records: list[dict[str, Any]] = []
+        aux_data_sources: list[str] = []
+        aux_ground_truths: list[str] = []
+        aux_solution_strs: list[str] = []
+        aux_parent_solution_strs: list[str] = []
+        aux_extra_infos: list[dict[str, Any]] = []
+        aux_output_texts: list[str] = []
+        aux_prompt_texts: list[str] = []
+
+        t_pack_tensors_start = time.perf_counter()
+        for row_idx, row in enumerate(aux_rows):
+            prompt_token_ids = row["prompt_token_ids"]
+            output_token_ids = row["output_token_ids"]
+
+            prompt_tensor = torch.full((aux_prompt_len,), pad_token_id, dtype=torch.long)
+            prompt_attention = torch.zeros((aux_prompt_len,), dtype=torch.long)
+            if prompt_token_ids:
+                prompt_tensor[-len(prompt_token_ids) :] = torch.tensor(prompt_token_ids, dtype=torch.long)
+                prompt_attention[-len(prompt_token_ids) :] = 1
+
+            response_tensor = torch.full((aux_response_len,), pad_token_id, dtype=torch.long)
+            response_attention = torch.zeros((aux_response_len,), dtype=torch.long)
+            response_tensor[: len(output_token_ids)] = torch.tensor(output_token_ids, dtype=torch.long)
+            response_attention[: len(output_token_ids)] = 1
+
+            rollout_log_prob_tensor = torch.zeros((aux_response_len,), dtype=torch.float32)
+            output_log_probs = row.get("output_log_probs", [])
+            if isinstance(output_log_probs, (list, tuple)) and len(output_log_probs) > 0:
+                valid_len = min(len(output_token_ids), len(output_log_probs), aux_response_len)
+                rollout_log_prob_tensor[:valid_len] = torch.tensor(output_log_probs[:valid_len], dtype=torch.float32)
+
+            input_ids = torch.cat([prompt_tensor, response_tensor], dim=0)
+            attention_mask = torch.cat([prompt_attention, response_attention], dim=0)
+            response_mask = response_attention.clone()
+
+            prompts.append(prompt_tensor)
+            responses.append(response_tensor)
+            response_masks.append(response_mask)
+            rollout_log_probs.append(rollout_log_prob_tensor)
+            input_ids_all.append(input_ids)
+            attention_masks.append(attention_mask)
+            if self.processor is not None and row.get("reused_multi_modal_inputs") is None:
+                aux_texts_for_compute.append(self._build_aux_mm_processor_text(len(row["images"])))
+                aux_images_for_compute.append(row["images"])
+                mm_compute_row_indices.append(row_idx)
+
+            uid = row["uid"]
+            aux_uids.append(f"{uid}::ans")
+            parent_row_indices.append(int(row["parent_row_index"]))
+            call_records.append(row["call_record"])
+            aux_data_sources.append(row["data_source"])
+            aux_ground_truths.append(row["ground_truth"])
+            aux_solution_strs.append(row["solution_str"])
+            aux_parent_solution_strs.append(row["parent_solution_str"])
+            aux_extra_infos.append(row["extra_info"])
+            aux_output_texts.append(row["output_text"])
+            aux_prompt_texts.append(row["prompt_text"])
+        t_pack_tensors = time.perf_counter() - t_pack_tensors_start
+
+        t_mm_inputs_start = time.perf_counter()
+        if self.processor is not None:
+            multi_modal_inputs_list: list[dict[str, torch.Tensor]] = [{} for _ in aux_rows]
+            mm_reuse_rows = 0
+            for row_idx, row in enumerate(aux_rows):
+                reused_inputs = row.get("reused_multi_modal_inputs")
+                if isinstance(reused_inputs, dict) and len(reused_inputs) > 0:
+                    multi_modal_inputs_list[row_idx] = reused_inputs
+                    mm_reuse_rows += 1
+            fallback_rows = 0
+            if mm_compute_row_indices:
+                computed_inputs, fallback_rows = self._compute_aux_multi_modal_inputs_batched(
+                    texts=aux_texts_for_compute,
+                    images_per_row=aux_images_for_compute,
+                )
+                for row_idx, computed in zip(mm_compute_row_indices, computed_inputs, strict=True):
+                    multi_modal_inputs_list[row_idx] = computed
+        else:
+            multi_modal_inputs_list = [{} for _ in aux_rows]
+            mm_reuse_rows = 0
+            fallback_rows = 0
+        t_mm_inputs = time.perf_counter() - t_mm_inputs_start
+
+        t_position_ids_start = time.perf_counter()
+        position_ids_all: list[torch.Tensor] = []
+        for input_ids, attention_mask, multi_modal_inputs in zip(
+            input_ids_all, attention_masks, multi_modal_inputs_list, strict=True
+        ):
+            position_ids = self._compute_aux_position_ids(
+                input_ids.unsqueeze(0),
+                attention_mask.unsqueeze(0),
+                multi_modal_inputs,
+            ).squeeze(0)
+            position_ids_all.append(position_ids)
+        t_position_ids = time.perf_counter() - t_position_ids_start
+
+        tensors = {
+            "prompts": torch.stack(prompts, dim=0),
+            "responses": torch.stack(responses, dim=0),
+            "response_mask": torch.stack(response_masks, dim=0),
+            "rollout_log_probs": torch.stack(rollout_log_probs, dim=0),
+            "input_ids": torch.stack(input_ids_all, dim=0),
+            "attention_mask": torch.stack(attention_masks, dim=0),
+            "position_ids": torch.stack(position_ids_all, dim=0),
+        }
+        non_tensors: dict[str, np.ndarray] = {
+            "uid": np.array(aux_uids, dtype=object),
+            "sttv_parent_row_index": np.array(parent_row_indices, dtype=np.int32),
+            "sttv_answer_aux_call_record": np.array(call_records, dtype=object),
+            "sttv_answer_output_text": np.array(aux_output_texts, dtype=object),
+            "sttv_answer_prompt_text": np.array(aux_prompt_texts, dtype=object),
+            "sttv_answer_solution_str": np.array(aux_solution_strs, dtype=object),
+            "data_source": np.array(aux_data_sources, dtype=object),
+            "sttv_ground_truth": np.array(aux_ground_truths, dtype=object),
+            "sttv_parent_solution_str": np.array(aux_parent_solution_strs, dtype=object),
+            "sttv_extra_info": np.array(aux_extra_infos, dtype=object),
+            "multi_modal_inputs": np.array(multi_modal_inputs_list, dtype=object),
+        }
+        aux_batch = DataProto.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=deepcopy(batch.meta_info))
+        aux_metrics = {
+            "sttv/answer_aux_prompt_len": float(aux_prompt_len),
+            "sttv/answer_aux_response_len": float(aux_response_len),
+            "sttv/answer_aux_rows_dropped_no_images": float(dropped_no_images),
+            "sttv/answer_aux_multimodal_fallback_rows": float(fallback_rows),
+            "sttv/answer_aux_mm_reuse_rows": float(mm_reuse_rows),
+            "sttv/answer_aux_mm_reuse_missing_rows": float(mm_reuse_missing_rows),
+            "sttv/answer_aux_build_time_total_s": float(time.perf_counter() - t_total_start),
+            "sttv/answer_aux_build_time_collect_rows_s": float(t_collect_rows),
+            "sttv/answer_aux_build_time_pack_tensors_s": float(t_pack_tensors),
+            "sttv/answer_aux_build_time_mm_inputs_s": float(t_mm_inputs),
+            "sttv/answer_aux_build_time_position_ids_s": float(t_position_ids),
+            "sttv/answer_aux_decode_cache_hits": float(decode_stats["cache_hits"]),
+            "sttv/answer_aux_decode_cache_misses": float(decode_stats["cache_misses"]),
+            "sttv/answer_aux_decode_errors": float(decode_stats["decode_errors"]),
+        }
+        return aux_batch, aux_metrics
+
     def _compute_sttv_loc_verifier_reward_tensor(
         self,
         aux_batch: Optional[DataProto],
@@ -2776,7 +3164,11 @@ class RayPPOTrainer:
         )
         return main_view, aux_view
 
-    def _compose_sttv_actor_batch(self, main_batch: DataProto, aux_batch: Optional[DataProto]) -> DataProto:
+    def _compose_sttv_actor_batches(
+        self,
+        main_batch: DataProto,
+        aux_batches: Sequence[Optional[DataProto]],
+    ) -> DataProto:
         tensor_keys = [
             "prompts",
             "responses",
@@ -2811,35 +3203,51 @@ class RayPPOTrainer:
             "ref_log_prob",
         }
         full_seq_tensor_keys = {"input_ids", "attention_mask", "position_ids"}
-        main_actor_batch, aux_actor_batch = self._build_sttv_aligned_main_aux_batches(
+        main_actor_batch = self._build_sttv_batch_view(
             main_batch,
-            aux_batch,
             tensor_keys=tensor_keys,
             non_tensor_keys=non_tensor_keys,
-            response_tensor_keys=response_tensor_keys,
-            full_seq_tensor_keys=full_seq_tensor_keys,
         )
-        if aux_actor_batch is None:
+
+        aligned_aux_views: list[DataProto] = []
+        source_aux_batches: list[DataProto] = []
+        for aux_batch in aux_batches:
+            if aux_batch is None or len(aux_batch) == 0:
+                continue
+            _, aligned_aux_view = self._build_sttv_aligned_main_aux_batches(
+                main_batch,
+                aux_batch,
+                tensor_keys=tensor_keys,
+                non_tensor_keys=non_tensor_keys,
+                response_tensor_keys=response_tensor_keys,
+                full_seq_tensor_keys=full_seq_tensor_keys,
+            )
+            if aligned_aux_view is None or len(aligned_aux_view) == 0:
+                continue
+            aligned_aux_views.append(aligned_aux_view)
+            source_aux_batches.append(aux_batch)
+
+        if len(aligned_aux_views) == 0:
             return main_actor_batch
 
-        merged = DataProto.concat([main_actor_batch, aux_actor_batch])
+        merged_parts = [main_actor_batch] + aligned_aux_views
+        merged = DataProto.concat(merged_parts)
         merged.meta_info = deepcopy(main_batch.meta_info)
-        # Interleave rows as [main_i, aux_i_*] instead of [all main][all aux].
-        # Without this, many PPO mini-batches become aux-only and can suppress the
-        # aggregate grad_norm even when main objectives have healthy signal.
-        if aux_batch is not None and "sttv_parent_row_index" in aux_batch.non_tensor_batch:
-            parent_rows_raw = aux_batch.non_tensor_batch["sttv_parent_row_index"]
+
+        main_rows = len(main_actor_batch)
+        buckets: list[list[int]] = [[] for _ in range(main_rows)]
+        unassigned_aux: list[int] = []
+        aux_offset = main_rows
+        for aux_batch, aligned_aux_view in zip(source_aux_batches, aligned_aux_views, strict=True):
+            aux_rows = len(aligned_aux_view)
+            parent_rows_raw = aux_batch.non_tensor_batch.get("sttv_parent_row_index")
             if isinstance(parent_rows_raw, np.ndarray):
                 parent_rows = parent_rows_raw.tolist()
+            elif parent_rows_raw is None:
+                parent_rows = []
             else:
                 parent_rows = list(parent_rows_raw)
 
-            main_rows = len(main_actor_batch)
-            aux_rows = len(aux_actor_batch)
-            aux_offset = main_rows
-
-            buckets: list[list[int]] = [[] for _ in range(main_rows)]
-            unassigned_aux: list[int] = []
             for aux_idx in range(aux_rows):
                 parent_row = parent_rows[aux_idx] if aux_idx < len(parent_rows) else -1
                 try:
@@ -2851,16 +3259,19 @@ class RayPPOTrainer:
                     buckets[parent_int].append(merged_aux_index)
                 else:
                     unassigned_aux.append(merged_aux_index)
+            aux_offset += aux_rows
 
-            ordered_indices: list[int] = []
-            for main_idx in range(main_rows):
-                ordered_indices.append(main_idx)
-                ordered_indices.extend(buckets[main_idx])
-            ordered_indices.extend(unassigned_aux)
-
-            if len(ordered_indices) == len(merged):
-                merged.reorder(torch.tensor(ordered_indices, dtype=torch.long))
+        ordered_indices: list[int] = []
+        for main_idx in range(main_rows):
+            ordered_indices.append(main_idx)
+            ordered_indices.extend(buckets[main_idx])
+        ordered_indices.extend(unassigned_aux)
+        if len(ordered_indices) == len(merged):
+            merged.reorder(torch.tensor(ordered_indices, dtype=torch.long))
         return merged
+
+    def _compose_sttv_actor_batch(self, main_batch: DataProto, aux_batch: Optional[DataProto]) -> DataProto:
+        return self._compose_sttv_actor_batches(main_batch, [aux_batch])
 
     def _get_actor_dp_size(self) -> int:
         return self._get_dp_size(self.actor_rollout_wg, "actor")
@@ -3950,8 +4361,10 @@ class RayPPOTrainer:
                             )
 
                     sttv_multi_objective_enabled = self._is_sttv_multi_objective_enabled()
-                    aux_batch: Optional[DataProto] = None
-                    aux_old_log_prob: Optional[DataProto] = None
+                    loc_verifier_aux_batch: Optional[DataProto] = None
+                    answer_aux_batch: Optional[DataProto] = None
+                    loc_verifier_aux_old_log_prob: Optional[DataProto] = None
+                    answer_aux_old_log_prob: Optional[DataProto] = None
                     if sttv_multi_objective_enabled:
                         if self.config.algorithm.adv_estimator != AdvantageEstimator.GRPO:
                             raise ValueError("STTV multi-objective currently supports only GRPO adv_estimator.")
@@ -3959,11 +4372,16 @@ class RayPPOTrainer:
                             raise ValueError(
                                 "STTV multi-objective currently does not support algorithm.use_kl_in_reward=True."
                             )
-                        t_aux_batch_start = time.perf_counter()
-                        aux_batch, aux_batch_metrics = self._build_sttv_loc_verifier_aux_batch(batch)
-                        metrics["sttv/aux_batch_build_time_s"] = float(time.perf_counter() - t_aux_batch_start)
+                        t_loc_verifier_aux_batch_start = time.perf_counter()
+                        loc_verifier_aux_batch, aux_batch_metrics = self._build_sttv_loc_verifier_aux_batch(batch)
+                        metrics["sttv/aux_batch_build_time_s"] = float(time.perf_counter() - t_loc_verifier_aux_batch_start)
                         if aux_batch_metrics:
                             metrics.update(aux_batch_metrics)
+                        t_answer_aux_batch_start = time.perf_counter()
+                        answer_aux_batch, answer_aux_batch_metrics = self._build_sttv_answer_aux_batch(batch)
+                        metrics["sttv/answer_aux_batch_build_time_s"] = float(time.perf_counter() - t_answer_aux_batch_start)
+                        if answer_aux_batch_metrics:
+                            metrics.update(answer_aux_batch_metrics)
 
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                     # Make bypass strictly config-controlled so STTV multi-objective can be
@@ -3985,15 +4403,25 @@ class RayPPOTrainer:
                             rollout_corr_config=rollout_corr_config,
                             policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
                         )
-                        if sttv_multi_objective_enabled and aux_batch is not None and len(aux_batch) > 0:
-                            if "rollout_log_probs" not in aux_batch.batch:
+                        if sttv_multi_objective_enabled and loc_verifier_aux_batch is not None and len(loc_verifier_aux_batch) > 0:
+                            if "rollout_log_probs" not in loc_verifier_aux_batch.batch:
                                 raise RuntimeError(
                                     "Bypass mode for STTV multi-objective requires aux rollout_log_probs. "
                                     "Verifier calls must include per-token verifier_output_log_probs."
                                 )
-                            aux_old_log_prob = DataProto.from_dict(
-                                tensors={"old_log_probs": aux_batch.batch["rollout_log_probs"].clone()},
-                                meta_info=deepcopy(aux_batch.meta_info),
+                            loc_verifier_aux_old_log_prob = DataProto.from_dict(
+                                tensors={"old_log_probs": loc_verifier_aux_batch.batch["rollout_log_probs"].clone()},
+                                meta_info=deepcopy(loc_verifier_aux_batch.meta_info),
+                            )
+                        if sttv_multi_objective_enabled and answer_aux_batch is not None and len(answer_aux_batch) > 0:
+                            if "rollout_log_probs" not in answer_aux_batch.batch:
+                                raise RuntimeError(
+                                    "Bypass mode for STTV multi-objective requires answer aux rollout_log_probs. "
+                                    "Answer aux calls must include per-token answer_output_log_probs."
+                                )
+                            answer_aux_old_log_prob = DataProto.from_dict(
+                                tensors={"old_log_probs": answer_aux_batch.batch["rollout_log_probs"].clone()},
+                                meta_info=deepcopy(answer_aux_batch.meta_info),
                             )
                     else:
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
@@ -4027,10 +4455,16 @@ class RayPPOTrainer:
                                 from verl.utils.debug.metrics import calculate_debug_metrics
 
                                 metrics.update(calculate_debug_metrics(batch))
-                            if sttv_multi_objective_enabled and aux_batch is not None and len(aux_batch) > 0:
-                                aux_old_log_prob, _ = self._compute_old_log_prob_with_padding(aux_batch)
-                                if "entropys" in aux_old_log_prob.batch:
-                                    aux_old_log_prob.batch.pop("entropys")
+                            if sttv_multi_objective_enabled and loc_verifier_aux_batch is not None and len(loc_verifier_aux_batch) > 0:
+                                loc_verifier_aux_old_log_prob, _ = self._compute_old_log_prob_with_padding(
+                                    loc_verifier_aux_batch
+                                )
+                                if "entropys" in loc_verifier_aux_old_log_prob.batch:
+                                    loc_verifier_aux_old_log_prob.batch.pop("entropys")
+                            if sttv_multi_objective_enabled and answer_aux_batch is not None and len(answer_aux_batch) > 0:
+                                answer_aux_old_log_prob, _ = self._compute_old_log_prob_with_padding(answer_aux_batch)
+                                if "entropys" in answer_aux_old_log_prob.batch:
+                                    answer_aux_old_log_prob.batch.pop("entropys")
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
@@ -4054,18 +4488,9 @@ class RayPPOTrainer:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
 
                         if sttv_multi_objective_enabled:
-                            # Answer objective score is scalar outcome score relocated to the answer mask endpoint.
-                            answer_mask = self._extract_sttv_mask_tensor(
-                                batch,
-                                "sttv_answer_mask",
-                                fallback_to_response_mask=True,
-                            )
-                            answer_scores = self._relocate_scalar_scores_to_mask(
-                                token_level_scores=reward_tensor,
-                                objective_mask=answer_mask,
-                                fallback_mask=batch.batch["response_mask"],
-                            )
-                            batch.batch["token_level_scores"] = answer_scores
+                            # Main trajectory does not optimize answer objective in STTV answer-aux mode.
+                            answer_mask = torch.zeros_like(batch.batch["response_mask"])
+                            batch.batch["token_level_scores"] = reward_tensor
                         else:
                             answer_mask = batch.batch["response_mask"]
                             batch.batch["token_level_scores"] = reward_tensor
@@ -4181,34 +4606,164 @@ class RayPPOTrainer:
                                 discard_rows,
                             )
 
-                            # Objective 1: answer correctness.
-                            answer_advantages, answer_returns = self._compute_sttv_grpo_advantages(
-                                token_level_rewards=batch.batch["token_level_rewards"],
-                                objective_mask=answer_mask,
-                                group_index=group_index_main,
-                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            )
-                            batch.batch["advantages"] = answer_advantages
-                            batch.batch["returns"] = answer_returns
-                            batch.batch["sttv_adv_answer"] = answer_advantages
+                            # Objective 1: answer correctness is optimized on answer aux only.
+                            main_answer_advantages = torch.zeros_like(loc_mask, dtype=torch.float32)
+                            batch.batch["advantages"] = main_answer_advantages
+                            batch.batch["returns"] = torch.zeros_like(main_answer_advantages)
+                            batch.batch["sttv_adv_answer"] = main_answer_advantages
                             batch.batch["sttv_mask_answer"] = answer_mask
-                            answer_zero_count, answer_active_count = self._count_zero_advantage_samples(
-                                answer_advantages,
-                                answer_mask,
-                            )
-                            metrics["sttv/adv_zero_samples_answer"] = float(answer_zero_count)
-                            metrics["sttv/adv_active_samples_answer"] = float(answer_active_count)
-                            metrics["sttv/adv_zero_frac_answer"] = (
-                                float(answer_zero_count) / float(answer_active_count)
-                                if answer_active_count > 0
-                                else 0.0
-                            )
-                            answer_active_tokens = float(answer_mask.sum().item())
-                            metrics["sttv/adv_abs_mean_answer"] = (
-                                float((answer_advantages.abs() * answer_mask).sum().item() / answer_active_tokens)
-                                if answer_active_tokens > 0.0
-                                else 0.0
-                            )
+                            metrics["sttv/adv_zero_samples_answer"] = 0.0
+                            metrics["sttv/adv_active_samples_answer"] = 0.0
+                            metrics["sttv/adv_zero_frac_answer"] = 0.0
+                            metrics["sttv/adv_abs_mean_answer"] = 0.0
+
+                            answer_aux_rows = len(answer_aux_batch) if answer_aux_batch is not None else 0
+                            answer_aux_scores: Optional[torch.Tensor] = None
+                            answer_aux_outputs = [""] * len(batch)
+                            answer_aux_prompts = [""] * len(batch)
+                            answer_aux_discard_rows = [False] * answer_aux_rows
+                            total_answer_aux_calls = 0
+                            if answer_aux_batch is not None and answer_aux_rows > 0:
+                                if answer_aux_old_log_prob is None:
+                                    raise RuntimeError(
+                                        "Missing answer aux old_log_probs for STTV multi-objective. "
+                                        "Either enable bypass mode or ensure aux old-logprob recomputation runs."
+                                    )
+                                answer_aux_batch = answer_aux_batch.union(answer_aux_old_log_prob)
+
+                                need_answer_aux_ref_log_prob = self.use_reference_policy and bool(
+                                    self.config.actor_rollout_ref.actor.get("use_kl_loss", False)
+                                )
+                                if need_answer_aux_ref_log_prob:
+                                    answer_aux_ref_log_prob = self._compute_ref_log_prob_with_padding(answer_aux_batch)
+                                    answer_aux_batch = answer_aux_batch.union(answer_aux_ref_log_prob)
+
+                                t_answer_aux_reward_start = time.perf_counter()
+                                (
+                                    answer_aux_scores,
+                                    total_answer_aux_calls,
+                                    _,
+                                ) = self._compute_sttv_answer_aux_reward_tensor(
+                                    answer_aux_batch,
+                                    sttv_reward_fns.get("answer"),
+                                )
+                                metrics["sttv/answer_aux_reward_eval_time_s"] = float(
+                                    time.perf_counter() - t_answer_aux_reward_start
+                                )
+
+                                answer_aux_mask = answer_aux_batch.batch["response_mask"].to(dtype=loc_mask.dtype)
+                                if discard_count > 0:
+                                    parent_rows_raw = answer_aux_batch.non_tensor_batch.get("sttv_parent_row_index")
+                                    if parent_rows_raw is not None:
+                                        parent_rows = (
+                                            parent_rows_raw.tolist()
+                                            if isinstance(parent_rows_raw, np.ndarray)
+                                            else list(parent_rows_raw)
+                                        )
+                                        for aux_idx in range(min(len(parent_rows), answer_aux_rows)):
+                                            try:
+                                                parent_row = int(parent_rows[aux_idx])
+                                            except (TypeError, ValueError):
+                                                continue
+                                            if 0 <= parent_row < len(discard_rows) and discard_rows[parent_row]:
+                                                answer_aux_discard_rows[aux_idx] = True
+                                if any(answer_aux_discard_rows):
+                                    answer_aux_discard_mask = torch.tensor(
+                                        answer_aux_discard_rows,
+                                        dtype=torch.bool,
+                                        device=answer_aux_mask.device,
+                                    )
+                                    answer_aux_mask = answer_aux_mask.clone()
+                                    answer_aux_mask[answer_aux_discard_mask] = 0
+                                    if answer_aux_scores is not None:
+                                        answer_aux_scores = answer_aux_scores.clone()
+                                        answer_aux_scores[answer_aux_discard_mask] = 0.0
+
+                                metrics["sttv/mask_tokens_answer_aux"] = float(answer_aux_mask.sum().item())
+                                aux_answer_group_index = self._build_sttv_group_index_with_discard(
+                                    answer_aux_batch.non_tensor_batch["uid"],
+                                    answer_aux_discard_rows,
+                                )
+                                if answer_aux_scores is None:
+                                    answer_aux_advantages = torch.zeros_like(answer_aux_mask, dtype=torch.float32)
+                                else:
+                                    answer_aux_advantages, _ = self._compute_sttv_grpo_advantages(
+                                        token_level_rewards=answer_aux_scores,
+                                        objective_mask=answer_aux_mask,
+                                        group_index=aux_answer_group_index,
+                                        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                    )
+
+                                answer_aux_batch.batch["advantages"] = answer_aux_advantages
+                                answer_aux_batch.batch["sttv_adv_answer"] = answer_aux_advantages
+                                answer_aux_batch.batch["sttv_mask_answer"] = answer_aux_mask
+                                answer_aux_batch.batch["sttv_adv_loc"] = torch.zeros_like(answer_aux_advantages)
+                                answer_aux_batch.batch["sttv_mask_loc"] = torch.zeros_like(answer_aux_mask)
+                                answer_aux_batch.batch["sttv_adv_loc_verifier"] = torch.zeros_like(answer_aux_advantages)
+                                answer_aux_batch.batch["sttv_mask_loc_verifier"] = torch.zeros_like(answer_aux_mask)
+
+                                answer_zero_count, answer_active_count = self._count_zero_advantage_samples(
+                                    answer_aux_advantages,
+                                    answer_aux_mask,
+                                )
+                                metrics["sttv/adv_zero_samples_answer"] = float(answer_zero_count)
+                                metrics["sttv/adv_active_samples_answer"] = float(answer_active_count)
+                                metrics["sttv/adv_zero_frac_answer"] = (
+                                    float(answer_zero_count) / float(answer_active_count)
+                                    if answer_active_count > 0
+                                    else 0.0
+                                )
+                                answer_active_tokens = float(answer_aux_mask.sum().item())
+                                metrics["sttv/adv_abs_mean_answer"] = (
+                                    float(
+                                        (answer_aux_advantages.abs() * answer_aux_mask).sum().item()
+                                        / answer_active_tokens
+                                    )
+                                    if answer_active_tokens > 0.0
+                                    else 0.0
+                                )
+
+                                output_texts_raw = answer_aux_batch.non_tensor_batch.get("sttv_answer_output_text")
+                                if output_texts_raw is not None:
+                                    output_texts = (
+                                        output_texts_raw.tolist()
+                                        if isinstance(output_texts_raw, np.ndarray)
+                                        else list(output_texts_raw)
+                                    )
+                                else:
+                                    output_texts = []
+                                prompt_texts_raw = answer_aux_batch.non_tensor_batch.get("sttv_answer_prompt_text")
+                                if prompt_texts_raw is not None:
+                                    prompt_texts = (
+                                        prompt_texts_raw.tolist()
+                                        if isinstance(prompt_texts_raw, np.ndarray)
+                                        else list(prompt_texts_raw)
+                                    )
+                                else:
+                                    prompt_texts = []
+                                parent_rows_raw = answer_aux_batch.non_tensor_batch.get("sttv_parent_row_index")
+                                if parent_rows_raw is not None:
+                                    parent_rows = (
+                                        parent_rows_raw.tolist()
+                                        if isinstance(parent_rows_raw, np.ndarray)
+                                        else list(parent_rows_raw)
+                                    )
+                                else:
+                                    parent_rows = []
+                                for aux_idx in range(min(answer_aux_rows, len(parent_rows))):
+                                    try:
+                                        parent_row = int(parent_rows[aux_idx])
+                                    except (TypeError, ValueError):
+                                        continue
+                                    if not (0 <= parent_row < len(batch)):
+                                        continue
+                                    if aux_idx < len(output_texts):
+                                        answer_aux_outputs[parent_row] = str(output_texts[aux_idx] or "")
+                                    if aux_idx < len(prompt_texts):
+                                        answer_aux_prompts[parent_row] = str(prompt_texts[aux_idx] or "")
+                            else:
+                                metrics["sttv/mask_tokens_answer_aux"] = 0.0
+                                metrics["sttv/answer_aux_reward_eval_time_s"] = 0.0
 
                             loc_advantages, _ = self._compute_sttv_grpo_advantages(
                                 token_level_rewards=loc_score_tensor,
@@ -4218,7 +4773,7 @@ class RayPPOTrainer:
                             )
                             batch.batch["sttv_adv_loc"] = loc_advantages
                             batch.batch["sttv_mask_loc"] = loc_mask
-                            batch.batch["sttv_adv_loc_verifier"] = torch.zeros_like(answer_advantages)
+                            batch.batch["sttv_adv_loc_verifier"] = torch.zeros_like(loc_advantages)
                             batch.batch["sttv_mask_loc_verifier"] = torch.zeros_like(answer_mask)
                             metrics["sttv/loc_call_count"] = float(total_loc_calls)
                             loc_zero_count, loc_active_count = self._count_zero_advantage_samples(
@@ -4238,7 +4793,7 @@ class RayPPOTrainer:
                             )
 
                             # Objective 2: verifier calls after <bbox_2d> (separate aux sub-batch).
-                            aux_rows = len(aux_batch) if aux_batch is not None else 0
+                            aux_rows = len(loc_verifier_aux_batch) if loc_verifier_aux_batch is not None else 0
                             metrics["sttv/adv_abs_mean_loc_verifier"] = 0.0
                             total_loc_verifier_calls = 0
                             verifier_rows_missing_next_call = 0
@@ -4247,30 +4802,30 @@ class RayPPOTrainer:
                             aux_invalid_for_reward_rows = [False] * aux_rows
                             aux_verifier_scores: Optional[torch.Tensor] = None
                             aux_discard_rows = [False] * aux_rows
-                            if aux_batch is not None and aux_rows > 0:
-                                if aux_old_log_prob is None:
+                            if loc_verifier_aux_batch is not None and aux_rows > 0:
+                                if loc_verifier_aux_old_log_prob is None:
                                     raise RuntimeError(
                                         "Missing aux old_log_probs for STTV multi-objective. "
                                         "Either enable bypass mode or ensure aux old-logprob recomputation runs."
                                     )
-                                aux_batch = aux_batch.union(aux_old_log_prob)
+                                loc_verifier_aux_batch = loc_verifier_aux_batch.union(loc_verifier_aux_old_log_prob)
 
                                 need_aux_ref_log_prob = self.use_reference_policy and bool(
                                     self.config.actor_rollout_ref.actor.get("use_kl_loss", False)
                                 )
                                 if need_aux_ref_log_prob:
-                                    aux_ref_log_prob = self._compute_ref_log_prob_with_padding(aux_batch)
-                                    aux_batch = aux_batch.union(aux_ref_log_prob)
+                                    aux_ref_log_prob = self._compute_ref_log_prob_with_padding(loc_verifier_aux_batch)
+                                    loc_verifier_aux_batch = loc_verifier_aux_batch.union(aux_ref_log_prob)
 
                                 t_loc_verifier_reward_start = time.perf_counter()
                                 verifier_reward_kwargs = dict(sttv_reward_kwargs)
                                 verifier_reward_kwargs["_sttv_loc_eval_lookup"] = loc_eval_lookup
                                 aux_verifier_scores, total_loc_verifier_calls = self._compute_sttv_loc_verifier_reward_tensor(
-                                    aux_batch,
+                                    loc_verifier_aux_batch,
                                     sttv_reward_fns.get("loc_verifier"),
                                     reward_kwargs=verifier_reward_kwargs,
                                 )
-                                verifier_records_raw = aux_batch.non_tensor_batch.get("sttv_loc_verifier_call_record")
+                                verifier_records_raw = loc_verifier_aux_batch.non_tensor_batch.get("sttv_loc_verifier_call_record")
                                 if verifier_records_raw is not None:
                                     verifier_records = (
                                         verifier_records_raw.tolist()
@@ -4291,11 +4846,11 @@ class RayPPOTrainer:
                                 metrics["sttv/loc_verifier_reward_eval_time_s"] = float(
                                     time.perf_counter() - t_loc_verifier_reward_start
                                 )
-                                aux_verifier_mask = self._build_aux_verifier_objective_mask(aux_batch).to(
+                                aux_verifier_mask = self._build_aux_verifier_objective_mask(loc_verifier_aux_batch).to(
                                     dtype=answer_mask.dtype
                                 )
                                 if discard_count > 0:
-                                    parent_rows_raw = aux_batch.non_tensor_batch.get("sttv_parent_row_index")
+                                    parent_rows_raw = loc_verifier_aux_batch.non_tensor_batch.get("sttv_parent_row_index")
                                     if parent_rows_raw is not None:
                                         parent_rows = (
                                             parent_rows_raw.tolist()
@@ -4333,7 +4888,7 @@ class RayPPOTrainer:
                                         aux_verifier_scores[aux_invalid_mask] = 0.0
                                 metrics["sttv/mask_tokens_loc_verifier_aux"] = float(aux_verifier_mask.sum().item())
                                 aux_group_index = self._build_sttv_group_index_with_discard(
-                                    aux_batch.non_tensor_batch["uid"],
+                                    loc_verifier_aux_batch.non_tensor_batch["uid"],
                                     aux_discard_rows,
                                 )
                                 if aux_verifier_scores is None:
@@ -4346,13 +4901,13 @@ class RayPPOTrainer:
                                         norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                                     )
 
-                                aux_batch.batch["advantages"] = aux_verifier_advantages
-                                aux_batch.batch["sttv_adv_answer"] = torch.zeros_like(aux_verifier_advantages)
-                                aux_batch.batch["sttv_mask_answer"] = torch.zeros_like(aux_verifier_mask)
-                                aux_batch.batch["sttv_adv_loc"] = torch.zeros_like(aux_verifier_advantages)
-                                aux_batch.batch["sttv_mask_loc"] = torch.zeros_like(aux_verifier_mask)
-                                aux_batch.batch["sttv_adv_loc_verifier"] = aux_verifier_advantages
-                                aux_batch.batch["sttv_mask_loc_verifier"] = aux_verifier_mask
+                                loc_verifier_aux_batch.batch["advantages"] = aux_verifier_advantages
+                                loc_verifier_aux_batch.batch["sttv_adv_answer"] = torch.zeros_like(aux_verifier_advantages)
+                                loc_verifier_aux_batch.batch["sttv_mask_answer"] = torch.zeros_like(aux_verifier_mask)
+                                loc_verifier_aux_batch.batch["sttv_adv_loc"] = torch.zeros_like(aux_verifier_advantages)
+                                loc_verifier_aux_batch.batch["sttv_mask_loc"] = torch.zeros_like(aux_verifier_mask)
+                                loc_verifier_aux_batch.batch["sttv_adv_loc_verifier"] = aux_verifier_advantages
+                                loc_verifier_aux_batch.batch["sttv_mask_loc_verifier"] = aux_verifier_mask
                                 aux_active_tokens = float(aux_verifier_mask.sum().item())
                                 metrics["sttv/adv_abs_mean_loc_verifier"] = (
                                     float(
@@ -4368,20 +4923,29 @@ class RayPPOTrainer:
                             metrics["sttv/verifier_rows_missing_next_call"] = float(verifier_rows_missing_next_call)
                             metrics["sttv/verifier_rows_invalid_for_reward"] = float(verifier_rows_invalid_for_reward)
                             metrics["sttv/verifier_rows_rewarded"] = float(verifier_rows_rewarded)
+                            metrics["sttv/answer_aux_rows"] = float(answer_aux_rows)
+                            metrics["sttv/answer_aux_call_count"] = float(total_answer_aux_calls)
 
-                            actor_train_batch = self._compose_sttv_actor_batch(batch, aux_batch)
+                            actor_train_batch = self._compose_sttv_actor_batches(
+                                batch,
+                                [loc_verifier_aux_batch, answer_aux_batch],
+                            )
                             actor_train_batch.meta_info.update(
                                 {
                                     "sttv_multi_objective_enable": True,
                                     "sttv_multi_objective_weights": self._get_sttv_multi_objective_weights(),
                                 }
                             )
-                            answer_rewards = reward_tensor.sum(-1).detach().cpu().tolist()
+                            answer_rewards = self._aggregate_sttv_aux_rewards_by_parent_row(
+                                batch_size=len(batch),
+                                aux_batch=answer_aux_batch,
+                                aux_scores=answer_aux_scores if answer_aux_batch is not None else None,
+                            )
                             loc_rewards = loc_score_tensor.sum(-1).detach().cpu().tolist()
                             loc_verifier_rewards = self._aggregate_sttv_aux_rewards_by_parent_row(
                                 batch_size=len(batch),
-                                aux_batch=aux_batch,
-                                aux_scores=aux_verifier_scores if aux_batch is not None else None,
+                                aux_batch=loc_verifier_aux_batch,
+                                aux_scores=aux_verifier_scores if loc_verifier_aux_batch is not None else None,
                             )
                             weights = self._get_sttv_multi_objective_weights()
                             metrics["sttv/reward_weight_answer"] = float(weights["answer"])
@@ -4435,6 +4999,8 @@ class RayPPOTrainer:
                                     global_rewards=global_rewards,
                                     weights=weights,
                                     raw_prompts=sample_table_context["raw_prompts"],
+                                    answer_aux_outputs=answer_aux_outputs,
+                                    answer_aux_prompts=answer_aux_prompts,
                                 )
                                 self._maybe_log_sample_table(
                                     split="train_sttv",
