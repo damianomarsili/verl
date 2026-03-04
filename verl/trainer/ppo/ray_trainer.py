@@ -636,17 +636,22 @@ class RayPPOTrainer:
 
         import wandb
 
-        columns = [
-            "step",
-            "split",
-            "query",
-            "image",
-            "output",
-            "final_answer",
-            "ground_truth",
-            "reward",
+        # Keep key answer-aux artifacts close to the main model output column in W&B.
+        preferred_after_output = [
+            "sttv_answer_call",
+            "sttv_answer_call_prompt",
+            "sttv_answer_call_output",
+            "sttv_answer_aux_prompt",
+            "sttv_answer_aux_output",
+            "sttv_answer_aux_final_answer",
         ]
-        columns.extend(normalized_extra_columns.keys())
+        early_extra_keys = [key for key in preferred_after_output if key in normalized_extra_columns]
+        remaining_extra_keys = [key for key in normalized_extra_columns.keys() if key not in set(early_extra_keys)]
+
+        columns = ["step", "split", "query", "image", "output"]
+        columns.extend(early_extra_keys)
+        columns.extend(["final_answer", "ground_truth", "reward"])
+        columns.extend(remaining_extra_keys)
         rows = []
         for idx in indices:
             raw_prompt = raw_prompts[idx]
@@ -662,11 +667,16 @@ class RayPPOTrainer:
                 query,
                 image_value,
                 output_text,
-                final_answer,
-                gts[idx],
-                scores[idx],
             ]
-            for col_name in normalized_extra_columns.keys():
+            for col_name in early_extra_keys:
+                row.append(
+                    self._coerce_wandb_table_cell(
+                        normalized_extra_columns[col_name][idx],
+                        wandb_module=wandb,
+                    )
+                )
+            row.extend([final_answer, gts[idx], scores[idx]])
+            for col_name in remaining_extra_keys:
                 row.append(
                     self._coerce_wandb_table_cell(
                         normalized_extra_columns[col_name][idx],
@@ -1725,18 +1735,30 @@ class RayPPOTrainer:
         if len(answer_aux_output_values) < batch_size:
             answer_aux_output_values.extend([""] * (batch_size - len(answer_aux_output_values)))
         answer_aux_output_values = answer_aux_output_values[:batch_size]
-        answer_aux_prompt_values = list(answer_aux_prompts) if isinstance(answer_aux_prompts, list) else []
-        if len(answer_aux_prompt_values) < batch_size:
-            answer_aux_prompt_values.extend([""] * (batch_size - len(answer_aux_prompt_values)))
+        answer_aux_prompt_values_full = list(answer_aux_prompts) if isinstance(answer_aux_prompts, list) else []
+        if len(answer_aux_prompt_values_full) < batch_size:
+            answer_aux_prompt_values_full.extend([""] * (batch_size - len(answer_aux_prompt_values_full)))
+        answer_aux_prompt_values_full = answer_aux_prompt_values_full[:batch_size]
         answer_aux_prompt_values = [
             (prompt[:1200] + "...") if isinstance(prompt, str) and len(prompt) > 1200 else prompt
-            for prompt in answer_aux_prompt_values[:batch_size]
+            for prompt in answer_aux_prompt_values_full
         ]
         answer_aux_final_answers = [
             self._extract_final_answer(str(output_text or "")) for output_text in answer_aux_output_values
         ]
+        answer_aux_call_values: list[str] = []
+        for prompt_text, output_text in zip(answer_aux_prompt_values_full, answer_aux_output_values, strict=True):
+            prompt_part = str(prompt_text or "").strip()
+            output_part = str(output_text or "").strip()
+            if not prompt_part and not output_part:
+                answer_aux_call_values.append("")
+                continue
+            answer_aux_call_values.append(f"user\n{prompt_part}\nassistant\n{output_part}".strip())
         sample_columns.update(
             {
+                "sttv_answer_call": answer_aux_call_values,
+                "sttv_answer_call_prompt": answer_aux_prompt_values_full,
+                "sttv_answer_call_output": answer_aux_output_values,
                 "sttv_answer_aux_output": answer_aux_output_values,
                 "sttv_answer_aux_final_answer": answer_aux_final_answers,
                 "sttv_answer_aux_prompt": answer_aux_prompt_values,
@@ -3426,6 +3448,9 @@ class RayPPOTrainer:
         sample_turns = []
         sample_uids = []
         sample_raw_prompts = []
+        sample_answer_aux_prompts = []
+        sample_answer_aux_outputs = []
+        sample_answer_aux_calls = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -3481,6 +3506,27 @@ class RayPPOTrainer:
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
+            answer_aux_calls_raw = test_output_gen_batch.non_tensor_batch.get("sttv_answer_aux_call", None)
+            if isinstance(answer_aux_calls_raw, np.ndarray):
+                answer_aux_calls = answer_aux_calls_raw.tolist()
+            elif isinstance(answer_aux_calls_raw, list):
+                answer_aux_calls = answer_aux_calls_raw
+            else:
+                answer_aux_calls = []
+            for sample_idx in range(len(output_texts)):
+                call_record = answer_aux_calls[sample_idx] if sample_idx < len(answer_aux_calls) else None
+                if not isinstance(call_record, dict):
+                    call_record = {}
+                answer_prompt_text = str(call_record.get("answer_prompt_text", "") or "")
+                answer_output_text = str(call_record.get("answer_output_text", "") or "")
+                sample_answer_aux_prompts.append(answer_prompt_text)
+                sample_answer_aux_outputs.append(answer_output_text)
+                if answer_prompt_text or answer_output_text:
+                    sample_answer_aux_calls.append(
+                        f"user\n{answer_prompt_text}\nassistant\n{answer_output_text}".strip()
+                    )
+                else:
+                    sample_answer_aux_calls.append("")
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
@@ -3520,12 +3566,21 @@ class RayPPOTrainer:
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+        val_extra_columns = {
+            "sttv_answer_call": sample_answer_aux_calls,
+            "sttv_answer_call_prompt": sample_answer_aux_prompts,
+            "sttv_answer_call_output": sample_answer_aux_outputs,
+            "sttv_answer_aux_final_answer": [
+                self._extract_final_answer(str(output_text or "")) for output_text in sample_answer_aux_outputs
+            ],
+        }
         self._maybe_log_sample_table(
             split="val",
             raw_prompts=sample_raw_prompts,
             outputs=sample_outputs,
             gts=sample_gts,
             scores=sample_scores,
+            extra_columns=val_extra_columns,
         )
 
         # dump generations
