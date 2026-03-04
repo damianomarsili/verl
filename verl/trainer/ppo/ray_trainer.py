@@ -1964,6 +1964,23 @@ class RayPPOTrainer:
             data_sources, solution_strs, ground_truths, extra_infos = self._extract_reward_context(
                 batch, include_solution_strs=True
             )
+            # In STTV multi-objective with answer-aux, the main response stream may end after
+            # bbox refinement rounds and not include <reason>/<answer>. Reward formatting checks
+            # should therefore use the compacted answer trajectory when available.
+            answer_calls_raw = batch.non_tensor_batch.get("sttv_answer_aux_call")
+            if isinstance(answer_calls_raw, np.ndarray):
+                answer_calls = answer_calls_raw.tolist()
+            elif isinstance(answer_calls_raw, list):
+                answer_calls = answer_calls_raw
+            else:
+                answer_calls = []
+            for row_idx in range(min(len(solution_strs), len(answer_calls))):
+                call_record = answer_calls[row_idx]
+                if not isinstance(call_record, dict):
+                    continue
+                answer_solution_str = str(call_record.get("answer_solution_str", "") or "")
+                if answer_solution_str:
+                    solution_strs[row_idx] = answer_solution_str
             raw_prompts_raw = batch.non_tensor_batch.get("raw_prompt")
             if isinstance(raw_prompts_raw, np.ndarray):
                 raw_prompts = raw_prompts_raw.tolist()
@@ -2303,6 +2320,21 @@ class RayPPOTrainer:
         data_sources, solution_strs, ground_truths, extra_infos = self._extract_reward_context(
             batch, include_solution_strs=True
         )
+        # Keep verifier reward format checks aligned with answer-aux compacted trajectory.
+        answer_calls_raw = batch.non_tensor_batch.get("sttv_answer_aux_call")
+        if isinstance(answer_calls_raw, np.ndarray):
+            answer_calls = answer_calls_raw.tolist()
+        elif isinstance(answer_calls_raw, list):
+            answer_calls = answer_calls_raw
+        else:
+            answer_calls = []
+        for row_idx in range(min(len(solution_strs), len(answer_calls))):
+            call_record = answer_calls[row_idx]
+            if not isinstance(call_record, dict):
+                continue
+            answer_solution_str = str(call_record.get("answer_solution_str", "") or "")
+            if answer_solution_str:
+                solution_strs[row_idx] = answer_solution_str
 
         aux_rows: list[dict[str, Any]] = []
         dropped_no_images = 0
