@@ -62,6 +62,18 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
             answer=str(latest_answer_output or "").strip(),
         )
 
+    def _build_clean_answer_prompt(self, query: str, latest_bbox_block: str) -> str:
+        query_text = query.strip()
+        return (
+            f"Original query:\n{query_text}\n\n"
+            "Detected objects (in [x_min, y_min, x_max, y_max] format with coordinates in [0,1000]):\n"
+            f"{latest_bbox_block}\n\n"
+            f"Here is the query again:\n{query_text}\n\n"
+            "Please now answer the query by first reasoning inside <reason> tags and then putting ONLY your final "
+            "answer inside <answer>. Do not round answers, express all ratios as unrounded decimals. "
+            "Do not output another <bbox_2d>."
+        )
+
     def _parse_logic_self_verifier_output(self, text: str) -> tuple[str, str, bool]:
         raw = str(text or "").strip()
         status_match = LOGIC_STATUS_PATTERN.search(raw)
