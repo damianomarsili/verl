@@ -533,6 +533,8 @@ class DataParallelPPOActor(BasePPOActor):
             "sttv_mask_loc",
             "sttv_adv_loc_verifier",
             "sttv_mask_loc_verifier",
+            "sttv_adv_answer_logic_verifier",
+            "sttv_mask_answer_logic_verifier",
         ]
         for key in sttv_objective_keys:
             if key in data.batch.keys():
@@ -557,6 +559,7 @@ class DataParallelPPOActor(BasePPOActor):
         sttv_weight_answer = float(sttv_multi_objective_weights.get("answer", 1.0))
         sttv_weight_loc = float(sttv_multi_objective_weights.get("loc", 1.0))
         sttv_weight_loc_verifier = float(sttv_multi_objective_weights.get("loc_verifier", 1.0))
+        sttv_weight_answer_logic_verifier = float(sttv_multi_objective_weights.get("answer_logic_verifier", 1.0))
 
         metrics = {
             "actor/pg_loss": 0.0,
@@ -629,6 +632,8 @@ class DataParallelPPOActor(BasePPOActor):
                         and "sttv_mask_loc" in model_inputs
                         and "sttv_adv_loc_verifier" in model_inputs
                         and "sttv_mask_loc_verifier" in model_inputs
+                        and "sttv_adv_answer_logic_verifier" in model_inputs
+                        and "sttv_mask_answer_logic_verifier" in model_inputs
                     ):
                         # Normalize each objective by its own active token count.
                         objective_loss_agg_mode = "token-mean"
@@ -645,6 +650,12 @@ class DataParallelPPOActor(BasePPOActor):
                                 "sttv_adv_loc_verifier",
                                 "sttv_mask_loc_verifier",
                                 sttv_weight_loc_verifier,
+                            ),
+                            (
+                                "answer_logic_verifier",
+                                "sttv_adv_answer_logic_verifier",
+                                "sttv_mask_answer_logic_verifier",
+                                sttv_weight_answer_logic_verifier,
                             ),
                         ]
                         # Keep a differentiable zero so backward is valid when all objective masks are empty.
@@ -715,6 +726,7 @@ class DataParallelPPOActor(BasePPOActor):
                             (model_inputs["sttv_mask_answer"] > 0)
                             | (model_inputs["sttv_mask_loc"] > 0)
                             | (model_inputs["sttv_mask_loc_verifier"] > 0)
+                            | (model_inputs["sttv_mask_answer_logic_verifier"] > 0)
                         ).to(dtype=response_mask.dtype)
                     else:
                         # Compute policy loss (any function is expected to return 2 values)
