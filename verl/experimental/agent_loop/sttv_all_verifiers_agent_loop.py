@@ -150,6 +150,8 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
             f"Logic self-verifier status: {logic_status}\n"
             f"Logic self-verifier feedback: {logic_feedback}\n\n"
             "Please output exactly one full <reason> block and then one full <answer> block. "
+            "Ensure that the answer is either yes/no, one word, or one number. "
+            "Do not round answers, express all ratios as unrounded decimals. Nothing else. "
             "Do not output any <bbox_2d>. "
             "If status is KEEP, re-emit the current answer draft unchanged."
         )

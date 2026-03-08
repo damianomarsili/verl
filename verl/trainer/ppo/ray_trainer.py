@@ -3830,11 +3830,16 @@ class RayPPOTrainer:
         non_tensor_keys = [key for key in ("uid", "multi_modal_inputs") if key in batch.non_tensor_batch]
         return batch.select(batch_keys=selected_tensor_keys, non_tensor_batch_keys=non_tensor_keys)
 
-    def _compute_old_log_prob_with_padding(self, batch: DataProto) -> tuple[DataProto, float]:
+    def _compute_old_log_prob_with_padding(
+        self,
+        batch: DataProto,
+        *,
+        calculate_entropy: bool = True,
+    ) -> tuple[DataProto, float]:
         dp_size = self._get_actor_dp_size()
         log_prob_batch = self._prepare_batch_for_log_prob(batch)
         padded_batch, pad_size = pad_dataproto_to_divisor(log_prob_batch, dp_size)
-        old_log_prob, mfu = self._compute_old_log_prob(padded_batch)
+        old_log_prob, mfu = self._compute_old_log_prob(padded_batch, calculate_entropy=calculate_entropy)
         old_log_prob = unpad_dataproto(old_log_prob, pad_size=pad_size)
         return old_log_prob, mfu
 
@@ -4666,7 +4671,7 @@ class RayPPOTrainer:
 
         return ref_log_prob
 
-    def _compute_old_log_prob(self, batch: DataProto):
+    def _compute_old_log_prob(self, batch: DataProto, *, calculate_entropy: bool = True):
         if self.use_legacy_worker_impl == "disable":
             # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
             # step 1: convert dataproto to tensordict.
@@ -4674,20 +4679,24 @@ class RayPPOTrainer:
             # step 2: convert from padding to nopadding
             batch_td = left_right_2_no_padding(batch_td)
             # step 3: add meta info
-            tu.assign_non_tensor(batch_td, calculate_entropy=True, compute_loss=False)
+            tu.assign_non_tensor(batch_td, calculate_entropy=bool(calculate_entropy), compute_loss=False)
             output = self.actor_rollout_wg.compute_log_prob(batch_td)
             # gather output
-            entropy = tu.get(output, "entropy")
             log_probs = tu.get(output, "log_probs")
             old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
-            # step 4. No padding to padding
-            entropy = no_padding_2_padding(entropy, batch_td)
             log_probs = no_padding_2_padding(log_probs, batch_td)
             # step 5: rebuild a tensordict and convert to dataproto
-            old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()})
+            tensors = {"old_log_probs": log_probs.float()}
+            if calculate_entropy:
+                entropy = tu.get(output, "entropy")
+                entropy = no_padding_2_padding(entropy, batch_td)
+                tensors["entropys"] = entropy.float()
+            old_log_prob = tu.get_tensordict(tensors)
             old_log_prob = DataProto.from_tensordict(old_log_prob)
         else:
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+            if not calculate_entropy and "entropys" in old_log_prob.batch:
+                old_log_prob.batch.pop("entropys")
             old_log_prob_mfu = 0
         return old_log_prob, old_log_prob_mfu
 
@@ -5065,26 +5074,38 @@ class RayPPOTrainer:
                                 from verl.utils.debug.metrics import calculate_debug_metrics
 
                                 metrics.update(calculate_debug_metrics(batch))
-                            if sttv_multi_objective_enabled and loc_verifier_aux_batch is not None and len(loc_verifier_aux_batch) > 0:
-                                loc_verifier_aux_old_log_prob, _ = self._compute_old_log_prob_with_padding(
-                                    loc_verifier_aux_batch
-                                )
-                                if "entropys" in loc_verifier_aux_old_log_prob.batch:
-                                    loc_verifier_aux_old_log_prob.batch.pop("entropys")
-                            if sttv_multi_objective_enabled and answer_aux_batch is not None and len(answer_aux_batch) > 0:
-                                answer_aux_old_log_prob, _ = self._compute_old_log_prob_with_padding(answer_aux_batch)
-                                if "entropys" in answer_aux_old_log_prob.batch:
-                                    answer_aux_old_log_prob.batch.pop("entropys")
-                            if (
-                                sttv_multi_objective_enabled
-                                and answer_logic_verifier_aux_batch is not None
-                                and len(answer_logic_verifier_aux_batch) > 0
-                            ):
-                                answer_logic_verifier_aux_old_log_prob, _ = self._compute_old_log_prob_with_padding(
-                                    answer_logic_verifier_aux_batch
-                                )
-                                if "entropys" in answer_logic_verifier_aux_old_log_prob.batch:
-                                    answer_logic_verifier_aux_old_log_prob.batch.pop("entropys")
+                            if sttv_multi_objective_enabled:
+                                aux_old_lp_inputs: list[tuple[str, DataProto]] = []
+                                if loc_verifier_aux_batch is not None and len(loc_verifier_aux_batch) > 0:
+                                    aux_old_lp_inputs.append(("loc_verifier", loc_verifier_aux_batch))
+                                if answer_aux_batch is not None and len(answer_aux_batch) > 0:
+                                    aux_old_lp_inputs.append(("answer", answer_aux_batch))
+                                if (
+                                    answer_logic_verifier_aux_batch is not None
+                                    and len(answer_logic_verifier_aux_batch) > 0
+                                ):
+                                    aux_old_lp_inputs.append(("answer_logic_verifier", answer_logic_verifier_aux_batch))
+
+                                if aux_old_lp_inputs:
+                                    merged_aux_batch = DataProto.concat([aux_batch for _, aux_batch in aux_old_lp_inputs])
+                                    merged_aux_old_log_prob, _ = self._compute_old_log_prob_with_padding(
+                                        merged_aux_batch,
+                                        calculate_entropy=False,
+                                    )
+                                    if "entropys" in merged_aux_old_log_prob.batch:
+                                        merged_aux_old_log_prob.batch.pop("entropys")
+
+                                    offset = 0
+                                    for aux_name, aux_batch in aux_old_lp_inputs:
+                                        aux_rows = len(aux_batch)
+                                        aux_old_log_prob = merged_aux_old_log_prob[offset : offset + aux_rows]
+                                        if aux_name == "loc_verifier":
+                                            loc_verifier_aux_old_log_prob = aux_old_log_prob
+                                        elif aux_name == "answer":
+                                            answer_aux_old_log_prob = aux_old_log_prob
+                                        elif aux_name == "answer_logic_verifier":
+                                            answer_logic_verifier_aux_old_log_prob = aux_old_log_prob
+                                        offset += aux_rows
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 

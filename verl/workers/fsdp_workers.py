@@ -1012,7 +1012,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["temperature"] = self.config.rollout.temperature
         data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
         # perform recompute log_prob
-        calculate_entropy = not is_lora
+        calculate_entropy = bool(data.meta_info.pop("calculate_entropy", (not is_lora)))
         with self.ulysses_sharding_manager:
             with adapter_ctx:
                 outputs = self.actor.compute_log_prob(data=data, calculate_entropy=calculate_entropy)
