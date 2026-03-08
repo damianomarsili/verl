@@ -5087,25 +5087,48 @@ class RayPPOTrainer:
                                     aux_old_lp_inputs.append(("answer_logic_verifier", answer_logic_verifier_aux_batch))
 
                                 if aux_old_lp_inputs:
-                                    merged_aux_batch = DataProto.concat([aux_batch for _, aux_batch in aux_old_lp_inputs])
-                                    merged_aux_old_log_prob, _ = self._compute_old_log_prob_with_padding(
-                                        merged_aux_batch,
-                                        calculate_entropy=False,
-                                    )
-                                    if "entropys" in merged_aux_old_log_prob.batch:
-                                        merged_aux_old_log_prob.batch.pop("entropys")
+                                    grouped_inputs: dict[
+                                        tuple[int, int],
+                                        list[tuple[int, str, DataProto, DataProto]],
+                                    ] = {}
+                                    for aux_idx, (aux_name, aux_batch) in enumerate(aux_old_lp_inputs):
+                                        prepared_aux_batch = self._prepare_batch_for_log_prob(aux_batch)
+                                        signature = (
+                                            int(prepared_aux_batch.batch["prompts"].shape[-1]),
+                                            int(prepared_aux_batch.batch["responses"].shape[-1]),
+                                        )
+                                        grouped_inputs.setdefault(signature, []).append(
+                                            (aux_idx, aux_name, aux_batch, prepared_aux_batch)
+                                        )
 
-                                    offset = 0
-                                    for aux_name, aux_batch in aux_old_lp_inputs:
-                                        aux_rows = len(aux_batch)
-                                        aux_old_log_prob = merged_aux_old_log_prob[offset : offset + aux_rows]
+                                    aux_old_log_prob_results: list[Optional[DataProto]] = [None] * len(aux_old_lp_inputs)
+                                    for grouped_items in grouped_inputs.values():
+                                        merged_prepared = DataProto.concat(
+                                            [prepared_batch for _, _, _, prepared_batch in grouped_items]
+                                        )
+                                        merged_old_log_prob, _ = self._compute_old_log_prob_with_padding(
+                                            merged_prepared,
+                                            calculate_entropy=False,
+                                        )
+                                        if "entropys" in merged_old_log_prob.batch:
+                                            merged_old_log_prob.batch.pop("entropys")
+
+                                        offset = 0
+                                        for aux_idx, _, aux_batch, _ in grouped_items:
+                                            aux_rows = len(aux_batch)
+                                            aux_old_log_prob_results[aux_idx] = merged_old_log_prob[offset : offset + aux_rows]
+                                            offset += aux_rows
+
+                                    for aux_idx, (aux_name, _) in enumerate(aux_old_lp_inputs):
+                                        aux_old_log_prob = aux_old_log_prob_results[aux_idx]
+                                        if aux_old_log_prob is None:
+                                            continue
                                         if aux_name == "loc_verifier":
                                             loc_verifier_aux_old_log_prob = aux_old_log_prob
                                         elif aux_name == "answer":
                                             answer_aux_old_log_prob = aux_old_log_prob
                                         elif aux_name == "answer_logic_verifier":
                                             answer_logic_verifier_aux_old_log_prob = aux_old_log_prob
-                                        offset += aux_rows
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
