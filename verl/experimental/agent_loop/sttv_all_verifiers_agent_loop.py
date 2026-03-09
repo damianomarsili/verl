@@ -25,6 +25,12 @@ from verl.experimental.agent_loop.sttv_agent_loop import SttvAgentLoop
 
 LOGIC_STATUS_PATTERN = re.compile(r"(?im)^\s*STATUS\s*:\s*(KEEP|REVISE)\s*$")
 LOGIC_FEEDBACK_PATTERN = re.compile(r"(?ims)^\s*FEEDBACK\s*:\s*(.*?)\s*$")
+LOGIC_SPATIAL_PATTERN = re.compile(r"(?im)^\s*SPATIAL_CORRECTNESS\s*:\s*(correct|incorrect)\s*$")
+LOGIC_ATTRIBUTE_PATTERN = re.compile(r"(?im)^\s*ATTRIBUTE_CORRECTNESS\s*:\s*(correct|incorrect)\s*$")
+LOGIC_REASONING_PATTERN = re.compile(r"(?im)^\s*LOGIC_CORRECTNESS\s*:\s*(correct|incorrect)\s*$")
+LOGIC_SPATIAL_FIX_PATTERN = re.compile(r"(?i)\bspatial\s+fix\s*:")
+LOGIC_ATTRIBUTE_FIX_PATTERN = re.compile(r"(?i)\battribute\s+fix\s*:")
+LOGIC_REASONING_FIX_PATTERN = re.compile(r"(?i)\blogic\s+fix\s*:")
 
 
 @register("sttv_all_verifiers_agent")
@@ -76,19 +82,41 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
 
     def _parse_logic_self_verifier_output(self, text: str) -> tuple[str, str, bool]:
         raw = str(text or "").strip()
+        spatial_match = LOGIC_SPATIAL_PATTERN.search(raw)
+        attribute_match = LOGIC_ATTRIBUTE_PATTERN.search(raw)
+        reasoning_match = LOGIC_REASONING_PATTERN.search(raw)
         status_match = LOGIC_STATUS_PATTERN.search(raw)
         feedback_match = LOGIC_FEEDBACK_PATTERN.search(raw)
 
-        status = status_match.group(1).upper().strip() if status_match else "INVALID"
         feedback = feedback_match.group(1).strip() if feedback_match else ""
 
-        if status not in {"KEEP", "REVISE"}:
+        if spatial_match is None or attribute_match is None or reasoning_match is None:
             return "INVALID", "", False
-        if status == "REVISE" and not feedback:
+
+        rubric_values = [
+            spatial_match.group(1).strip().lower(),
+            attribute_match.group(1).strip().lower(),
+            reasoning_match.group(1).strip().lower(),
+        ]
+        has_incorrect = any(value == "incorrect" for value in rubric_values)
+        derived_status = "REVISE" if has_incorrect else "KEEP"
+
+        # Accept explicit STATUS if present, but enforce rubric-driven behavior.
+        if status_match is not None:
+            parsed_status = status_match.group(1).upper().strip()
+            if parsed_status not in {"KEEP", "REVISE"}:
+                return "INVALID", "", False
+        if has_incorrect and not feedback:
             return "INVALID", "", False
-        if status == "KEEP" and not feedback:
+        if spatial_match.group(1).strip().lower() == "incorrect" and LOGIC_SPATIAL_FIX_PATTERN.search(feedback) is None:
+            return "INVALID", "", False
+        if attribute_match.group(1).strip().lower() == "incorrect" and LOGIC_ATTRIBUTE_FIX_PATTERN.search(feedback) is None:
+            return "INVALID", "", False
+        if reasoning_match.group(1).strip().lower() == "incorrect" and LOGIC_REASONING_FIX_PATTERN.search(feedback) is None:
+            return "INVALID", "", False
+        if derived_status == "KEEP" and not feedback:
             feedback = "The current <reason>/<answer> is correct. Re-emit unchanged."
-        return status, feedback, True
+        return derived_status, feedback, True
 
     async def _build_logic_verifier_messages(
         self,
@@ -138,7 +166,6 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
         query: str,
         latest_bbox_block: str,
         current_answer_output: str,
-        logic_status: str,
         logic_feedback: str,
         sampling_params: dict[str, Any],
         metrics: dict[str, Any],
@@ -147,13 +174,12 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
         rewrite_prompt = (
             f"{clean_prompt}\n\n"
             f"Current answer draft:\n{str(current_answer_output or '').strip()}\n\n"
-            f"Logic self-verifier status: {logic_status}\n"
-            f"Logic self-verifier feedback: {logic_feedback}\n\n"
+            f"Feedback: {logic_feedback}\n\n"
             "Please output exactly one full <reason> block and then one full <answer> block. "
             "Ensure that the answer is either yes/no, one word, or one number. "
             "Do not round answers, express all ratios as unrounded decimals. Nothing else. "
             "Do not output any <bbox_2d>. "
-            "If status is KEEP, re-emit the current answer draft unchanged."
+            "If feedback indicates the current answer is already correct, re-emit the current answer draft unchanged."
         )
         messages = self._build_messages(rewrite_prompt, images)
         prompt_ids, answer_multi_modal_inputs = await self._build_prompt_ids_and_mm_inputs(messages, images)
@@ -589,7 +615,6 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
                     query=query,
                     latest_bbox_block=latest_bbox_block,
                     current_answer_output=current_answer_output,
-                    logic_status=logic_status,
                     logic_feedback=logic_feedback,
                     sampling_params=sampling_params,
                     metrics=metrics,
