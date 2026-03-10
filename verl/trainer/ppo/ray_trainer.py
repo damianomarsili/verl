@@ -1581,7 +1581,12 @@ class RayPPOTrainer:
                         "delta_answer_reward": _as_float(call.get("sttv_answer_logic_verifier_delta_answer_reward", 0.0)),
                         "answer_reward_current": _as_float(call.get("sttv_answer_logic_verifier_answer_reward_current", 0.0)),
                         "answer_reward_next": _as_float(call.get("sttv_answer_logic_verifier_answer_reward_next", 0.0)),
+                        "is_numeric_pair": bool(call.get("sttv_answer_logic_verifier_is_numeric_pair", False)),
+                        "err_current": _as_float(call.get("sttv_answer_logic_verifier_err_current", 0.0)),
+                        "err_next": _as_float(call.get("sttv_answer_logic_verifier_err_next", 0.0)),
+                        "delta_err": _as_float(call.get("sttv_answer_logic_verifier_delta_err", 0.0)),
                         "logic_keep_bonus": bool(call.get("sttv_answer_logic_verifier_keep_bonus", False)),
+                        "logic_keep_forced_zero": bool(call.get("sttv_answer_logic_verifier_keep_forced_zero", False)),
                     }
                 )
             answer_logic_entries = sorted(answer_logic_entries, key=lambda row: int(row.get("round_index", -1)))
@@ -1795,9 +1800,14 @@ class RayPPOTrainer:
             delta_col = []
             current_col = []
             next_col = []
+            numeric_pair_col = []
+            err_current_col = []
+            err_next_col = []
+            delta_err_col = []
             status_col = []
             valid_col = []
             keep_bonus_col = []
+            keep_forced_zero_col = []
             for sample_idx in range(batch_size):
                 entry = answer_logic_component_maps[sample_idx].get(round_index)
                 reward_col.append(None if entry is None else _as_float(entry.get("logic_reward", 0.0)))
@@ -1805,18 +1815,32 @@ class RayPPOTrainer:
                 delta_col.append(None if entry is None else _as_float(entry.get("delta_answer_reward", 0.0)))
                 current_col.append(None if entry is None else _as_float(entry.get("answer_reward_current", 0.0)))
                 next_col.append(None if entry is None else _as_float(entry.get("answer_reward_next", 0.0)))
+                numeric_pair_col.append(None if entry is None else bool(entry.get("is_numeric_pair", False)))
+                err_current_col.append(None if entry is None else _as_float(entry.get("err_current", 0.0)))
+                err_next_col.append(None if entry is None else _as_float(entry.get("err_next", 0.0)))
+                delta_err_col.append(None if entry is None else _as_float(entry.get("delta_err", 0.0)))
                 status_col.append(None if entry is None else str(entry.get("logic_status", "")))
                 valid_col.append(None if entry is None else bool(entry.get("logic_parse_valid", False)))
                 keep_bonus_col.append(None if entry is None else bool(entry.get("logic_keep_bonus", False)))
+                keep_forced_zero_col.append(
+                    None if entry is None else bool(entry.get("logic_keep_forced_zero", False))
+                )
             round_label = round_index + 1
             per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_reward"] = reward_col
             per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_raw"] = raw_col
             per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_delta_answer_reward"] = delta_col
             per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_answer_reward_current"] = current_col
             per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_answer_reward_next"] = next_col
+            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_is_numeric_pair"] = numeric_pair_col
+            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_err_current"] = err_current_col
+            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_err_next"] = err_next_col
+            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_delta_err"] = delta_err_col
             per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_status"] = status_col
             per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_parse_valid"] = valid_col
             per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_keep_bonus"] = keep_bonus_col
+            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_keep_forced_zero"] = (
+                keep_forced_zero_col
+            )
 
         sample_columns = {
             "sttv_answer_reward": answer_rewards,
