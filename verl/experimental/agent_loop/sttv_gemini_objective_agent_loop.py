@@ -13,33 +13,44 @@
 # limitations under the License.
 from __future__ import annotations
 
+import asyncio
+import hashlib
 from pathlib import Path
 import re
 from typing import Any, Optional
 from uuid import uuid4
 
 from PIL import Image
+from omegaconf import OmegaConf
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
 from verl.experimental.agent_loop.sttv_agent_loop import SttvAgentLoop
+from training.gemini_objectives import (
+    build_gemini_runtime_config,
+    generate_gemini_answer_judgment,
+    generate_gemini_logic_teacher_judgment,
+    load_gemini_prompt_template,
+)
 
 LOGIC_STEP_EDIT_PATTERN = re.compile(r"(?i)^EDIT_STEP\s+(?P<idx>\d+)\s*:\s*(?P<body>.+)$")
 REASON_BLOCK_PATTERN = re.compile(r"(?is)<reason>\s*(?P<body>.*?)\s*</reason>")
 REASON_STEP_LINE_PATTERN = re.compile(r"^\s*(?P<idx>\d+)\.\s*(?P<body>.+?)\s*$")
 
 
-@register("sttv_all_verifiers_agent")
-class SttvAllVerifiersAgentLoop(SttvAgentLoop):
+@register("sttv_gemini_objective_agent")
+class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
     def __init__(
         self,
         *args: Any,
-        logic_verifier_rounds: int = 2,
+        logic_verifier_rounds: int = 1,
         logic_verifier_max_new_tokens: int = 96,
         logic_self_verifier_prompt_path: Optional[str] = None,
+        gemini_logic_teacher_prompt_path: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
-        self.logic_verifier_rounds = max(0, int(logic_verifier_rounds))
+        del logic_verifier_rounds
+        self.logic_verifier_rounds = 1
         self.logic_verifier_max_new_tokens = int(logic_verifier_max_new_tokens)
 
         if logic_self_verifier_prompt_path:
@@ -47,9 +58,41 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
         else:
             prompt_path = (
                 self._resolve_training_prompts_dir()
-                / "logic_self_verifier_instructions.txt"
+                / "logic_self_verifier_gemini_instructions.txt"
             )
         self.logic_self_verifier_template = self._read_prompt_file(prompt_path)
+        self.gemini_logic_teacher_prompt = load_gemini_prompt_template(
+            gemini_logic_teacher_prompt_path,
+            default_filename="gemini_logic_teacher_judge_instructions.txt",
+        )
+        reward_cfg = OmegaConf.to_container(
+            self.config.get("custom_reward_function", {}),
+            resolve=True,
+        )
+        self.gemini_runtime_config = build_gemini_runtime_config(
+            reward_cfg if isinstance(reward_cfg, dict) else {}
+        )
+        self.gemini_call_semaphore = asyncio.Semaphore(
+            max(1, int(self.gemini_runtime_config.get("max_workers", 1)))
+        )
+        self.gemini_answer_grader_prompt = load_gemini_prompt_template(
+            str(
+                self.config.get("custom_reward_function", {}).get(
+                    "gemini_answer_grader_prompt_path", ""
+                )
+                or ""
+            ).strip()
+            or None,
+            default_filename="gemini_answer_grader_instructions.txt",
+        )
+        self.total_training_steps = int(
+            OmegaConf.select(
+                self.config,
+                "actor_rollout_ref.actor.optim.total_training_steps",
+                default=0,
+            )
+            or 0
+        )
 
     def _resolve_training_prompts_dir(self) -> Path:
         here = Path(__file__).resolve()
@@ -63,10 +106,11 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
         )
 
     def _build_logic_self_verifier_prompt(
-        self, query: str, latest_answer_output: str
+        self, query: str, latest_bbox_block: str, latest_answer_output: str
     ) -> str:
         return self.logic_self_verifier_template.format(
             query=query.strip(),
+            detected_objects=str(latest_bbox_block or "").strip(),
             answer=str(latest_answer_output or "").strip(),
         )
 
@@ -104,12 +148,13 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
                 step_indices.append(step_idx)
         return step_indices
 
-    def _parse_logic_self_verifier_output(
+    def _parse_logic_step_edits_optional(
         self, text: str, current_answer_output: str
     ) -> tuple[str, bool, dict[str, Any]]:
         cleaned = str(text or "").replace("<|im_end|>", "").strip()
         normalized_lines: list[tuple[str, int]] = []
         line_order = 0
+        saw_nonempty_line = False
         valid_step_indices = set(self._extract_reason_step_indices(current_answer_output))
         edited_step_indices: list[int] = []
         seen: set[str] = set()
@@ -120,6 +165,7 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
             line = raw_line.strip()
             if not line:
                 continue
+            saw_nonempty_line = True
             line = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
             if not line:
                 continue
@@ -149,20 +195,80 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
 
         normalized_lines.sort(key=lambda item: item[1])
         has_effect = len(normalized_lines) > 0
+        parse_valid = bool(has_effect or not saw_nonempty_line)
         feedback_info: dict[str, Any] = {
             "logic_feedback_has_effect": bool(has_effect),
-            "logic_feedback_valid_for_reward": bool(has_effect),
+            "logic_feedback_valid_for_reward": bool(parse_valid),
             "logic_feedback_has_reason_edit": bool(has_effect),
             "logic_feedback_num_step_edits": int(len(edited_step_indices)),
             "logic_feedback_step_indices": list(edited_step_indices),
         }
         if not has_effect:
-            return (
-                "NO_VALID_REFINEMENTS. Re-emit the current <reason>/<answer> unchanged.",
-                False,
-                feedback_info,
+            return "", parse_valid, feedback_info
+        return "\n".join(line for line, _ in normalized_lines), parse_valid, feedback_info
+
+    def _choose_logic_edit_source(
+        self,
+        *,
+        uid: str,
+        global_steps: int,
+        validate_mode: bool,
+    ) -> str:
+        if validate_mode:
+            return "self"
+        total_steps = max(1, int(self.total_training_steps))
+        progress = max(0.0, min(1.0, float(global_steps) / float(total_steps)))
+        if progress < 0.2:
+            p_self = 0.1
+        elif progress < 0.4:
+            p_self = 0.3
+        elif progress < 0.6:
+            p_self = 0.5
+        elif progress < 0.8:
+            p_self = 0.7
+        else:
+            p_self = 0.8
+        digest = hashlib.sha1(f"{uid}:{global_steps}".encode("utf-8")).digest()
+        threshold = int.from_bytes(digest[:8], byteorder="big") / float(2**64)
+        return "self" if threshold < p_self else "teacher"
+
+    async def _request_gemini_logic_teacher_judgment(
+        self,
+        *,
+        query: str,
+        latest_bbox_block: str,
+        current_answer_output: str,
+        proposed_self_edits: str,
+        images: list[Image.Image],
+    ) -> dict[str, Any]:
+        async with self.gemini_call_semaphore:
+            return await asyncio.to_thread(
+                generate_gemini_logic_teacher_judgment,
+                config=self.gemini_runtime_config,
+                prompt_template=self.gemini_logic_teacher_prompt,
+                query=query,
+                detected_objects=latest_bbox_block,
+                current_answer=current_answer_output,
+                proposed_self_edits=proposed_self_edits,
+                images=images,
             )
-        return "\n".join(line for line, _ in normalized_lines), True, feedback_info
+
+    async def _request_gemini_answer_score(
+        self,
+        *,
+        query: str,
+        candidate_response: str,
+        images: list[Image.Image],
+    ) -> dict[str, Any]:
+        async with self.gemini_call_semaphore:
+            return await asyncio.to_thread(
+                generate_gemini_answer_judgment,
+                config=self.gemini_runtime_config,
+                prompt_template=self.gemini_answer_grader_prompt,
+                query=query,
+                candidate_response=candidate_response,
+                images=images,
+            )
 
     async def _build_logic_verifier_messages(
         self,
@@ -286,6 +392,9 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
         self, sampling_params: dict[str, Any], **kwargs: Any
     ) -> AgentLoopOutput:
         validate_mode = bool(kwargs.get("validate", False))
+        uid = str(kwargs.get("uid", "") or "")
+        raw_global_steps = kwargs.get("global_steps", -1)
+        global_steps = int(raw_global_steps if raw_global_steps is not None else -1)
         raw_messages = list(kwargs["raw_prompt"])
         query = self._extract_query(raw_messages)
         multi_modal_data = await self.process_vision_info(raw_messages)
@@ -637,6 +746,7 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
                 current_entries = corrected_entries
 
             latest_bbox_block = self._format_bbox_block(current_entries)
+            gemini_images = raw_images_rgb if raw_images_rgb else images
 
             # Initial compacted answer call.
             (
@@ -680,64 +790,124 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
                 }
             )
 
-            # Logic self-verifier rounds on reason/answer.
-            for logic_round_index in range(self.logic_verifier_rounds):
-                logic_prompt_text = self._build_logic_self_verifier_prompt(
-                    query, current_answer_output
+            logic_prompt_text = self._build_logic_self_verifier_prompt(
+                query, latest_bbox_block, current_answer_output
+            )
+            (
+                logic_output_text,
+                logic_prompt_token_ids,
+                logic_output_token_ids,
+                logic_output_log_probs,
+                logic_images,
+                logic_multi_modal_inputs,
+            ) = await self._build_logic_verifier_messages(
+                images=images,
+                prompt=logic_prompt_text,
+                generate_logprobs=bool(sampling_params.get("logprobs", False)),
+                metrics=metrics,
+            )
+            self_feedback, self_parse_valid, self_feedback_info = (
+                self._parse_logic_step_edits_optional(
+                    logic_output_text, current_answer_output
                 )
-                (
-                    logic_output_text,
-                    logic_prompt_token_ids,
-                    logic_output_token_ids,
-                    logic_output_log_probs,
-                    logic_images,
-                    logic_multi_modal_inputs,
-                ) = await self._build_logic_verifier_messages(
-                    images=images,
-                    prompt=logic_prompt_text,
-                    generate_logprobs=bool(sampling_params.get("logprobs", False)),
-                    metrics=metrics,
-                )
-                logic_feedback, logic_parse_valid, logic_feedback_info = (
-                    self._parse_logic_self_verifier_output(
-                        logic_output_text, current_answer_output
-                    )
-                )
-                if not logic_parse_valid:
-                    logic_feedback = "No valid self-verifier feedback was produced. Re-emit the current answer unchanged."
+            )
 
-                sttv_answer_logic_verifier_calls.append(
-                    {
-                        "round_index": int(logic_round_index),
-                        "answer_call_index": int(answer_call_index),
-                        "logic_feedback": str(logic_feedback),
-                        "logic_feedback_parse_valid": bool(logic_parse_valid),
-                        "logic_feedback_valid_for_reward": bool(
-                            logic_feedback_info.get(
-                                "logic_feedback_valid_for_reward", False
-                            )
-                        ),
-                        "logic_feedback_has_reason_edit": bool(
-                            logic_feedback_info.get(
-                                "logic_feedback_has_reason_edit", False
-                            )
-                        ),
-                        "logic_feedback_num_step_edits": int(
-                            logic_feedback_info.get("logic_feedback_num_step_edits", 0)
-                        ),
-                        "logic_feedback_step_indices": list(
-                            logic_feedback_info.get("logic_feedback_step_indices", [])
-                        ),
-                        "logic_verifier_prompt_text": logic_prompt_text,
-                        "logic_verifier_output_text": logic_output_text,
-                        "logic_verifier_prompt_token_ids": logic_prompt_token_ids,
-                        "logic_verifier_output_token_ids": logic_output_token_ids,
-                        "logic_verifier_output_log_probs": logic_output_log_probs,
-                        "logic_verifier_images": logic_images,
-                        "logic_verifier_multi_modal_inputs": logic_multi_modal_inputs,
-                    }
+            teacher_judgment = await self._request_gemini_logic_teacher_judgment(
+                query=query,
+                latest_bbox_block=latest_bbox_block,
+                current_answer_output=current_answer_output,
+                proposed_self_edits=logic_output_text,
+                images=gemini_images,
+            )
+            teacher_edits_raw = teacher_judgment.get("teacher_edits", [])
+            if isinstance(teacher_edits_raw, (list, tuple)):
+                teacher_output_text = "\n".join(
+                    str(line or "").strip() for line in teacher_edits_raw if str(line or "").strip()
                 )
+            else:
+                teacher_output_text = str(teacher_edits_raw or "").strip()
+            teacher_feedback, teacher_parse_valid, teacher_feedback_info = (
+                self._parse_logic_step_edits_optional(
+                    teacher_output_text, current_answer_output
+                )
+            )
+            current_answer_score = float(
+                teacher_judgment.get("current_answer_score", 0.0) or 0.0
+            )
+            self_edit_score = float(
+                teacher_judgment.get("self_edit_score", 0.0) or 0.0
+            )
+            self_edit_reason = str(
+                teacher_judgment.get("self_edit_reason", "") or ""
+            ).strip()
 
+            edit_source = self._choose_logic_edit_source(
+                uid=uid,
+                global_steps=global_steps,
+                validate_mode=validate_mode,
+            )
+            if edit_source == "self":
+                selected_feedback = self_feedback
+                selected_feedback_info = self_feedback_info
+            else:
+                selected_feedback = teacher_feedback
+                selected_feedback_info = teacher_feedback_info
+
+            logic_call_record = {
+                "round_index": 0,
+                "answer_call_index": int(answer_call_index),
+                "logic_feedback": str(self_feedback),
+                "logic_feedback_parse_valid": bool(self_parse_valid),
+                "logic_feedback_valid_for_reward": bool(
+                    self_feedback_info.get("logic_feedback_valid_for_reward", False)
+                ),
+                "logic_feedback_has_reason_edit": bool(
+                    self_feedback_info.get("logic_feedback_has_reason_edit", False)
+                ),
+                "logic_feedback_num_step_edits": int(
+                    self_feedback_info.get("logic_feedback_num_step_edits", 0)
+                ),
+                "logic_feedback_step_indices": list(
+                    self_feedback_info.get("logic_feedback_step_indices", [])
+                ),
+                "logic_verifier_prompt_text": logic_prompt_text,
+                "logic_verifier_output_text": logic_output_text,
+                "logic_verifier_prompt_token_ids": logic_prompt_token_ids,
+                "logic_verifier_output_token_ids": logic_output_token_ids,
+                "logic_verifier_output_log_probs": logic_output_log_probs,
+                "logic_verifier_images": logic_images,
+                "logic_verifier_multi_modal_inputs": logic_multi_modal_inputs,
+                "logic_teacher_output_text": teacher_output_text,
+                "logic_teacher_output_raw_text": str(
+                    teacher_judgment.get("raw_text", "") or ""
+                ),
+                "logic_teacher_feedback": str(teacher_feedback),
+                "logic_teacher_parse_valid": bool(teacher_parse_valid),
+                "logic_teacher_num_step_edits": int(
+                    teacher_feedback_info.get("logic_feedback_num_step_edits", 0)
+                ),
+                "logic_teacher_step_indices": list(
+                    teacher_feedback_info.get("logic_feedback_step_indices", [])
+                ),
+                "logic_edit_source": str(edit_source),
+                "logic_selected_feedback": str(selected_feedback),
+                "logic_selected_num_step_edits": int(
+                    selected_feedback_info.get("logic_feedback_num_step_edits", 0)
+                ),
+                "sttv_answer_logic_verifier_self_edit_score": float(self_edit_score),
+                "sttv_answer_logic_verifier_self_edit_reason": self_edit_reason,
+                "sttv_answer_logic_verifier_current_answer_score": float(current_answer_score),
+                "sttv_answer_logic_verifier_final_answer_score": float(current_answer_score),
+                "sttv_answer_logic_verifier_rewrite_skipped_no_edits": False,
+            }
+            sttv_answer_logic_verifier_calls.append(logic_call_record)
+
+            final_answer_call = dict(current_answer_aux_record)
+            final_answer_score = float(current_answer_score)
+            rewrite_skipped_no_edits = not bool(selected_feedback.strip())
+            if rewrite_skipped_no_edits:
+                final_answer_call["answer_reward_override"] = float(current_answer_score)
+            else:
                 (
                     rewrite_prompt_text,
                     rewrite_output_text,
@@ -751,14 +921,14 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
                     query=query,
                     latest_bbox_block=latest_bbox_block,
                     current_answer_output=current_answer_output,
-                    logic_feedback=logic_feedback,
+                    logic_feedback=selected_feedback,
                     sampling_params=sampling_params,
                     metrics=metrics,
                 )
 
                 answer_call_index += 1
                 current_answer_output = str(rewrite_output_text or "")
-                current_answer_aux_record = {
+                final_answer_call = {
                     "call_index": int(answer_call_index),
                     "answer_prompt_text": rewrite_prompt_text,
                     "answer_output_text": current_answer_output,
@@ -770,18 +940,32 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
                     "answer_latest_bbox_block": latest_bbox_block,
                     "answer_solution_str": f"{latest_bbox_block}\n{current_answer_output}",
                 }
+                final_answer_judgment = await self._request_gemini_answer_score(
+                    query=query,
+                    candidate_response=final_answer_call["answer_solution_str"],
+                    images=gemini_images,
+                )
+                final_answer_score = float(
+                    final_answer_judgment.get("score", 0.0) or 0.0
+                )
+                final_answer_call["answer_reward_override"] = float(final_answer_score)
                 sttv_answer_calls.append(
                     {
                         "call_index": int(answer_call_index),
                         "answer_prompt_text": rewrite_prompt_text,
                         "answer_output_text": current_answer_output,
-                        "answer_solution_str": current_answer_aux_record[
-                            "answer_solution_str"
-                        ],
+                        "answer_solution_str": final_answer_call["answer_solution_str"],
                     }
                 )
 
-            final_answer_call = current_answer_aux_record
+            final_answer_call["answer_reward_override"] = float(final_answer_score)
+            logic_call_record["sttv_answer_logic_verifier_final_answer_score"] = float(
+                final_answer_score
+            )
+            logic_call_record["sttv_answer_logic_verifier_rewrite_skipped_no_edits"] = bool(
+                rewrite_skipped_no_edits
+            )
+
             sttv_answer_aux_call = (
                 dict(final_answer_call) if isinstance(final_answer_call, dict) else None
             )

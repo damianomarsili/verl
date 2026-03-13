@@ -1509,6 +1509,9 @@ class RayPPOTrainer:
                     {
                         "round_index": int(call.get("round_index", -1)),
                         "answer_call_index": int(call.get("answer_call_index", -1)),
+                        "logic_verifier_output_text": str(
+                            call.get("logic_verifier_output_text", "")
+                        ),
                         "logic_feedback": str(call.get("logic_feedback", "")),
                         "logic_feedback_parse_valid": bool(call.get("logic_feedback_parse_valid", False)),
                         "logic_feedback_valid_for_reward": bool(
@@ -1516,6 +1519,27 @@ class RayPPOTrainer:
                         ),
                         "logic_feedback_has_reason_edit": bool(
                             call.get("logic_feedback_has_reason_edit", False)
+                        ),
+                        "logic_teacher_output_text": str(
+                            call.get("logic_teacher_output_text", "")
+                        ),
+                        "logic_teacher_feedback": str(call.get("logic_teacher_feedback", "")),
+                        "logic_edit_source": str(call.get("logic_edit_source", "")),
+                        "logic_selected_feedback": str(call.get("logic_selected_feedback", "")),
+                        "self_edit_score": _as_float(
+                            call.get("sttv_answer_logic_verifier_self_edit_score", 0.0)
+                        ),
+                        "self_edit_reason": str(
+                            call.get("sttv_answer_logic_verifier_self_edit_reason", "")
+                        ),
+                        "current_answer_score": _as_float(
+                            call.get("sttv_answer_logic_verifier_current_answer_score", 0.0)
+                        ),
+                        "final_answer_score": _as_float(
+                            call.get("sttv_answer_logic_verifier_final_answer_score", 0.0)
+                        ),
+                        "rewrite_skipped_no_edits": bool(
+                            call.get("sttv_answer_logic_verifier_rewrite_skipped_no_edits", False)
                         ),
                     }
                 )
@@ -1588,15 +1612,24 @@ class RayPPOTrainer:
                         ),
                         "logic_reward": _as_float(call.get("sttv_answer_logic_verifier_reward", 0.0)),
                         "logic_reward_raw": _as_float(call.get("sttv_answer_logic_verifier_reward_raw", 0.0)),
-                        "delta_answer_reward": _as_float(call.get("sttv_answer_logic_verifier_delta_answer_reward", 0.0)),
-                        "answer_reward_current": _as_float(call.get("sttv_answer_logic_verifier_answer_reward_current", 0.0)),
-                        "answer_reward_next": _as_float(call.get("sttv_answer_logic_verifier_answer_reward_next", 0.0)),
-                        "is_numeric_pair": bool(call.get("sttv_answer_logic_verifier_is_numeric_pair", False)),
-                        "err_current": _as_float(call.get("sttv_answer_logic_verifier_err_current", 0.0)),
-                        "err_next": _as_float(call.get("sttv_answer_logic_verifier_err_next", 0.0)),
-                        "delta_err": _as_float(call.get("sttv_answer_logic_verifier_delta_err", 0.0)),
-                        "logic_high_score_unchanged_bonus": bool(
-                            call.get("sttv_answer_logic_verifier_high_score_unchanged_bonus", False)
+                        "self_edit_score": _as_float(
+                            call.get("sttv_answer_logic_verifier_self_edit_score", 0.0)
+                        ),
+                        "usefulness": _as_float(
+                            call.get("sttv_answer_logic_verifier_usefulness", 0.0)
+                        ),
+                        "current_answer_score": _as_float(
+                            call.get("sttv_answer_logic_verifier_current_answer_score", 0.0)
+                        ),
+                        "final_answer_score": _as_float(
+                            call.get("sttv_answer_logic_verifier_final_answer_score", 0.0)
+                        ),
+                        "delta_answer_reward": _as_float(
+                            call.get("sttv_answer_logic_verifier_delta_answer_reward", 0.0)
+                        ),
+                        "edit_source": str(call.get("logic_edit_source", "")),
+                        "rewrite_skipped_no_edits": bool(
+                            call.get("sttv_answer_logic_verifier_rewrite_skipped_no_edits", False)
                         ),
                     }
                 )
@@ -1810,26 +1843,27 @@ class RayPPOTrainer:
             raw_col = []
             delta_col = []
             current_col = []
-            next_col = []
-            numeric_pair_col = []
-            err_current_col = []
-            err_next_col = []
-            delta_err_col = []
+            final_col = []
+            self_edit_score_col = []
+            usefulness_col = []
+            edit_source_col = []
+            rewrite_skipped_col = []
             parse_valid_col = []
             feedback_valid_col = []
             has_reason_edit_col = []
-            high_score_unchanged_bonus_col = []
             for sample_idx in range(batch_size):
                 entry = answer_logic_component_maps[sample_idx].get(round_index)
                 reward_col.append(None if entry is None else _as_float(entry.get("logic_reward", 0.0)))
                 raw_col.append(None if entry is None else _as_float(entry.get("logic_reward_raw", 0.0)))
                 delta_col.append(None if entry is None else _as_float(entry.get("delta_answer_reward", 0.0)))
-                current_col.append(None if entry is None else _as_float(entry.get("answer_reward_current", 0.0)))
-                next_col.append(None if entry is None else _as_float(entry.get("answer_reward_next", 0.0)))
-                numeric_pair_col.append(None if entry is None else bool(entry.get("is_numeric_pair", False)))
-                err_current_col.append(None if entry is None else _as_float(entry.get("err_current", 0.0)))
-                err_next_col.append(None if entry is None else _as_float(entry.get("err_next", 0.0)))
-                delta_err_col.append(None if entry is None else _as_float(entry.get("delta_err", 0.0)))
+                current_col.append(None if entry is None else _as_float(entry.get("current_answer_score", 0.0)))
+                final_col.append(None if entry is None else _as_float(entry.get("final_answer_score", 0.0)))
+                self_edit_score_col.append(None if entry is None else _as_float(entry.get("self_edit_score", 0.0)))
+                usefulness_col.append(None if entry is None else _as_float(entry.get("usefulness", 0.0)))
+                edit_source_col.append(None if entry is None else str(entry.get("edit_source", "")))
+                rewrite_skipped_col.append(
+                    None if entry is None else bool(entry.get("rewrite_skipped_no_edits", False))
+                )
                 parse_valid_col.append(
                     None if entry is None else bool(entry.get("logic_feedback_parse_valid", False))
                 )
@@ -1839,19 +1873,20 @@ class RayPPOTrainer:
                 has_reason_edit_col.append(
                     None if entry is None else bool(entry.get("logic_feedback_has_reason_edit", False))
                 )
-                high_score_unchanged_bonus_col.append(
-                    None if entry is None else bool(entry.get("logic_high_score_unchanged_bonus", False))
-                )
             round_label = round_index + 1
             per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_reward"] = reward_col
             per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_raw"] = raw_col
             per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_delta_answer_reward"] = delta_col
-            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_answer_reward_current"] = current_col
-            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_answer_reward_next"] = next_col
-            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_is_numeric_pair"] = numeric_pair_col
-            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_err_current"] = err_current_col
-            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_err_next"] = err_next_col
-            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_delta_err"] = delta_err_col
+            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_current_answer_score"] = current_col
+            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_final_answer_score"] = final_col
+            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_self_edit_score"] = (
+                self_edit_score_col
+            )
+            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_usefulness"] = usefulness_col
+            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_edit_source"] = edit_source_col
+            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_rewrite_skipped"] = (
+                rewrite_skipped_col
+            )
             per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_parse_valid"] = parse_valid_col
             per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_feedback_valid"] = (
                 feedback_valid_col
@@ -1859,9 +1894,6 @@ class RayPPOTrainer:
             per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_has_reason_edit"] = (
                 has_reason_edit_col
             )
-            per_step_columns[
-                f"sttv_answer_logic_verifier_round_{round_label}_high_score_unchanged_bonus"
-            ] = high_score_unchanged_bonus_col
 
         sample_columns = {
             "sttv_answer_reward": answer_rewards,
@@ -2038,35 +2070,81 @@ class RayPPOTrainer:
         answer_rewards = torch.zeros_like(response_mask, dtype=torch.float32)
         total_rows = len(aux_batch)
         reward_values = [0.0] * total_rows
+        override_values: list[Optional[float]] = [None] * total_rows
+        call_records_raw = aux_batch.non_tensor_batch.get(
+            "sttv_answer_aux_call_record",
+            np.array([{}] * total_rows, dtype=object),
+        )
+        call_records = (
+            call_records_raw.tolist()
+            if isinstance(call_records_raw, np.ndarray)
+            else list(call_records_raw)
+        )
+        if len(call_records) < total_rows:
+            call_records.extend([{}] * (total_rows - len(call_records)))
+        missing_override_indices: list[int] = []
+        for row_idx, call_record in enumerate(call_records[:total_rows]):
+            override_value: Optional[float] = None
+            if isinstance(call_record, dict):
+                raw_override = call_record.get("answer_reward_override", None)
+                if raw_override is not None:
+                    try:
+                        override_value = float(raw_override)
+                    except (TypeError, ValueError):
+                        override_value = None
+            override_values[row_idx] = override_value
+            if override_value is None:
+                missing_override_indices.append(row_idx)
         if reward_fn is not None:
-            data_sources_raw = aux_batch.non_tensor_batch.get("data_source", np.array(["unknown"] * total_rows, dtype=object))
-            data_sources = data_sources_raw.tolist() if isinstance(data_sources_raw, np.ndarray) else list(data_sources_raw)
-            ground_truths_raw = aux_batch.non_tensor_batch.get(
-                "sttv_ground_truth",
-                np.array([""] * total_rows, dtype=object),
-            )
-            ground_truths = ground_truths_raw.tolist() if isinstance(ground_truths_raw, np.ndarray) else list(ground_truths_raw)
-            extra_infos_raw = aux_batch.non_tensor_batch.get(
-                "sttv_extra_info",
-                np.array([{}] * total_rows, dtype=object),
-            )
-            extra_infos = extra_infos_raw.tolist() if isinstance(extra_infos_raw, np.ndarray) else list(extra_infos_raw)
-            solution_strs_raw = aux_batch.non_tensor_batch.get(
-                "sttv_answer_solution_str",
-                np.array([""] * total_rows, dtype=object),
-            )
-            solution_strs = (
-                solution_strs_raw.tolist() if isinstance(solution_strs_raw, np.ndarray) else list(solution_strs_raw)
-            )
-            if len(solution_strs) < total_rows:
-                solution_strs.extend([""] * (total_rows - len(solution_strs)))
-            raw_rewards = reward_fn(
-                data_sources=data_sources,
-                solution_strs=solution_strs,
-                ground_truths=ground_truths,
-                extra_infos=extra_infos,
-            )
-            reward_values = self._normalize_flat_rewards(raw_rewards, expected_len=total_rows)
+            if missing_override_indices:
+                data_sources_raw = aux_batch.non_tensor_batch.get("data_source", np.array(["unknown"] * total_rows, dtype=object))
+                data_sources_all = data_sources_raw.tolist() if isinstance(data_sources_raw, np.ndarray) else list(data_sources_raw)
+                ground_truths_raw = aux_batch.non_tensor_batch.get(
+                    "sttv_ground_truth",
+                    np.array([""] * total_rows, dtype=object),
+                )
+                ground_truths_all = ground_truths_raw.tolist() if isinstance(ground_truths_raw, np.ndarray) else list(ground_truths_raw)
+                extra_infos_raw = aux_batch.non_tensor_batch.get(
+                    "sttv_extra_info",
+                    np.array([{}] * total_rows, dtype=object),
+                )
+                extra_infos_all = extra_infos_raw.tolist() if isinstance(extra_infos_raw, np.ndarray) else list(extra_infos_raw)
+                solution_strs_raw = aux_batch.non_tensor_batch.get(
+                    "sttv_answer_solution_str",
+                    np.array([""] * total_rows, dtype=object),
+                )
+                solution_strs_all = (
+                    solution_strs_raw.tolist() if isinstance(solution_strs_raw, np.ndarray) else list(solution_strs_raw)
+                )
+                raw_prompts_raw = aux_batch.non_tensor_batch.get("raw_prompt", np.array([None] * total_rows, dtype=object))
+                raw_prompts_all = raw_prompts_raw.tolist() if isinstance(raw_prompts_raw, np.ndarray) else list(raw_prompts_raw)
+                if len(data_sources_all) < total_rows:
+                    data_sources_all.extend(["unknown"] * (total_rows - len(data_sources_all)))
+                if len(ground_truths_all) < total_rows:
+                    ground_truths_all.extend([""] * (total_rows - len(ground_truths_all)))
+                if len(extra_infos_all) < total_rows:
+                    extra_infos_all.extend([{}] * (total_rows - len(extra_infos_all)))
+                if len(solution_strs_all) < total_rows:
+                    solution_strs_all.extend([""] * (total_rows - len(solution_strs_all)))
+                if len(raw_prompts_all) < total_rows:
+                    raw_prompts_all.extend([None] * (total_rows - len(raw_prompts_all)))
+                raw_rewards = reward_fn(
+                    data_sources=[data_sources_all[idx] for idx in missing_override_indices],
+                    solution_strs=[solution_strs_all[idx] for idx in missing_override_indices],
+                    ground_truths=[ground_truths_all[idx] for idx in missing_override_indices],
+                    extra_infos=[extra_infos_all[idx] for idx in missing_override_indices],
+                    raw_prompts=[raw_prompts_all[idx] for idx in missing_override_indices],
+                )
+                normalized_missing = self._normalize_flat_rewards(
+                    raw_rewards,
+                    expected_len=len(missing_override_indices),
+                )
+                for local_idx, row_idx in enumerate(missing_override_indices):
+                    reward_values[row_idx] = float(normalized_missing[local_idx])
+
+        for row_idx, override_value in enumerate(override_values):
+            if override_value is not None:
+                reward_values[row_idx] = float(override_value)
 
         for row_idx, reward in enumerate(reward_values):
             response_len = int(response_mask[row_idx].sum().item())
@@ -2939,6 +3017,8 @@ class RayPPOTrainer:
         aux_extra_infos: list[dict[str, Any]] = []
         aux_output_texts: list[str] = []
         aux_prompt_texts: list[str] = []
+        aux_raw_prompts: list[Any] = []
+        raw_prompt_batch = batch.non_tensor_batch.get("raw_prompt", None)
 
         t_pack_tensors_start = time.perf_counter()
         for row_idx, row in enumerate(aux_rows):
@@ -2988,6 +3068,10 @@ class RayPPOTrainer:
             aux_extra_infos.append(row["extra_info"])
             aux_output_texts.append(row["output_text"])
             aux_prompt_texts.append(row["prompt_text"])
+            if raw_prompt_batch is None:
+                aux_raw_prompts.append(None)
+            else:
+                aux_raw_prompts.append(raw_prompt_batch[int(row["parent_row_index"])])
         t_pack_tensors = time.perf_counter() - t_pack_tensors_start
 
         t_mm_inputs_start = time.perf_counter()
@@ -3046,6 +3130,7 @@ class RayPPOTrainer:
             "sttv_ground_truth": np.array(aux_ground_truths, dtype=object),
             "sttv_parent_solution_str": np.array(aux_parent_solution_strs, dtype=object),
             "sttv_extra_info": np.array(aux_extra_infos, dtype=object),
+            "raw_prompt": np.array(aux_raw_prompts, dtype=object),
             "multi_modal_inputs": np.array(multi_modal_inputs_list, dtype=object),
         }
         aux_batch = DataProto.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=deepcopy(batch.meta_info))

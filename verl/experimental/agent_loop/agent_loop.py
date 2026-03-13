@@ -518,6 +518,7 @@ class AgentLoopWorker:
             output: AgentLoopOutput = await agent_loop.run(
                 sampling_params,
                 validate=bool(trajectory.get("validate", False)),
+                global_steps=int(trajectory.get("step", -1)),
                 **kwargs,
             )
             return await self._agent_loop_postprocess(output, **kwargs)
