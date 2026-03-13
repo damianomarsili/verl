@@ -1532,6 +1532,15 @@ class RayPPOTrainer:
                         "self_edit_reason": str(
                             call.get("sttv_answer_logic_verifier_self_edit_reason", "")
                         ),
+                        "logic_teacher_time_s": _as_float(
+                            call.get("sttv_answer_logic_verifier_logic_teacher_time_s", 0.0)
+                        ),
+                        "answer_gemini_score_time_s": _as_float(
+                            call.get("sttv_answer_logic_verifier_answer_gemini_score_time_s", 0.0)
+                        ),
+                        "gemini_total_time_s": _as_float(
+                            call.get("sttv_answer_logic_verifier_gemini_total_time_s", 0.0)
+                        ),
                         "current_answer_score": _as_float(
                             call.get("sttv_answer_logic_verifier_current_answer_score", 0.0)
                         ),
@@ -1848,6 +1857,9 @@ class RayPPOTrainer:
             usefulness_col = []
             edit_source_col = []
             rewrite_skipped_col = []
+            logic_teacher_time_col = []
+            answer_gemini_time_col = []
+            gemini_total_time_col = []
             parse_valid_col = []
             feedback_valid_col = []
             has_reason_edit_col = []
@@ -1863,6 +1875,15 @@ class RayPPOTrainer:
                 edit_source_col.append(None if entry is None else str(entry.get("edit_source", "")))
                 rewrite_skipped_col.append(
                     None if entry is None else bool(entry.get("rewrite_skipped_no_edits", False))
+                )
+                logic_teacher_time_col.append(
+                    None if entry is None else _as_float(entry.get("logic_teacher_time_s", 0.0))
+                )
+                answer_gemini_time_col.append(
+                    None if entry is None else _as_float(entry.get("answer_gemini_score_time_s", 0.0))
+                )
+                gemini_total_time_col.append(
+                    None if entry is None else _as_float(entry.get("gemini_total_time_s", 0.0))
                 )
                 parse_valid_col.append(
                     None if entry is None else bool(entry.get("logic_feedback_parse_valid", False))
@@ -1886,6 +1907,15 @@ class RayPPOTrainer:
             per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_edit_source"] = edit_source_col
             per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_rewrite_skipped"] = (
                 rewrite_skipped_col
+            )
+            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_logic_teacher_time_s"] = (
+                logic_teacher_time_col
+            )
+            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_answer_gemini_score_time_s"] = (
+                answer_gemini_time_col
+            )
+            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_gemini_total_time_s"] = (
+                gemini_total_time_col
             )
             per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_parse_valid"] = parse_valid_col
             per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_feedback_valid"] = (
@@ -1924,6 +1954,29 @@ class RayPPOTrainer:
         answer_aux_final_answers = [
             self._extract_final_answer(str(output_text or "")) for output_text in answer_aux_output_values
         ]
+        answer_aux_calls_raw = batch.non_tensor_batch.get("sttv_answer_aux_call", None)
+        if isinstance(answer_aux_calls_raw, np.ndarray):
+            answer_aux_call_records = answer_aux_calls_raw.tolist()
+        elif isinstance(answer_aux_calls_raw, list):
+            answer_aux_call_records = answer_aux_calls_raw
+        else:
+            answer_aux_call_records = []
+        if len(answer_aux_call_records) < batch_size:
+            answer_aux_call_records.extend([{}] * (batch_size - len(answer_aux_call_records)))
+        answer_gemini_score_times: list[float] = []
+        gemini_total_times: list[float] = []
+        for sample_idx in range(batch_size):
+            call_record = answer_aux_call_records[sample_idx]
+            if not isinstance(call_record, dict):
+                answer_gemini_score_times.append(0.0)
+                gemini_total_times.append(0.0)
+                continue
+            answer_gemini_score_times.append(
+                _as_float(call_record.get("answer_gemini_score_time_s", 0.0))
+            )
+            gemini_total_times.append(
+                _as_float(call_record.get("gemini_total_time_s", 0.0))
+            )
         answer_aux_call_values: list[str] = []
         for prompt_text, output_text in zip(answer_aux_prompt_values_full, answer_aux_output_values, strict=True):
             prompt_part = str(prompt_text or "").strip()
@@ -1940,6 +1993,8 @@ class RayPPOTrainer:
                 "sttv_answer_aux_output": answer_aux_output_values,
                 "sttv_answer_aux_final_answer": answer_aux_final_answers,
                 "sttv_answer_aux_prompt": answer_aux_prompt_values,
+                "sttv_gemini_answer_score_time_s": answer_gemini_score_times,
+                "sttv_gemini_total_time_s": gemini_total_times,
                 "sttv_answer_calls": answer_calls_per_sample,
                 "sttv_answer_logic_verifier_calls": answer_logic_verifier_calls_compact,
             }
@@ -5904,6 +5959,77 @@ class RayPPOTrainer:
                             )
                             metrics["sttv/answer_logic_verifier_rows_rewarded"] = float(
                                 answer_logic_rows_rewarded
+                            )
+                            gemini_logic_teacher_times: list[float] = []
+                            gemini_answer_score_times: list[float] = []
+                            gemini_total_times: list[float] = []
+                            logic_calls_sample_raw = batch.non_tensor_batch.get("sttv_answer_logic_verifier_calls")
+                            if logic_calls_sample_raw is not None:
+                                logic_calls_per_sample = (
+                                    logic_calls_sample_raw.tolist()
+                                    if isinstance(logic_calls_sample_raw, np.ndarray)
+                                    else list(logic_calls_sample_raw)
+                                )
+                                for sample_calls in logic_calls_per_sample:
+                                    if isinstance(sample_calls, np.ndarray):
+                                        sample_calls = sample_calls.tolist()
+                                    if not isinstance(sample_calls, (list, tuple)):
+                                        continue
+                                    for record in sample_calls:
+                                        if not isinstance(record, dict):
+                                            continue
+                                        gemini_logic_teacher_times.append(
+                                            float(record.get("sttv_answer_logic_verifier_logic_teacher_time_s", 0.0) or 0.0)
+                                        )
+                            answer_aux_calls_sample_raw = batch.non_tensor_batch.get("sttv_answer_aux_call")
+                            if answer_aux_calls_sample_raw is not None:
+                                answer_aux_calls_per_sample = (
+                                    answer_aux_calls_sample_raw.tolist()
+                                    if isinstance(answer_aux_calls_sample_raw, np.ndarray)
+                                    else list(answer_aux_calls_sample_raw)
+                                )
+                                for record in answer_aux_calls_per_sample:
+                                    if isinstance(record, np.ndarray):
+                                        record = record.tolist()
+                                    if isinstance(record, list) and len(record) > 0:
+                                        record = record[0]
+                                    if not isinstance(record, dict):
+                                        continue
+                                    gemini_answer_score_times.append(
+                                        float(record.get("answer_gemini_score_time_s", 0.0) or 0.0)
+                                    )
+                                    gemini_total_times.append(
+                                        float(record.get("gemini_total_time_s", 0.0) or 0.0)
+                                    )
+                            metrics["sttv/gemini_logic_teacher_time_s_mean"] = (
+                                float(np.mean(gemini_logic_teacher_times))
+                                if gemini_logic_teacher_times
+                                else 0.0
+                            )
+                            metrics["sttv/gemini_logic_teacher_time_s_max"] = (
+                                float(np.max(gemini_logic_teacher_times))
+                                if gemini_logic_teacher_times
+                                else 0.0
+                            )
+                            metrics["sttv/gemini_answer_score_time_s_mean"] = (
+                                float(np.mean(gemini_answer_score_times))
+                                if gemini_answer_score_times
+                                else 0.0
+                            )
+                            metrics["sttv/gemini_answer_score_time_s_max"] = (
+                                float(np.max(gemini_answer_score_times))
+                                if gemini_answer_score_times
+                                else 0.0
+                            )
+                            metrics["sttv/gemini_total_time_s_mean"] = (
+                                float(np.mean(gemini_total_times))
+                                if gemini_total_times
+                                else 0.0
+                            )
+                            metrics["sttv/gemini_total_time_s_max"] = (
+                                float(np.max(gemini_total_times))
+                                if gemini_total_times
+                                else 0.0
                             )
 
                             actor_train_batch = self._compose_sttv_actor_batches(

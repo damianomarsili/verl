@@ -17,6 +17,7 @@ import asyncio
 import hashlib
 from pathlib import Path
 import re
+import time
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -812,6 +813,7 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
                 )
             )
 
+            t_logic_teacher_start = time.perf_counter()
             teacher_judgment = await self._request_gemini_logic_teacher_judgment(
                 query=query,
                 latest_bbox_block=latest_bbox_block,
@@ -819,6 +821,7 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
                 proposed_self_edits=logic_output_text,
                 images=gemini_images,
             )
+            logic_teacher_time_s = float(time.perf_counter() - t_logic_teacher_start)
             teacher_edits_raw = teacher_judgment.get("teacher_edits", [])
             if isinstance(teacher_edits_raw, (list, tuple)):
                 teacher_output_text = "\n".join(
@@ -881,6 +884,7 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
                 "logic_teacher_output_raw_text": str(
                     teacher_judgment.get("raw_text", "") or ""
                 ),
+                "logic_teacher_time_s": float(logic_teacher_time_s),
                 "logic_teacher_feedback": str(teacher_feedback),
                 "logic_teacher_parse_valid": bool(teacher_parse_valid),
                 "logic_teacher_num_step_edits": int(
@@ -907,6 +911,7 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
             rewrite_skipped_no_edits = not bool(selected_feedback.strip())
             if rewrite_skipped_no_edits:
                 final_answer_call["answer_reward_override"] = float(current_answer_score)
+                final_answer_call["answer_gemini_score_time_s"] = 0.0
             else:
                 (
                     rewrite_prompt_text,
@@ -940,15 +945,22 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
                     "answer_latest_bbox_block": latest_bbox_block,
                     "answer_solution_str": f"{latest_bbox_block}\n{current_answer_output}",
                 }
+                t_answer_grade_start = time.perf_counter()
                 final_answer_judgment = await self._request_gemini_answer_score(
                     query=query,
                     candidate_response=final_answer_call["answer_solution_str"],
                     images=gemini_images,
                 )
+                answer_gemini_score_time_s = float(
+                    time.perf_counter() - t_answer_grade_start
+                )
                 final_answer_score = float(
                     final_answer_judgment.get("score", 0.0) or 0.0
                 )
                 final_answer_call["answer_reward_override"] = float(final_answer_score)
+                final_answer_call["answer_gemini_score_time_s"] = float(
+                    answer_gemini_score_time_s
+                )
                 sttv_answer_calls.append(
                     {
                         "call_index": int(answer_call_index),
@@ -959,11 +971,25 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
                 )
 
             final_answer_call["answer_reward_override"] = float(final_answer_score)
+            if "answer_gemini_score_time_s" not in final_answer_call:
+                final_answer_call["answer_gemini_score_time_s"] = 0.0
+            final_answer_call["gemini_total_time_s"] = float(
+                logic_teacher_time_s + float(final_answer_call.get("answer_gemini_score_time_s", 0.0) or 0.0)
+            )
             logic_call_record["sttv_answer_logic_verifier_final_answer_score"] = float(
                 final_answer_score
             )
             logic_call_record["sttv_answer_logic_verifier_rewrite_skipped_no_edits"] = bool(
                 rewrite_skipped_no_edits
+            )
+            logic_call_record["sttv_answer_logic_verifier_logic_teacher_time_s"] = float(
+                logic_teacher_time_s
+            )
+            logic_call_record["sttv_answer_logic_verifier_answer_gemini_score_time_s"] = float(
+                final_answer_call.get("answer_gemini_score_time_s", 0.0) or 0.0
+            )
+            logic_call_record["sttv_answer_logic_verifier_gemini_total_time_s"] = float(
+                final_answer_call.get("gemini_total_time_s", 0.0) or 0.0
             )
 
             sttv_answer_aux_call = (
