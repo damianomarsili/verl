@@ -5116,6 +5116,7 @@ class RayPPOTrainer:
                             continue
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
+                    sttv_multi_objective_enabled = self._is_sttv_multi_objective_enabled()
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
@@ -5127,7 +5128,12 @@ class RayPPOTrainer:
                             batch = batch.union(reward_tensor)
 
                         # Compute or extract reward for training
-                        if self.config.reward_model.launch_reward_fn_async:
+                        if sttv_multi_objective_enabled:
+                            reward_tensor = torch.zeros_like(
+                                batch.batch["responses"], dtype=torch.float32
+                            )
+                            reward_extra_infos_dict = {}
+                        elif self.config.reward_model.launch_reward_fn_async:
                             future_reward = compute_reward_async.remote(
                                 data=batch, config=self.config, tokenizer=self.tokenizer
                             )
@@ -5135,8 +5141,6 @@ class RayPPOTrainer:
                             reward_tensor, reward_extra_infos_dict = self._compute_or_extract_reward(
                                 batch, reward_fn=self.reward_fn, reward_for_val=False
                             )
-
-                    sttv_multi_objective_enabled = self._is_sttv_multi_objective_enabled()
                     loc_verifier_aux_batch: Optional[DataProto] = None
                     answer_aux_batch: Optional[DataProto] = None
                     answer_logic_verifier_aux_batch: Optional[DataProto] = None
@@ -5333,7 +5337,7 @@ class RayPPOTrainer:
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
-                        if self.config.reward_model.launch_reward_fn_async:
+                        if self.config.reward_model.launch_reward_fn_async and not sttv_multi_objective_enabled:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
 
                         if sttv_multi_objective_enabled:
