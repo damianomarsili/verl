@@ -1509,9 +1509,17 @@ class RayPPOTrainer:
                     {
                         "round_index": int(call.get("round_index", -1)),
                         "answer_call_index": int(call.get("answer_call_index", -1)),
-                        "logic_status": str(call.get("logic_status", "")),
                         "logic_feedback": str(call.get("logic_feedback", "")),
-                        "logic_parse_valid": bool(call.get("logic_parse_valid", False)),
+                        "logic_feedback_parse_valid": bool(call.get("logic_feedback_parse_valid", False)),
+                        "logic_feedback_valid_for_reward": bool(
+                            call.get("logic_feedback_valid_for_reward", False)
+                        ),
+                        "logic_feedback_has_reason_edit": bool(
+                            call.get("logic_feedback_has_reason_edit", False)
+                        ),
+                        "logic_feedback_has_answer_edit": bool(
+                            call.get("logic_feedback_has_answer_edit", False)
+                        ),
                     }
                 )
             answer_logic_verifier_calls_compact.append(compact_rows)
@@ -1574,8 +1582,16 @@ class RayPPOTrainer:
                     {
                         "round_index": int(call.get("round_index", -1)),
                         "answer_call_index": int(call.get("answer_call_index", -1)),
-                        "logic_status": str(call.get("logic_status", "")),
-                        "logic_parse_valid": bool(call.get("logic_parse_valid", False)),
+                        "logic_feedback_parse_valid": bool(call.get("logic_feedback_parse_valid", False)),
+                        "logic_feedback_valid_for_reward": bool(
+                            call.get("logic_feedback_valid_for_reward", False)
+                        ),
+                        "logic_feedback_has_reason_edit": bool(
+                            call.get("logic_feedback_has_reason_edit", False)
+                        ),
+                        "logic_feedback_has_answer_edit": bool(
+                            call.get("logic_feedback_has_answer_edit", False)
+                        ),
                         "logic_reward": _as_float(call.get("sttv_answer_logic_verifier_reward", 0.0)),
                         "logic_reward_raw": _as_float(call.get("sttv_answer_logic_verifier_reward_raw", 0.0)),
                         "delta_answer_reward": _as_float(call.get("sttv_answer_logic_verifier_delta_answer_reward", 0.0)),
@@ -1585,8 +1601,9 @@ class RayPPOTrainer:
                         "err_current": _as_float(call.get("sttv_answer_logic_verifier_err_current", 0.0)),
                         "err_next": _as_float(call.get("sttv_answer_logic_verifier_err_next", 0.0)),
                         "delta_err": _as_float(call.get("sttv_answer_logic_verifier_delta_err", 0.0)),
-                        "logic_keep_bonus": bool(call.get("sttv_answer_logic_verifier_keep_bonus", False)),
-                        "logic_keep_forced_zero": bool(call.get("sttv_answer_logic_verifier_keep_forced_zero", False)),
+                        "logic_high_score_unchanged_bonus": bool(
+                            call.get("sttv_answer_logic_verifier_high_score_unchanged_bonus", False)
+                        ),
                     }
                 )
             answer_logic_entries = sorted(answer_logic_entries, key=lambda row: int(row.get("round_index", -1)))
@@ -1804,10 +1821,11 @@ class RayPPOTrainer:
             err_current_col = []
             err_next_col = []
             delta_err_col = []
-            status_col = []
-            valid_col = []
-            keep_bonus_col = []
-            keep_forced_zero_col = []
+            parse_valid_col = []
+            feedback_valid_col = []
+            has_reason_edit_col = []
+            has_answer_edit_col = []
+            high_score_unchanged_bonus_col = []
             for sample_idx in range(batch_size):
                 entry = answer_logic_component_maps[sample_idx].get(round_index)
                 reward_col.append(None if entry is None else _as_float(entry.get("logic_reward", 0.0)))
@@ -1819,11 +1837,20 @@ class RayPPOTrainer:
                 err_current_col.append(None if entry is None else _as_float(entry.get("err_current", 0.0)))
                 err_next_col.append(None if entry is None else _as_float(entry.get("err_next", 0.0)))
                 delta_err_col.append(None if entry is None else _as_float(entry.get("delta_err", 0.0)))
-                status_col.append(None if entry is None else str(entry.get("logic_status", "")))
-                valid_col.append(None if entry is None else bool(entry.get("logic_parse_valid", False)))
-                keep_bonus_col.append(None if entry is None else bool(entry.get("logic_keep_bonus", False)))
-                keep_forced_zero_col.append(
-                    None if entry is None else bool(entry.get("logic_keep_forced_zero", False))
+                parse_valid_col.append(
+                    None if entry is None else bool(entry.get("logic_feedback_parse_valid", False))
+                )
+                feedback_valid_col.append(
+                    None if entry is None else bool(entry.get("logic_feedback_valid_for_reward", False))
+                )
+                has_reason_edit_col.append(
+                    None if entry is None else bool(entry.get("logic_feedback_has_reason_edit", False))
+                )
+                has_answer_edit_col.append(
+                    None if entry is None else bool(entry.get("logic_feedback_has_answer_edit", False))
+                )
+                high_score_unchanged_bonus_col.append(
+                    None if entry is None else bool(entry.get("logic_high_score_unchanged_bonus", False))
                 )
             round_label = round_index + 1
             per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_reward"] = reward_col
@@ -1835,12 +1862,19 @@ class RayPPOTrainer:
             per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_err_current"] = err_current_col
             per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_err_next"] = err_next_col
             per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_delta_err"] = delta_err_col
-            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_status"] = status_col
-            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_parse_valid"] = valid_col
-            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_keep_bonus"] = keep_bonus_col
-            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_keep_forced_zero"] = (
-                keep_forced_zero_col
+            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_parse_valid"] = parse_valid_col
+            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_feedback_valid"] = (
+                feedback_valid_col
             )
+            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_has_reason_edit"] = (
+                has_reason_edit_col
+            )
+            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_has_answer_edit"] = (
+                has_answer_edit_col
+            )
+            per_step_columns[
+                f"sttv_answer_logic_verifier_round_{round_label}_high_score_unchanged_bonus"
+            ] = high_score_unchanged_bonus_col
 
         sample_columns = {
             "sttv_answer_reward": answer_rewards,

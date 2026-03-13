@@ -23,11 +23,8 @@ from PIL import Image
 from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
 from verl.experimental.agent_loop.sttv_agent_loop import SttvAgentLoop
 
-LOGIC_STATUS_PATTERN = re.compile(r"(?im)^\s*STATUS\s*:\s*(KEEP|REVISE)\s*$")
-LOGIC_FEEDBACK_PATTERN = re.compile(r"(?ims)^\s*FEEDBACK\s*:\s*(.*?)\s*$")
-LOGIC_SPATIAL_PATTERN = re.compile(r"(?im)^\s*SPATIAL_CORRECTNESS\s*:\s*(correct|incorrect)\s*$")
-LOGIC_ATTRIBUTE_PATTERN = re.compile(r"(?im)^\s*ATTRIBUTE_CORRECTNESS\s*:\s*(correct|incorrect)\s*$")
-LOGIC_REASONING_PATTERN = re.compile(r"(?im)^\s*LOGIC_CORRECTNESS\s*:\s*(correct|incorrect)\s*$")
+LOGIC_REASON_EDIT_PATTERN = re.compile(r"(?i)^EDIT_REASON\s*:\s*(?P<body>.+)$")
+LOGIC_ANSWER_EDIT_PATTERN = re.compile(r"(?i)^EDIT_ANSWER\s*:\s*(?P<body>.+)$")
 
 
 @register("sttv_all_verifiers_agent")
@@ -77,37 +74,61 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
             "Do not output another <bbox_2d>."
         )
 
-    def _parse_logic_self_verifier_output(self, text: str) -> tuple[str, str, bool]:
-        raw = str(text or "").strip()
-        spatial_match = LOGIC_SPATIAL_PATTERN.search(raw)
-        attribute_match = LOGIC_ATTRIBUTE_PATTERN.search(raw)
-        reasoning_match = LOGIC_REASONING_PATTERN.search(raw)
-        status_match = LOGIC_STATUS_PATTERN.search(raw)
-        feedback_match = LOGIC_FEEDBACK_PATTERN.search(raw)
+    def _parse_logic_self_verifier_output(self, text: str) -> tuple[str, bool, dict[str, Any]]:
+        cleaned = str(text or "").replace("<|im_end|>", "").strip()
+        normalized_lines: list[tuple[str, int]] = []
+        line_order = 0
+        has_reason_edit = False
+        has_answer_edit = False
+        seen: set[str] = set()
 
-        feedback = feedback_match.group(1).strip() if feedback_match else ""
+        for raw_line in cleaned.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            line = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
+            if not line:
+                continue
+            if line.lower().startswith("feedback:"):
+                line = line.split(":", 1)[1].strip()
+                if not line:
+                    continue
 
-        if spatial_match is None or attribute_match is None or reasoning_match is None:
-            return "INVALID", "", False
+            reason_match = LOGIC_REASON_EDIT_PATTERN.match(line)
+            if reason_match is not None:
+                body = reason_match.group("body").strip()
+                if body:
+                    normalized = f"EDIT_REASON: {body}"
+                    if normalized not in seen:
+                        normalized_lines.append((normalized, line_order))
+                        seen.add(normalized)
+                        has_reason_edit = True
+                        line_order += 1
+                continue
 
-        rubric_values = [
-            spatial_match.group(1).strip().lower(),
-            attribute_match.group(1).strip().lower(),
-            reasoning_match.group(1).strip().lower(),
-        ]
-        has_incorrect = any(value == "incorrect" for value in rubric_values)
-        derived_status = "REVISE" if has_incorrect else "KEEP"
+            answer_match = LOGIC_ANSWER_EDIT_PATTERN.match(line)
+            if answer_match is not None:
+                body = answer_match.group("body").strip()
+                if body:
+                    normalized = f"EDIT_ANSWER: {body}"
+                    if normalized not in seen:
+                        normalized_lines.append((normalized, line_order))
+                        seen.add(normalized)
+                        has_answer_edit = True
+                        line_order += 1
+                continue
 
-        # Accept explicit STATUS if present, but enforce rubric-driven behavior.
-        if status_match is not None:
-            parsed_status = status_match.group(1).upper().strip()
-            if parsed_status not in {"KEEP", "REVISE"}:
-                return "INVALID", "", False
-        if has_incorrect and not feedback:
-            return "INVALID", "", False
-        if derived_status == "KEEP" and not feedback:
-            feedback = "The current <reason>/<answer> is correct. Re-emit unchanged."
-        return derived_status, feedback, True
+        normalized_lines.sort(key=lambda item: item[1])
+        has_effect = len(normalized_lines) > 0
+        feedback_info: dict[str, Any] = {
+            "logic_feedback_has_effect": bool(has_effect),
+            "logic_feedback_valid_for_reward": bool(has_effect),
+            "logic_feedback_has_reason_edit": bool(has_reason_edit),
+            "logic_feedback_has_answer_edit": bool(has_answer_edit),
+        }
+        if not has_effect:
+            return "NO_VALID_REFINEMENTS. Re-emit the current <reason>/<answer> unchanged.", False, feedback_info
+        return "\n".join(line for line, _ in normalized_lines), True, feedback_info
 
     async def _build_logic_verifier_messages(
         self,
@@ -165,12 +186,15 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
         rewrite_prompt = (
             f"{clean_prompt}\n\n"
             f"Current answer draft:\n{str(current_answer_output or '').strip()}\n\n"
-            f"Feedback: {logic_feedback}\n\n"
+            "I have some feedback for you to incorporate. "
+            "Please output exactly one full <reason> block and then one full <answer> block that incorporates the feedback.\n"
+            f"Feedback:\n{logic_feedback}\n"
+            "You MUST re-predict BOTH the reasoning and the answer, including unchanged parts. "
+            "You MUST incorporate the feedback and MUST NOT make unrelated changes. "
             "Please output exactly one full <reason> block and then one full <answer> block. "
             "Ensure that the answer is either yes/no, one word, or one number. "
             "Do not round answers, express all ratios as unrounded decimals. Nothing else. "
-            "Do not output any <bbox_2d>. "
-            "If feedback indicates the current answer is already correct, re-emit the current answer draft unchanged."
+            "Do not output any <bbox_2d>."
         )
         messages = self._build_messages(rewrite_prompt, images)
         prompt_ids, answer_multi_modal_inputs = await self._build_prompt_ids_and_mm_inputs(messages, images)
@@ -571,18 +595,27 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
                     generate_logprobs=bool(sampling_params.get("logprobs", False)),
                     metrics=metrics,
                 )
-                logic_status, logic_feedback, logic_parse_valid = self._parse_logic_self_verifier_output(logic_output_text)
+                logic_feedback, logic_parse_valid, logic_feedback_info = self._parse_logic_self_verifier_output(
+                    logic_output_text
+                )
                 if not logic_parse_valid:
-                    logic_status = "INVALID"
                     logic_feedback = "No valid self-verifier feedback was produced. Re-emit the current answer unchanged."
 
                 sttv_answer_logic_verifier_calls.append(
                     {
                         "round_index": int(logic_round_index),
                         "answer_call_index": int(answer_call_index),
-                        "logic_status": str(logic_status),
                         "logic_feedback": str(logic_feedback),
-                        "logic_parse_valid": bool(logic_parse_valid),
+                        "logic_feedback_parse_valid": bool(logic_parse_valid),
+                        "logic_feedback_valid_for_reward": bool(
+                            logic_feedback_info.get("logic_feedback_valid_for_reward", False)
+                        ),
+                        "logic_feedback_has_reason_edit": bool(
+                            logic_feedback_info.get("logic_feedback_has_reason_edit", False)
+                        ),
+                        "logic_feedback_has_answer_edit": bool(
+                            logic_feedback_info.get("logic_feedback_has_answer_edit", False)
+                        ),
                         "logic_verifier_prompt_text": logic_prompt_text,
                         "logic_verifier_output_text": logic_output_text,
                         "logic_verifier_prompt_token_ids": logic_prompt_token_ids,
