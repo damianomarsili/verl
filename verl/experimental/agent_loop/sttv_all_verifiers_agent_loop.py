@@ -24,7 +24,6 @@ from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
 from verl.experimental.agent_loop.sttv_agent_loop import SttvAgentLoop
 
 LOGIC_REASON_EDIT_PATTERN = re.compile(r"(?i)^EDIT_REASON\s*:\s*(?P<body>.+)$")
-LOGIC_ANSWER_EDIT_PATTERN = re.compile(r"(?i)^EDIT_ANSWER\s*:\s*(?P<body>.+)$")
 
 
 @register("sttv_all_verifiers_agent")
@@ -44,7 +43,10 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
         if logic_self_verifier_prompt_path:
             prompt_path = Path(logic_self_verifier_prompt_path)
         else:
-            prompt_path = self._resolve_training_prompts_dir() / "logic_self_verifier_instructions.txt"
+            prompt_path = (
+                self._resolve_training_prompts_dir()
+                / "logic_self_verifier_instructions.txt"
+            )
         self.logic_self_verifier_template = self._read_prompt_file(prompt_path)
 
     def _resolve_training_prompts_dir(self) -> Path:
@@ -54,9 +56,13 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
                 return parent / "training" / "prompts"
             if (parent / "STTV" / "training" / "prompts").exists():
                 return parent / "STTV" / "training" / "prompts"
-        raise FileNotFoundError("Could not locate training/prompts relative to the repo.")
+        raise FileNotFoundError(
+            "Could not locate training/prompts relative to the repo."
+        )
 
-    def _build_logic_self_verifier_prompt(self, query: str, latest_answer_output: str) -> str:
+    def _build_logic_self_verifier_prompt(
+        self, query: str, latest_answer_output: str
+    ) -> str:
         return self.logic_self_verifier_template.format(
             query=query.strip(),
             answer=str(latest_answer_output or "").strip(),
@@ -74,12 +80,13 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
             "Do not output another <bbox_2d>."
         )
 
-    def _parse_logic_self_verifier_output(self, text: str) -> tuple[str, bool, dict[str, Any]]:
+    def _parse_logic_self_verifier_output(
+        self, text: str
+    ) -> tuple[str, bool, dict[str, Any]]:
         cleaned = str(text or "").replace("<|im_end|>", "").strip()
         normalized_lines: list[tuple[str, int]] = []
         line_order = 0
         has_reason_edit = False
-        has_answer_edit = False
         seen: set[str] = set()
 
         for raw_line in cleaned.splitlines():
@@ -106,28 +113,19 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
                         line_order += 1
                 continue
 
-            answer_match = LOGIC_ANSWER_EDIT_PATTERN.match(line)
-            if answer_match is not None:
-                body = answer_match.group("body").strip()
-                if body:
-                    normalized = f"EDIT_ANSWER: {body}"
-                    if normalized not in seen:
-                        normalized_lines.append((normalized, line_order))
-                        seen.add(normalized)
-                        has_answer_edit = True
-                        line_order += 1
-                continue
-
         normalized_lines.sort(key=lambda item: item[1])
         has_effect = len(normalized_lines) > 0
         feedback_info: dict[str, Any] = {
             "logic_feedback_has_effect": bool(has_effect),
             "logic_feedback_valid_for_reward": bool(has_effect),
             "logic_feedback_has_reason_edit": bool(has_reason_edit),
-            "logic_feedback_has_answer_edit": bool(has_answer_edit),
         }
         if not has_effect:
-            return "NO_VALID_REFINEMENTS. Re-emit the current <reason>/<answer> unchanged.", False, feedback_info
+            return (
+                "NO_VALID_REFINEMENTS. Re-emit the current <reason>/<answer> unchanged.",
+                False,
+                feedback_info,
+            )
         return "\n".join(line for line, _ in normalized_lines), True, feedback_info
 
     async def _build_logic_verifier_messages(
@@ -136,9 +134,13 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
         prompt: str,
         generate_logprobs: bool,
         metrics: dict[str, Any],
-    ) -> tuple[str, list[int], list[int], list[float], list[dict[str, Any]], dict[str, Any]]:
+    ) -> tuple[
+        str, list[int], list[int], list[float], list[dict[str, Any]], dict[str, Any]
+    ]:
         messages = self._build_messages(prompt, images)
-        prompt_ids, logic_multi_modal_inputs = await self._build_prompt_ids_and_mm_inputs(messages, images)
+        prompt_ids, logic_multi_modal_inputs = (
+            await self._build_prompt_ids_and_mm_inputs(messages, images)
+        )
 
         sampling_params = {
             "temperature": 0.0,
@@ -157,7 +159,9 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
         output_ids = output.token_ids
         output_log_probs = output.log_probs or []
         if metrics is not None and metrics.get("num_preempted", -1) == -1:
-            metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
+            metrics["num_preempted"] = (
+                output.num_preempted if output.num_preempted is not None else -1
+            )
         if output_log_probs:
             logic_output_log_probs = [float(x) for x in output_log_probs]
         else:
@@ -181,15 +185,24 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
         logic_feedback: str,
         sampling_params: dict[str, Any],
         metrics: dict[str, Any],
-    ) -> tuple[str, str, list[int], list[int], list[float], list[dict[str, Any]], dict[str, Any]]:
+    ) -> tuple[
+        str,
+        str,
+        list[int],
+        list[int],
+        list[float],
+        list[dict[str, Any]],
+        dict[str, Any],
+    ]:
         clean_prompt = self._build_clean_answer_prompt(query, latest_bbox_block)
         rewrite_prompt = (
             f"{clean_prompt}\n\n"
             f"Current answer draft:\n{str(current_answer_output or '').strip()}\n\n"
             "I have some feedback for you to incorporate. "
-            "Please output exactly one full <reason> block and then one full <answer> block that incorporates the feedback.\n"
+            "Please update the <reason> using the feedback, then output a final <answer> that follows from the updated reasoning.\n"
             f"Feedback:\n{logic_feedback}\n"
-            "You MUST re-predict BOTH the reasoning and the answer, including unchanged parts. "
+            "You MUST update the reasoning to incorporate the feedback. "
+            "You MUST then produce the final answer from that updated reasoning. "
             "You MUST incorporate the feedback and MUST NOT make unrelated changes. "
             "Please output exactly one full <reason> block and then one full <answer> block. "
             "Ensure that the answer is either yes/no, one word, or one number. "
@@ -197,7 +210,9 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
             "Do not output any <bbox_2d>."
         )
         messages = self._build_messages(rewrite_prompt, images)
-        prompt_ids, answer_multi_modal_inputs = await self._build_prompt_ids_and_mm_inputs(messages, images)
+        prompt_ids, answer_multi_modal_inputs = (
+            await self._build_prompt_ids_and_mm_inputs(messages, images)
+        )
         answer_sampling_params = dict(sampling_params)
         answer_sampling_params["max_tokens"] = self.max_new_tokens_per_chunk
         answer_sampling_params["stop"] = ["</answer>"]
@@ -211,7 +226,9 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
         output_ids = output.token_ids
         output_log_probs_raw = output.log_probs or []
         if metrics is not None and metrics.get("num_preempted", -1) == -1:
-            metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
+            metrics["num_preempted"] = (
+                output.num_preempted if output.num_preempted is not None else -1
+            )
         if output_log_probs_raw:
             output_log_probs = [float(x) for x in output_log_probs_raw]
         else:
@@ -227,14 +244,19 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
             answer_multi_modal_inputs,
         )
 
-    async def run(self, sampling_params: dict[str, Any], **kwargs: Any) -> AgentLoopOutput:
+    async def run(
+        self, sampling_params: dict[str, Any], **kwargs: Any
+    ) -> AgentLoopOutput:
         validate_mode = bool(kwargs.get("validate", False))
         raw_messages = list(kwargs["raw_prompt"])
         query = self._extract_query(raw_messages)
         multi_modal_data = await self.process_vision_info(raw_messages)
         raw_images = self._normalize_images(multi_modal_data.get("images"))
         raw_images_rgb = [img.convert("RGB") for img in raw_images]
-        images = [self._resize_longest_side(img, self.max_image_side) for img in raw_images_rgb]
+        images = [
+            self._resize_longest_side(img, self.max_image_side)
+            for img in raw_images_rgb
+        ]
 
         prompted_query = self._build_prompted_context(query)
         messages = self._build_messages(prompted_query, images)
@@ -243,7 +265,9 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
 
         train_prompt_ids = list(initial_prompt_ids)
         response_mask: list[int] = []
-        response_logprobs: Optional[list[float]] = [] if sampling_params.get("logprobs") else None
+        response_logprobs: Optional[list[float]] = (
+            [] if sampling_params.get("logprobs") else None
+        )
         sttv_answer_mask: list[int] = []
         sttv_loc_mask: list[int] = []
         sttv_loc_calls: list[dict[str, Any]] = []
@@ -258,11 +282,17 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
         total_generated_tokens = 0
         bbox_line_format = '1: label="object_name", [x_min, y_min, x_max, y_max]'
 
-        metrics: dict[str, Any] = {"generate_sequences": 0.0, "tool_calls": 0.0, "num_preempted": -1}
+        metrics: dict[str, Any] = {
+            "generate_sequences": 0.0,
+            "tool_calls": 0.0,
+            "num_preempted": -1,
+        }
         user_turns = 1
         assistant_turns = 0
 
-        def _extend_objective_masks(answer_value: int, loc_value: int, count: int) -> None:
+        def _extend_objective_masks(
+            answer_value: int, loc_value: int, count: int
+        ) -> None:
             if count <= 0:
                 return
             sttv_answer_mask.extend([answer_value] * count)
@@ -281,7 +311,9 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
             appended = len(extra_prompt_ids)
             _extend_objective_masks(answer_value=0, loc_value=0, count=appended)
 
-        def _append_assistant_turn(chunk: str, token_ids: list[int], log_probs: list[float]) -> None:
+        def _append_assistant_turn(
+            chunk: str, token_ids: list[int], log_probs: list[float]
+        ) -> None:
             nonlocal loc_call_counter
             chunk_start = len(response_mask)
             appended = self._append_assistant_tokens(
@@ -354,7 +386,11 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
                 prompt_ids=initial_prompt_ids,
                 response_ids=response_ids[: self.response_length],
                 response_mask=response_mask[: self.response_length],
-                response_logprobs=(response_logprobs[: self.response_length] if response_logprobs is not None else None),
+                response_logprobs=(
+                    response_logprobs[: self.response_length]
+                    if response_logprobs is not None
+                    else None
+                ),
                 multi_modal_data={"images": images} if images else {},
                 num_turns=user_turns + assistant_turns,
                 metrics=metrics,
@@ -374,13 +410,15 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
                 return _return_output()
 
             if self.agent_loop_cpu_cleanup_enable:
-                chunk, token_ids, log_probs = await self._generate_once_with_cached_prompt_ids(
-                    prompt_ids=model_prompt_ids,
-                    images=images,
-                    sampling_params=sampling_params,
-                    stop_sequences=["</bbox_2d>"],
-                    max_new_tokens=self.max_new_tokens_per_chunk,
-                    metrics=metrics,
+                chunk, token_ids, log_probs = (
+                    await self._generate_once_with_cached_prompt_ids(
+                        prompt_ids=model_prompt_ids,
+                        images=images,
+                        sampling_params=sampling_params,
+                        stop_sequences=["</bbox_2d>"],
+                        max_new_tokens=self.max_new_tokens_per_chunk,
+                        metrics=metrics,
+                    )
                 )
             else:
                 chunk, token_ids, log_probs = await self._generate_once(
@@ -399,7 +437,9 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
             _append_assistant_turn(chunk, token_ids, log_probs)
             if self.agent_loop_cpu_cleanup_enable and token_ids:
                 model_prompt_ids.extend(token_ids)
-            messages.append({"role": "assistant", "content": [{"type": "text", "text": chunk}]})
+            messages.append(
+                {"role": "assistant", "content": [{"type": "text", "text": chunk}]}
+            )
 
             if total_generated_tokens >= max_total_tokens:
                 return _return_output()
@@ -435,7 +475,9 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
                     originals.append(original)
                     overlays.append(overlay)
 
-                verifier_prompt = self._build_verifier_prompt(current_entries, len(images))
+                verifier_prompt = self._build_verifier_prompt(
+                    current_entries, len(images)
+                )
                 (
                     verifier_output,
                     verifier_prompt_ids,
@@ -450,8 +492,12 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
                     generate_logprobs=bool(sampling_params.get("logprobs", False)),
                     metrics=metrics,
                 )
-                corrections, _, feedback_info = self._parse_verifier_feedback(verifier_output, current_entries)
-                current_loc_call_index = sttv_loc_calls[-1]["call_index"] if sttv_loc_calls else -1
+                corrections, _, feedback_info = self._parse_verifier_feedback(
+                    verifier_output, current_entries
+                )
+                current_loc_call_index = (
+                    sttv_loc_calls[-1]["call_index"] if sttv_loc_calls else -1
+                )
                 if current_loc_call_index >= 0:
                     sttv_loc_verifier_calls.append(
                         {
@@ -472,13 +518,19 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
                                 feedback_info.get("feedback_valid_for_reward", False)
                             ),
                             "sttv_loc_verifier_feedback_has_duplicate_add_existing": bool(
-                                feedback_info.get("feedback_has_duplicate_add_existing", False)
+                                feedback_info.get(
+                                    "feedback_has_duplicate_add_existing", False
+                                )
                             ),
                             "sttv_loc_verifier_feedback_has_disallowed_remove": bool(
-                                feedback_info.get("feedback_has_disallowed_remove", False)
+                                feedback_info.get(
+                                    "feedback_has_disallowed_remove", False
+                                )
                             ),
                             "sttv_loc_verifier_feedback_duplicate_add_existing_count": int(
-                                feedback_info.get("feedback_duplicate_add_existing_count", 0)
+                                feedback_info.get(
+                                    "feedback_duplicate_add_existing_count", 0
+                                )
                             ),
                             "sttv_loc_verifier_feedback_disallowed_remove_count": int(
                                 feedback_info.get("feedback_disallowed_remove_count", 0)
@@ -509,20 +561,29 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
                         )
                     )
                 else:
-                    correction_chunk, correction_token_ids, correction_log_probs = await self._generate_once(
-                        messages,
-                        images=images,
-                        sampling_params=sampling_params,
-                        stop_sequences=["</bbox_2d>"],
-                        max_new_tokens=self.max_new_tokens_per_chunk,
-                        metrics=metrics,
+                    correction_chunk, correction_token_ids, correction_log_probs = (
+                        await self._generate_once(
+                            messages,
+                            images=images,
+                            sampling_params=sampling_params,
+                            stop_sequences=["</bbox_2d>"],
+                            max_new_tokens=self.max_new_tokens_per_chunk,
+                            metrics=metrics,
+                        )
                     )
                 total_generated_tokens += len(correction_token_ids)
                 assistant_turns += 1
-                _append_assistant_turn(correction_chunk, correction_token_ids, correction_log_probs)
+                _append_assistant_turn(
+                    correction_chunk, correction_token_ids, correction_log_probs
+                )
                 if self.agent_loop_cpu_cleanup_enable and correction_token_ids:
                     model_prompt_ids.extend(correction_token_ids)
-                messages.append({"role": "assistant", "content": [{"type": "text", "text": correction_chunk}]})
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": correction_chunk}],
+                    }
+                )
 
                 corrected_payloads = self._extract_bbox_2d_payloads(correction_chunk)
                 if len(corrected_payloads) != 1:
@@ -575,13 +636,17 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
                     "call_index": int(answer_call_index),
                     "answer_prompt_text": answer_prompt_text,
                     "answer_output_text": current_answer_output,
-                    "answer_solution_str": current_answer_aux_record["answer_solution_str"],
+                    "answer_solution_str": current_answer_aux_record[
+                        "answer_solution_str"
+                    ],
                 }
             )
 
             # Logic self-verifier rounds on reason/answer.
             for logic_round_index in range(self.logic_verifier_rounds):
-                logic_prompt_text = self._build_logic_self_verifier_prompt(query, current_answer_output)
+                logic_prompt_text = self._build_logic_self_verifier_prompt(
+                    query, current_answer_output
+                )
                 (
                     logic_output_text,
                     logic_prompt_token_ids,
@@ -595,8 +660,8 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
                     generate_logprobs=bool(sampling_params.get("logprobs", False)),
                     metrics=metrics,
                 )
-                logic_feedback, logic_parse_valid, logic_feedback_info = self._parse_logic_self_verifier_output(
-                    logic_output_text
+                logic_feedback, logic_parse_valid, logic_feedback_info = (
+                    self._parse_logic_self_verifier_output(logic_output_text)
                 )
                 if not logic_parse_valid:
                     logic_feedback = "No valid self-verifier feedback was produced. Re-emit the current answer unchanged."
@@ -608,13 +673,14 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
                         "logic_feedback": str(logic_feedback),
                         "logic_feedback_parse_valid": bool(logic_parse_valid),
                         "logic_feedback_valid_for_reward": bool(
-                            logic_feedback_info.get("logic_feedback_valid_for_reward", False)
+                            logic_feedback_info.get(
+                                "logic_feedback_valid_for_reward", False
+                            )
                         ),
                         "logic_feedback_has_reason_edit": bool(
-                            logic_feedback_info.get("logic_feedback_has_reason_edit", False)
-                        ),
-                        "logic_feedback_has_answer_edit": bool(
-                            logic_feedback_info.get("logic_feedback_has_answer_edit", False)
+                            logic_feedback_info.get(
+                                "logic_feedback_has_reason_edit", False
+                            )
                         ),
                         "logic_verifier_prompt_text": logic_prompt_text,
                         "logic_verifier_output_text": logic_output_text,
@@ -663,24 +729,42 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
                         "call_index": int(answer_call_index),
                         "answer_prompt_text": rewrite_prompt_text,
                         "answer_output_text": current_answer_output,
-                        "answer_solution_str": current_answer_aux_record["answer_solution_str"],
+                        "answer_solution_str": current_answer_aux_record[
+                            "answer_solution_str"
+                        ],
                     }
                 )
 
             final_answer_call = current_answer_aux_record
-            sttv_answer_aux_call = dict(final_answer_call) if isinstance(final_answer_call, dict) else None
+            sttv_answer_aux_call = (
+                dict(final_answer_call) if isinstance(final_answer_call, dict) else None
+            )
 
             if validate_mode and isinstance(final_answer_call, dict):
-                final_output_token_ids = list(final_answer_call.get("answer_output_token_ids", []) or [])
-                final_output_log_probs_raw = list(final_answer_call.get("answer_output_log_probs", []) or [])
+                final_output_token_ids = list(
+                    final_answer_call.get("answer_output_token_ids", []) or []
+                )
+                final_output_log_probs_raw = list(
+                    final_answer_call.get("answer_output_log_probs", []) or []
+                )
                 final_output_log_probs = [
-                    float(x) if isinstance(x, (int, float)) else 0.0 for x in final_output_log_probs_raw
+                    float(x) if isinstance(x, (int, float)) else 0.0
+                    for x in final_output_log_probs_raw
                 ]
-                final_output_text = str(final_answer_call.get("answer_output_text", "") or "")
+                final_output_text = str(
+                    final_answer_call.get("answer_output_text", "") or ""
+                )
                 total_generated_tokens += len(final_output_token_ids)
                 assistant_turns += 1
-                _append_assistant_turn(final_output_text, final_output_token_ids, final_output_log_probs)
+                _append_assistant_turn(
+                    final_output_text, final_output_token_ids, final_output_log_probs
+                )
                 if self.agent_loop_cpu_cleanup_enable and final_output_token_ids:
                     model_prompt_ids.extend(final_output_token_ids)
-                messages.append({"role": "assistant", "content": [{"type": "text", "text": final_output_text}]})
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": final_output_text}],
+                    }
+                )
             return _return_output()

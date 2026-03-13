@@ -1517,9 +1517,6 @@ class RayPPOTrainer:
                         "logic_feedback_has_reason_edit": bool(
                             call.get("logic_feedback_has_reason_edit", False)
                         ),
-                        "logic_feedback_has_answer_edit": bool(
-                            call.get("logic_feedback_has_answer_edit", False)
-                        ),
                     }
                 )
             answer_logic_verifier_calls_compact.append(compact_rows)
@@ -1588,9 +1585,6 @@ class RayPPOTrainer:
                         ),
                         "logic_feedback_has_reason_edit": bool(
                             call.get("logic_feedback_has_reason_edit", False)
-                        ),
-                        "logic_feedback_has_answer_edit": bool(
-                            call.get("logic_feedback_has_answer_edit", False)
                         ),
                         "logic_reward": _as_float(call.get("sttv_answer_logic_verifier_reward", 0.0)),
                         "logic_reward_raw": _as_float(call.get("sttv_answer_logic_verifier_reward_raw", 0.0)),
@@ -1824,7 +1818,6 @@ class RayPPOTrainer:
             parse_valid_col = []
             feedback_valid_col = []
             has_reason_edit_col = []
-            has_answer_edit_col = []
             high_score_unchanged_bonus_col = []
             for sample_idx in range(batch_size):
                 entry = answer_logic_component_maps[sample_idx].get(round_index)
@@ -1846,9 +1839,6 @@ class RayPPOTrainer:
                 has_reason_edit_col.append(
                     None if entry is None else bool(entry.get("logic_feedback_has_reason_edit", False))
                 )
-                has_answer_edit_col.append(
-                    None if entry is None else bool(entry.get("logic_feedback_has_answer_edit", False))
-                )
                 high_score_unchanged_bonus_col.append(
                     None if entry is None else bool(entry.get("logic_high_score_unchanged_bonus", False))
                 )
@@ -1868,9 +1858,6 @@ class RayPPOTrainer:
             )
             per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_has_reason_edit"] = (
                 has_reason_edit_col
-            )
-            per_step_columns[f"sttv_answer_logic_verifier_round_{round_label}_has_answer_edit"] = (
-                has_answer_edit_col
             )
             per_step_columns[
                 f"sttv_answer_logic_verifier_round_{round_label}_high_score_unchanged_bonus"
