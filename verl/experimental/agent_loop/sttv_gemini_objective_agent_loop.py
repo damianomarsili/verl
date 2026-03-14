@@ -43,13 +43,15 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
     def __init__(
         self,
         *args: Any,
+        loc_verifier_rounds: int = 1,
         logic_verifier_rounds: int = 1,
         logic_verifier_max_new_tokens: int = 96,
         logic_self_verifier_prompt_path: Optional[str] = None,
         gemini_logic_teacher_prompt_path: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
-        super().__init__(*args, **kwargs)
+        super().__init__(*args, loc_verifier_rounds=loc_verifier_rounds, **kwargs)
+        self.loc_verifier_rounds = max(0, int(loc_verifier_rounds))
         del logic_verifier_rounds
         self.logic_verifier_rounds = 1
         self.logic_verifier_max_new_tokens = int(logic_verifier_max_new_tokens)
