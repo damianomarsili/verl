@@ -369,8 +369,18 @@ class TaskRunner:
             num_examine=0,
             **config.reward_model.get("reward_kwargs", {}),
         )
+
+        val_reward_config = config
+        val_custom_reward_cfg = config.get("val_custom_reward_function", None)
+        if val_custom_reward_cfg is not None:
+            val_reward_config = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
+            val_reward_config.custom_reward_function = OmegaConf.create(
+                OmegaConf.to_container(val_custom_reward_cfg, resolve=True)
+            )
+            print("Using val_custom_reward_function override for validation reward manager.")
+
         val_reward_fn = load_reward_manager(
-            config,
+            val_reward_config,
             tokenizer,
             num_examine=1,
             **config.reward_model.get("reward_kwargs", {}),

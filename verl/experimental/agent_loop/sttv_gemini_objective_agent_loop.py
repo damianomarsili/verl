@@ -595,22 +595,18 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
                 break
 
             loc_payloads = self._extract_bbox_2d_payloads(chunk)
-            if len(loc_payloads) == 0:
-                break
-            if len(loc_payloads) > 1:
-                metrics["sttv_loc_multi_bbox_payload_chunks"] = (
-                    float(metrics.get("sttv_loc_multi_bbox_payload_chunks", 0.0)) + 1.0
-                )
-            loc_payload = loc_payloads[-1]
+            if len(loc_payloads) != 1:
+                return _return_output()
+            loc_payload = loc_payloads[0]
 
             if self._has_missing_label(loc_payload):
-                break
+                return _return_output()
 
             entries = self._parse_bbox_2d_entries(loc_payload)
             if not entries:
-                break
+                return _return_output()
             if self._has_invalid_box(entries):
-                break
+                return _return_output()
 
             current_entries = entries
             for verifier_round in range(self.loc_verifier_rounds):
@@ -738,13 +734,9 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
                 )
 
                 corrected_payloads = self._extract_bbox_2d_payloads(correction_chunk)
-                if len(corrected_payloads) == 0:
+                if len(corrected_payloads) != 1:
                     continue
-                if len(corrected_payloads) > 1:
-                    metrics["sttv_loc_multi_bbox_payload_corrections"] = (
-                        float(metrics.get("sttv_loc_multi_bbox_payload_corrections", 0.0)) + 1.0
-                    )
-                corrected_payload = corrected_payloads[-1]
+                corrected_payload = corrected_payloads[0]
                 if self._has_missing_label(corrected_payload):
                     continue
                 corrected_entries = self._parse_bbox_2d_entries(corrected_payload)
@@ -890,6 +882,12 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
             global_steps=global_steps,
             validate_mode=validate_mode,
         )
+        force_logic_reward_invalid = False
+        if not validate_mode and teacher_judgment_failed:
+            force_logic_reward_invalid = True
+            if edit_source == "teacher":
+                edit_source = "self"
+
         if edit_source == "self":
             selected_feedback = self_feedback
             selected_feedback_info = self_feedback_info
@@ -909,7 +907,8 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
             "logic_feedback_parse_valid": bool(self_parse_valid),
             "logic_feedback_valid_for_reward": bool(
                 self_feedback_info.get("logic_feedback_valid_for_reward", False)
-            ),
+            )
+            and not force_logic_reward_invalid,
             "logic_feedback_has_reason_edit": bool(
                 self_feedback_info.get("logic_feedback_has_reason_edit", False)
             ),
