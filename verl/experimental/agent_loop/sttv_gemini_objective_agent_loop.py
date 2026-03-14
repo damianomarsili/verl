@@ -594,9 +594,13 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
                 return _return_output()
 
             loc_payloads = self._extract_bbox_2d_payloads(chunk)
-            if len(loc_payloads) != 1:
+            if len(loc_payloads) == 0:
                 return _return_output()
-            loc_payload = loc_payloads[0]
+            if len(loc_payloads) > 1:
+                metrics["sttv_loc_multi_bbox_payload_chunks"] = (
+                    float(metrics.get("sttv_loc_multi_bbox_payload_chunks", 0.0)) + 1.0
+                )
+            loc_payload = loc_payloads[-1]
 
             if self._has_missing_label(loc_payload):
                 return _return_output()
@@ -733,9 +737,13 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
                 )
 
                 corrected_payloads = self._extract_bbox_2d_payloads(correction_chunk)
-                if len(corrected_payloads) != 1:
+                if len(corrected_payloads) == 0:
                     continue
-                corrected_payload = corrected_payloads[0]
+                if len(corrected_payloads) > 1:
+                    metrics["sttv_loc_multi_bbox_payload_corrections"] = (
+                        float(metrics.get("sttv_loc_multi_bbox_payload_corrections", 0.0)) + 1.0
+                    )
+                corrected_payload = corrected_payloads[-1]
                 if self._has_missing_label(corrected_payload):
                     continue
                 corrected_entries = self._parse_bbox_2d_entries(corrected_payload)

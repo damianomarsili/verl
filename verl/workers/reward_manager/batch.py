@@ -56,6 +56,12 @@ class BatchRewardManager(AbstractRewardManager):
         prompt_len = prompt_ids.shape[-1]
         valid_response_lengths = attention_mask[:, prompt_len:].sum(dim=-1)
 
+        answer_aux_calls_raw = data.non_tensor_batch.get("sttv_answer_aux_call", None)
+        if answer_aux_calls_raw is not None and hasattr(answer_aux_calls_raw, "tolist"):
+            answer_aux_calls_raw = answer_aux_calls_raw.tolist()
+        if not isinstance(answer_aux_calls_raw, (list, tuple)):
+            answer_aux_calls_raw = [None] * len(data)
+
         responses_str = []
         for i in range(len(data)):
             if response_mask is not None and tuple(response_mask.shape) == tuple(response_ids.shape):
@@ -64,6 +70,12 @@ class BatchRewardManager(AbstractRewardManager):
                 valid_len = valid_response_lengths[i]
                 valid_response_ids = response_ids[i][:valid_len]
             response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+            if i < len(answer_aux_calls_raw):
+                call_record = answer_aux_calls_raw[i]
+                if isinstance(call_record, dict):
+                    aux_solution = str(call_record.get("answer_solution_str", "") or "").strip()
+                    if aux_solution:
+                        response_str = aux_solution
             responses_str.append(response_str)
 
         ground_truths = [item.non_tensor_batch["reward_model"].get("ground_truth", None) for item in data]

@@ -4179,6 +4179,10 @@ class RayPPOTrainer:
         sample_answer_aux_prompts = []
         sample_answer_aux_outputs = []
         sample_answer_aux_calls = []
+        sample_logic_verifier_prompts = []
+        sample_logic_verifier_outputs = []
+        sample_logic_selected_feedbacks = []
+        sample_logic_edit_sources = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -4255,6 +4259,24 @@ class RayPPOTrainer:
                     )
                 else:
                     sample_answer_aux_calls.append("")
+            logic_calls_raw = test_output_gen_batch.non_tensor_batch.get("sttv_answer_logic_verifier_calls", None)
+            if isinstance(logic_calls_raw, np.ndarray):
+                logic_calls = logic_calls_raw.tolist()
+            elif isinstance(logic_calls_raw, list):
+                logic_calls = logic_calls_raw
+            else:
+                logic_calls = []
+            for sample_idx in range(len(output_texts)):
+                sample_calls = logic_calls[sample_idx] if sample_idx < len(logic_calls) else None
+                first_call = (
+                    sample_calls[0]
+                    if isinstance(sample_calls, (list, tuple)) and len(sample_calls) > 0 and isinstance(sample_calls[0], dict)
+                    else {}
+                )
+                sample_logic_verifier_prompts.append(str(first_call.get("logic_verifier_prompt_text", "") or ""))
+                sample_logic_verifier_outputs.append(str(first_call.get("logic_verifier_output_text", "") or ""))
+                sample_logic_selected_feedbacks.append(str(first_call.get("logic_selected_feedback", "") or ""))
+                sample_logic_edit_sources.append(str(first_call.get("logic_edit_source", "") or ""))
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
@@ -4301,6 +4323,10 @@ class RayPPOTrainer:
             "sttv_answer_aux_final_answer": [
                 self._extract_final_answer(str(output_text or "")) for output_text in sample_answer_aux_outputs
             ],
+            "sttv_logic_verifier_prompt": sample_logic_verifier_prompts,
+            "sttv_logic_verifier_output": sample_logic_verifier_outputs,
+            "sttv_logic_selected_feedback": sample_logic_selected_feedbacks,
+            "sttv_logic_edit_source": sample_logic_edit_sources,
         }
         for key in (
             "gemini_verdict",
