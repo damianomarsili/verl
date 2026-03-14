@@ -552,9 +552,10 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
                 },
             )
 
+        current_entries: list[Any] = []
         while True:
             if len(response_mask) >= self.response_length:
-                return _return_output()
+                break
 
             if self.agent_loop_cpu_cleanup_enable:
                 chunk, token_ids, log_probs = (
@@ -577,7 +578,7 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
                     metrics=metrics,
                 )
             if not token_ids and not chunk.strip():
-                return _return_output()
+                break
 
             total_generated_tokens += len(token_ids)
             assistant_turns += 1
@@ -589,13 +590,13 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
             )
 
             if total_generated_tokens >= max_total_tokens:
-                return _return_output()
+                break
             if "</answer>" in chunk:
-                return _return_output()
+                break
 
             loc_payloads = self._extract_bbox_2d_payloads(chunk)
             if len(loc_payloads) == 0:
-                return _return_output()
+                break
             if len(loc_payloads) > 1:
                 metrics["sttv_loc_multi_bbox_payload_chunks"] = (
                     float(metrics.get("sttv_loc_multi_bbox_payload_chunks", 0.0)) + 1.0
@@ -603,13 +604,13 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
             loc_payload = loc_payloads[-1]
 
             if self._has_missing_label(loc_payload):
-                return _return_output()
+                break
 
             entries = self._parse_bbox_2d_entries(loc_payload)
             if not entries:
-                return _return_output()
+                break
             if self._has_invalid_box(entries):
-                return _return_output()
+                break
 
             current_entries = entries
             for verifier_round in range(self.loc_verifier_rounds):
@@ -753,6 +754,20 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
                     continue
                 current_entries = corrected_entries
 
+            # Grounding stage for this variant is a single initial bbox call
+            # followed by verifier refinements, then answer compaction.
+            break
+
+        # Best-effort recovery: if grounding parsing failed to update current_entries,
+        # use the last parsable bbox block from generated text so answer compaction
+        # still has a concrete detection context.
+        if len(current_entries) == 0:
+            fallback_payloads = self._extract_bbox_2d_payloads("".join(output_chunks))
+            if len(fallback_payloads) > 0:
+                fallback_entries = self._parse_bbox_2d_entries(fallback_payloads[-1])
+                if fallback_entries and not self._has_invalid_box(fallback_entries):
+                    current_entries = fallback_entries
+
         latest_bbox_block = self._format_bbox_block(current_entries)
         gemini_images = raw_images_rgb if raw_images_rgb else images
 
@@ -881,6 +896,11 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
         else:
             selected_feedback = teacher_feedback
             selected_feedback_info = teacher_feedback_info
+        if validate_mode and not str(selected_feedback or "").strip():
+            selected_feedback = (
+                "No valid self-verifier feedback was produced. "
+                "Re-emit the current answer unchanged."
+            )
 
         logic_call_record = {
             "round_index": 0,

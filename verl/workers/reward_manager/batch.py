@@ -15,6 +15,7 @@
 from collections import defaultdict
 from typing import Any
 
+import numpy as np
 import torch
 
 from verl import DataProto
@@ -72,6 +73,15 @@ class BatchRewardManager(AbstractRewardManager):
             response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
             if i < len(answer_aux_calls_raw):
                 call_record = answer_aux_calls_raw[i]
+                # Be permissive with object-array nesting so aux answer override
+                # works across different DataProto packing paths.
+                if isinstance(call_record, np.ndarray):
+                    if call_record.shape == ():
+                        call_record = call_record.item()
+                    elif call_record.size == 1:
+                        call_record = call_record.reshape(-1)[0]
+                if isinstance(call_record, list) and len(call_record) == 1 and isinstance(call_record[0], dict):
+                    call_record = call_record[0]
                 if isinstance(call_record, dict):
                     aux_solution = str(call_record.get("answer_solution_str", "") or "").strip()
                     if aux_solution:
