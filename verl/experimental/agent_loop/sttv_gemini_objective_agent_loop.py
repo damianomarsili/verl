@@ -745,73 +745,90 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
                     continue
                 current_entries = corrected_entries
 
-            latest_bbox_block = self._format_bbox_block(current_entries)
-            gemini_images = raw_images_rgb if raw_images_rgb else images
+        latest_bbox_block = self._format_bbox_block(current_entries)
+        gemini_images = raw_images_rgb if raw_images_rgb else images
 
-            # Initial compacted answer call.
-            (
-                answer_prompt_text,
-                answer_output_text,
-                answer_prompt_token_ids,
-                answer_output_token_ids,
-                answer_output_log_probs,
-                answer_images,
-                answer_multi_modal_inputs,
-            ) = await self._build_answer_aux_messages(
-                images=images,
-                query=query,
-                latest_bbox_block=latest_bbox_block,
-                sampling_params=sampling_params,
-                metrics=metrics,
-            )
+        # Initial compacted answer call.
+        (
+            answer_prompt_text,
+            answer_output_text,
+            answer_prompt_token_ids,
+            answer_output_token_ids,
+            answer_output_log_probs,
+            answer_images,
+            answer_multi_modal_inputs,
+        ) = await self._build_answer_aux_messages(
+            images=images,
+            query=query,
+            latest_bbox_block=latest_bbox_block,
+            sampling_params=sampling_params,
+            metrics=metrics,
+        )
 
-            current_answer_output = str(answer_output_text or "")
-            answer_call_index = 0
-            current_answer_aux_record: dict[str, Any] = {
+        current_answer_output = str(answer_output_text or "")
+        answer_call_index = 0
+        current_answer_aux_record: dict[str, Any] = {
+            "call_index": int(answer_call_index),
+            "answer_prompt_text": answer_prompt_text,
+            "answer_output_text": current_answer_output,
+            "answer_prompt_token_ids": answer_prompt_token_ids,
+            "answer_output_token_ids": answer_output_token_ids,
+            "answer_output_log_probs": answer_output_log_probs,
+            "answer_images": answer_images,
+            "answer_multi_modal_inputs": answer_multi_modal_inputs,
+            "answer_latest_bbox_block": latest_bbox_block,
+            "answer_solution_str": f"{latest_bbox_block}\n{current_answer_output}",
+        }
+        sttv_answer_calls.append(
+            {
                 "call_index": int(answer_call_index),
                 "answer_prompt_text": answer_prompt_text,
                 "answer_output_text": current_answer_output,
-                "answer_prompt_token_ids": answer_prompt_token_ids,
-                "answer_output_token_ids": answer_output_token_ids,
-                "answer_output_log_probs": answer_output_log_probs,
-                "answer_images": answer_images,
-                "answer_multi_modal_inputs": answer_multi_modal_inputs,
-                "answer_latest_bbox_block": latest_bbox_block,
-                "answer_solution_str": f"{latest_bbox_block}\n{current_answer_output}",
+                "answer_solution_str": current_answer_aux_record[
+                    "answer_solution_str"
+                ],
             }
-            sttv_answer_calls.append(
-                {
-                    "call_index": int(answer_call_index),
-                    "answer_prompt_text": answer_prompt_text,
-                    "answer_output_text": current_answer_output,
-                    "answer_solution_str": current_answer_aux_record[
-                        "answer_solution_str"
-                    ],
-                }
-            )
+        )
 
-            logic_prompt_text = self._build_logic_self_verifier_prompt(
-                query, latest_bbox_block, current_answer_output
+        logic_prompt_text = self._build_logic_self_verifier_prompt(
+            query, latest_bbox_block, current_answer_output
+        )
+        (
+            logic_output_text,
+            logic_prompt_token_ids,
+            logic_output_token_ids,
+            logic_output_log_probs,
+            logic_images,
+            logic_multi_modal_inputs,
+        ) = await self._build_logic_verifier_messages(
+            images=images,
+            prompt=logic_prompt_text,
+            generate_logprobs=bool(sampling_params.get("logprobs", False)),
+            metrics=metrics,
+        )
+        self_feedback, self_parse_valid, self_feedback_info = (
+            self._parse_logic_step_edits_optional(
+                logic_output_text, current_answer_output
             )
-            (
-                logic_output_text,
-                logic_prompt_token_ids,
-                logic_output_token_ids,
-                logic_output_log_probs,
-                logic_images,
-                logic_multi_modal_inputs,
-            ) = await self._build_logic_verifier_messages(
-                images=images,
-                prompt=logic_prompt_text,
-                generate_logprobs=bool(sampling_params.get("logprobs", False)),
-                metrics=metrics,
-            )
-            self_feedback, self_parse_valid, self_feedback_info = (
-                self._parse_logic_step_edits_optional(
-                    logic_output_text, current_answer_output
-                )
-            )
+        )
 
+        if validate_mode:
+            teacher_judgment: dict[str, Any] = {}
+            logic_teacher_time_s = 0.0
+            teacher_output_text = ""
+            teacher_feedback = ""
+            teacher_parse_valid = True
+            teacher_feedback_info = {
+                "logic_feedback_has_effect": False,
+                "logic_feedback_valid_for_reward": True,
+                "logic_feedback_has_reason_edit": False,
+                "logic_feedback_num_step_edits": 0,
+                "logic_feedback_step_indices": [],
+            }
+            current_answer_score = 0.0
+            self_edit_score = 0.0
+            self_edit_reason = ""
+        else:
             t_logic_teacher_start = time.perf_counter()
             teacher_judgment = await self._request_gemini_logic_teacher_judgment(
                 query=query,
@@ -823,7 +840,9 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
             teacher_edits_raw = teacher_judgment.get("teacher_edits", [])
             if isinstance(teacher_edits_raw, (list, tuple)):
                 teacher_output_text = "\n".join(
-                    str(line or "").strip() for line in teacher_edits_raw if str(line or "").strip()
+                    str(line or "").strip()
+                    for line in teacher_edits_raw
+                    if str(line or "").strip()
                 )
             else:
                 teacher_output_text = str(teacher_edits_raw or "").strip()
@@ -842,107 +861,113 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
                 teacher_judgment.get("self_edit_reason", "") or ""
             ).strip()
 
-            edit_source = self._choose_logic_edit_source(
-                uid=uid,
-                global_steps=global_steps,
-                validate_mode=validate_mode,
+        edit_source = self._choose_logic_edit_source(
+            uid=uid,
+            global_steps=global_steps,
+            validate_mode=validate_mode,
+        )
+        if edit_source == "self":
+            selected_feedback = self_feedback
+            selected_feedback_info = self_feedback_info
+        else:
+            selected_feedback = teacher_feedback
+            selected_feedback_info = teacher_feedback_info
+
+        logic_call_record = {
+            "round_index": 0,
+            "answer_call_index": int(answer_call_index),
+            "logic_feedback": str(self_feedback),
+            "logic_feedback_parse_valid": bool(self_parse_valid),
+            "logic_feedback_valid_for_reward": bool(
+                self_feedback_info.get("logic_feedback_valid_for_reward", False)
+            ),
+            "logic_feedback_has_reason_edit": bool(
+                self_feedback_info.get("logic_feedback_has_reason_edit", False)
+            ),
+            "logic_feedback_num_step_edits": int(
+                self_feedback_info.get("logic_feedback_num_step_edits", 0)
+            ),
+            "logic_feedback_step_indices": list(
+                self_feedback_info.get("logic_feedback_step_indices", [])
+            ),
+            "logic_verifier_prompt_text": logic_prompt_text,
+            "logic_verifier_output_text": logic_output_text,
+            "logic_verifier_prompt_token_ids": logic_prompt_token_ids,
+            "logic_verifier_output_token_ids": logic_output_token_ids,
+            "logic_verifier_output_log_probs": logic_output_log_probs,
+            "logic_verifier_images": logic_images,
+            "logic_verifier_multi_modal_inputs": logic_multi_modal_inputs,
+            "logic_teacher_output_text": teacher_output_text,
+            "logic_teacher_output_raw_text": str(
+                teacher_judgment.get("raw_text", "") or ""
+            ),
+            "logic_teacher_time_s": float(logic_teacher_time_s),
+            "logic_teacher_skipped_validate": bool(validate_mode),
+            "logic_teacher_feedback": str(teacher_feedback),
+            "logic_teacher_parse_valid": bool(teacher_parse_valid),
+            "logic_teacher_num_step_edits": int(
+                teacher_feedback_info.get("logic_feedback_num_step_edits", 0)
+            ),
+            "logic_teacher_step_indices": list(
+                teacher_feedback_info.get("logic_feedback_step_indices", [])
+            ),
+            "logic_edit_source": str(edit_source),
+            "logic_selected_feedback": str(selected_feedback),
+            "logic_selected_num_step_edits": int(
+                selected_feedback_info.get("logic_feedback_num_step_edits", 0)
+            ),
+            "sttv_answer_logic_verifier_self_edit_score": float(self_edit_score),
+            "sttv_answer_logic_verifier_self_edit_reason": self_edit_reason,
+            "sttv_answer_logic_verifier_current_answer_score": float(current_answer_score),
+            "sttv_answer_logic_verifier_final_answer_score": float(current_answer_score),
+            "sttv_answer_logic_verifier_rewrite_skipped_no_edits": False,
+        }
+        sttv_answer_logic_verifier_calls.append(logic_call_record)
+
+        final_answer_call = dict(current_answer_aux_record)
+        final_answer_score = float(current_answer_score)
+        rewrite_skipped_no_edits = not bool(selected_feedback.strip())
+        if rewrite_skipped_no_edits:
+            final_answer_call["answer_reward_override"] = float(current_answer_score)
+            final_answer_call["answer_gemini_score_time_s"] = 0.0
+        else:
+            (
+                rewrite_prompt_text,
+                rewrite_output_text,
+                rewrite_prompt_token_ids,
+                rewrite_output_token_ids,
+                rewrite_output_log_probs,
+                rewrite_images,
+                rewrite_multi_modal_inputs,
+            ) = await self._build_answer_rewrite_aux_messages(
+                images=images,
+                query=query,
+                latest_bbox_block=latest_bbox_block,
+                current_answer_output=current_answer_output,
+                logic_feedback=selected_feedback,
+                sampling_params=sampling_params,
+                metrics=metrics,
             )
-            if edit_source == "self":
-                selected_feedback = self_feedback
-                selected_feedback_info = self_feedback_info
-            else:
-                selected_feedback = teacher_feedback
-                selected_feedback_info = teacher_feedback_info
 
-            logic_call_record = {
-                "round_index": 0,
-                "answer_call_index": int(answer_call_index),
-                "logic_feedback": str(self_feedback),
-                "logic_feedback_parse_valid": bool(self_parse_valid),
-                "logic_feedback_valid_for_reward": bool(
-                    self_feedback_info.get("logic_feedback_valid_for_reward", False)
-                ),
-                "logic_feedback_has_reason_edit": bool(
-                    self_feedback_info.get("logic_feedback_has_reason_edit", False)
-                ),
-                "logic_feedback_num_step_edits": int(
-                    self_feedback_info.get("logic_feedback_num_step_edits", 0)
-                ),
-                "logic_feedback_step_indices": list(
-                    self_feedback_info.get("logic_feedback_step_indices", [])
-                ),
-                "logic_verifier_prompt_text": logic_prompt_text,
-                "logic_verifier_output_text": logic_output_text,
-                "logic_verifier_prompt_token_ids": logic_prompt_token_ids,
-                "logic_verifier_output_token_ids": logic_output_token_ids,
-                "logic_verifier_output_log_probs": logic_output_log_probs,
-                "logic_verifier_images": logic_images,
-                "logic_verifier_multi_modal_inputs": logic_multi_modal_inputs,
-                "logic_teacher_output_text": teacher_output_text,
-                "logic_teacher_output_raw_text": str(
-                    teacher_judgment.get("raw_text", "") or ""
-                ),
-                "logic_teacher_time_s": float(logic_teacher_time_s),
-                "logic_teacher_feedback": str(teacher_feedback),
-                "logic_teacher_parse_valid": bool(teacher_parse_valid),
-                "logic_teacher_num_step_edits": int(
-                    teacher_feedback_info.get("logic_feedback_num_step_edits", 0)
-                ),
-                "logic_teacher_step_indices": list(
-                    teacher_feedback_info.get("logic_feedback_step_indices", [])
-                ),
-                "logic_edit_source": str(edit_source),
-                "logic_selected_feedback": str(selected_feedback),
-                "logic_selected_num_step_edits": int(
-                    selected_feedback_info.get("logic_feedback_num_step_edits", 0)
-                ),
-                "sttv_answer_logic_verifier_self_edit_score": float(self_edit_score),
-                "sttv_answer_logic_verifier_self_edit_reason": self_edit_reason,
-                "sttv_answer_logic_verifier_current_answer_score": float(current_answer_score),
-                "sttv_answer_logic_verifier_final_answer_score": float(current_answer_score),
-                "sttv_answer_logic_verifier_rewrite_skipped_no_edits": False,
+            answer_call_index += 1
+            current_answer_output = str(rewrite_output_text or "")
+            final_answer_call = {
+                "call_index": int(answer_call_index),
+                "answer_prompt_text": rewrite_prompt_text,
+                "answer_output_text": current_answer_output,
+                "answer_prompt_token_ids": rewrite_prompt_token_ids,
+                "answer_output_token_ids": rewrite_output_token_ids,
+                "answer_output_log_probs": rewrite_output_log_probs,
+                "answer_images": rewrite_images,
+                "answer_multi_modal_inputs": rewrite_multi_modal_inputs,
+                "answer_latest_bbox_block": latest_bbox_block,
+                "answer_solution_str": f"{latest_bbox_block}\n{current_answer_output}",
             }
-            sttv_answer_logic_verifier_calls.append(logic_call_record)
-
-            final_answer_call = dict(current_answer_aux_record)
-            final_answer_score = float(current_answer_score)
-            rewrite_skipped_no_edits = not bool(selected_feedback.strip())
-            if rewrite_skipped_no_edits:
-                final_answer_call["answer_reward_override"] = float(current_answer_score)
+            if validate_mode:
+                final_answer_score = 0.0
+                final_answer_call["answer_reward_override"] = 0.0
                 final_answer_call["answer_gemini_score_time_s"] = 0.0
             else:
-                (
-                    rewrite_prompt_text,
-                    rewrite_output_text,
-                    rewrite_prompt_token_ids,
-                    rewrite_output_token_ids,
-                    rewrite_output_log_probs,
-                    rewrite_images,
-                    rewrite_multi_modal_inputs,
-                ) = await self._build_answer_rewrite_aux_messages(
-                    images=images,
-                    query=query,
-                    latest_bbox_block=latest_bbox_block,
-                    current_answer_output=current_answer_output,
-                    logic_feedback=selected_feedback,
-                    sampling_params=sampling_params,
-                    metrics=metrics,
-                )
-
-                answer_call_index += 1
-                current_answer_output = str(rewrite_output_text or "")
-                final_answer_call = {
-                    "call_index": int(answer_call_index),
-                    "answer_prompt_text": rewrite_prompt_text,
-                    "answer_output_text": current_answer_output,
-                    "answer_prompt_token_ids": rewrite_prompt_token_ids,
-                    "answer_output_token_ids": rewrite_output_token_ids,
-                    "answer_output_log_probs": rewrite_output_log_probs,
-                    "answer_images": rewrite_images,
-                    "answer_multi_modal_inputs": rewrite_multi_modal_inputs,
-                    "answer_latest_bbox_block": latest_bbox_block,
-                    "answer_solution_str": f"{latest_bbox_block}\n{current_answer_output}",
-                }
                 t_answer_grade_start = time.perf_counter()
                 final_answer_judgment = await self._request_gemini_answer_score(
                     query=query,
@@ -959,66 +984,67 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
                 final_answer_call["answer_gemini_score_time_s"] = float(
                     answer_gemini_score_time_s
                 )
-                sttv_answer_calls.append(
-                    {
-                        "call_index": int(answer_call_index),
-                        "answer_prompt_text": rewrite_prompt_text,
-                        "answer_output_text": current_answer_output,
-                        "answer_solution_str": final_answer_call["answer_solution_str"],
-                    }
-                )
-
-            final_answer_call["answer_reward_override"] = float(final_answer_score)
-            if "answer_gemini_score_time_s" not in final_answer_call:
-                final_answer_call["answer_gemini_score_time_s"] = 0.0
-            final_answer_call["gemini_total_time_s"] = float(
-                logic_teacher_time_s + float(final_answer_call.get("answer_gemini_score_time_s", 0.0) or 0.0)
-            )
-            logic_call_record["sttv_answer_logic_verifier_final_answer_score"] = float(
-                final_answer_score
-            )
-            logic_call_record["sttv_answer_logic_verifier_rewrite_skipped_no_edits"] = bool(
-                rewrite_skipped_no_edits
-            )
-            logic_call_record["sttv_answer_logic_verifier_logic_teacher_time_s"] = float(
-                logic_teacher_time_s
-            )
-            logic_call_record["sttv_answer_logic_verifier_answer_gemini_score_time_s"] = float(
-                final_answer_call.get("answer_gemini_score_time_s", 0.0) or 0.0
-            )
-            logic_call_record["sttv_answer_logic_verifier_gemini_total_time_s"] = float(
-                final_answer_call.get("gemini_total_time_s", 0.0) or 0.0
+            sttv_answer_calls.append(
+                {
+                    "call_index": int(answer_call_index),
+                    "answer_prompt_text": rewrite_prompt_text,
+                    "answer_output_text": current_answer_output,
+                    "answer_solution_str": final_answer_call["answer_solution_str"],
+                }
             )
 
-            sttv_answer_aux_call = (
-                dict(final_answer_call) if isinstance(final_answer_call, dict) else None
-            )
+        final_answer_call["answer_reward_override"] = float(final_answer_score)
+        if "answer_gemini_score_time_s" not in final_answer_call:
+            final_answer_call["answer_gemini_score_time_s"] = 0.0
+        final_answer_call["gemini_total_time_s"] = float(
+            logic_teacher_time_s
+            + float(final_answer_call.get("answer_gemini_score_time_s", 0.0) or 0.0)
+        )
+        logic_call_record["sttv_answer_logic_verifier_final_answer_score"] = float(
+            final_answer_score
+        )
+        logic_call_record["sttv_answer_logic_verifier_rewrite_skipped_no_edits"] = bool(
+            rewrite_skipped_no_edits
+        )
+        logic_call_record["sttv_answer_logic_verifier_logic_teacher_time_s"] = float(
+            logic_teacher_time_s
+        )
+        logic_call_record["sttv_answer_logic_verifier_answer_gemini_score_time_s"] = float(
+            final_answer_call.get("answer_gemini_score_time_s", 0.0) or 0.0
+        )
+        logic_call_record["sttv_answer_logic_verifier_gemini_total_time_s"] = float(
+            final_answer_call.get("gemini_total_time_s", 0.0) or 0.0
+        )
 
-            if validate_mode and isinstance(final_answer_call, dict):
-                final_output_token_ids = list(
-                    final_answer_call.get("answer_output_token_ids", []) or []
-                )
-                final_output_log_probs_raw = list(
-                    final_answer_call.get("answer_output_log_probs", []) or []
-                )
-                final_output_log_probs = [
-                    float(x) if isinstance(x, (int, float)) else 0.0
-                    for x in final_output_log_probs_raw
-                ]
-                final_output_text = str(
-                    final_answer_call.get("answer_output_text", "") or ""
-                )
-                total_generated_tokens += len(final_output_token_ids)
-                assistant_turns += 1
-                _append_assistant_turn(
-                    final_output_text, final_output_token_ids, final_output_log_probs
-                )
-                if self.agent_loop_cpu_cleanup_enable and final_output_token_ids:
-                    model_prompt_ids.extend(final_output_token_ids)
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": final_output_text}],
-                    }
-                )
-            return _return_output()
+        sttv_answer_aux_call = (
+            dict(final_answer_call) if isinstance(final_answer_call, dict) else None
+        )
+
+        if validate_mode and isinstance(final_answer_call, dict):
+            final_output_token_ids = list(
+                final_answer_call.get("answer_output_token_ids", []) or []
+            )
+            final_output_log_probs_raw = list(
+                final_answer_call.get("answer_output_log_probs", []) or []
+            )
+            final_output_log_probs = [
+                float(x) if isinstance(x, (int, float)) else 0.0
+                for x in final_output_log_probs_raw
+            ]
+            final_output_text = str(
+                final_answer_call.get("answer_output_text", "") or ""
+            )
+            total_generated_tokens += len(final_output_token_ids)
+            assistant_turns += 1
+            _append_assistant_turn(
+                final_output_text, final_output_token_ids, final_output_log_probs
+            )
+            if self.agent_loop_cpu_cleanup_enable and final_output_token_ids:
+                model_prompt_ids.extend(final_output_token_ids)
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": final_output_text}],
+                }
+            )
+        return _return_output()
