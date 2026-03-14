@@ -860,6 +860,7 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
             self_edit_reason = str(
                 teacher_judgment.get("self_edit_reason", "") or ""
             ).strip()
+        teacher_judgment_failed = bool(teacher_judgment.get("failed", False))
 
         edit_source = self._choose_logic_edit_source(
             uid=uid,
@@ -928,8 +929,33 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
         final_answer_score = float(current_answer_score)
         rewrite_skipped_no_edits = not bool(selected_feedback.strip())
         if rewrite_skipped_no_edits:
-            final_answer_call["answer_reward_override"] = float(current_answer_score)
-            final_answer_call["answer_gemini_score_time_s"] = 0.0
+            # Validation path: do not force zero override; let validation reward compute normally.
+            if validate_mode:
+                final_answer_score = 0.0
+                final_answer_call["answer_gemini_score_time_s"] = 0.0
+            # Training path: if teacher judgment is valid, reuse current score.
+            elif not teacher_judgment_failed:
+                final_answer_score = float(current_answer_score)
+                final_answer_call["answer_reward_override"] = float(current_answer_score)
+                final_answer_call["answer_gemini_score_time_s"] = 0.0
+            # Training fallback: teacher judgment failed, so grade the current answer directly.
+            else:
+                t_answer_grade_start = time.perf_counter()
+                final_answer_judgment = await self._request_gemini_answer_score(
+                    query=query,
+                    candidate_response=final_answer_call["answer_solution_str"],
+                    images=gemini_images,
+                )
+                answer_gemini_score_time_s = float(
+                    time.perf_counter() - t_answer_grade_start
+                )
+                final_answer_score = float(
+                    final_answer_judgment.get("score", 0.0) or 0.0
+                )
+                final_answer_call["answer_reward_override"] = float(final_answer_score)
+                final_answer_call["answer_gemini_score_time_s"] = float(
+                    answer_gemini_score_time_s
+                )
         else:
             (
                 rewrite_prompt_text,
@@ -965,7 +991,6 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
             }
             if validate_mode:
                 final_answer_score = 0.0
-                final_answer_call["answer_reward_override"] = 0.0
                 final_answer_call["answer_gemini_score_time_s"] = 0.0
             else:
                 t_answer_grade_start = time.perf_counter()
@@ -993,7 +1018,8 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
                 }
             )
 
-        final_answer_call["answer_reward_override"] = float(final_answer_score)
+        if not validate_mode:
+            final_answer_call["answer_reward_override"] = float(final_answer_score)
         if "answer_gemini_score_time_s" not in final_answer_call:
             final_answer_call["answer_gemini_score_time_s"] = 0.0
         final_answer_call["gemini_total_time_s"] = float(

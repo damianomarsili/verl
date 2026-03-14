@@ -2080,6 +2080,11 @@ class RayPPOTrainer:
                         flat.append(0.0)
                     else:
                         flat.append(float(list(value)[0]))
+                elif isinstance(value, dict):
+                    try:
+                        flat.append(float(value.get("score", 0.0)))
+                    except Exception:
+                        flat.append(0.0)
                 elif value is None:
                     flat.append(0.0)
                 else:
@@ -2088,10 +2093,16 @@ class RayPPOTrainer:
             if len(flat) < expected_len:
                 flat.extend([0.0] * (expected_len - len(flat)))
             return flat
-        try:
-            scalar = float(raw_rewards)
-        except Exception:
-            scalar = 0.0
+        if isinstance(raw_rewards, dict):
+            try:
+                scalar = float(raw_rewards.get("score", 0.0))
+            except Exception:
+                scalar = 0.0
+        else:
+            try:
+                scalar = float(raw_rewards)
+            except Exception:
+                scalar = 0.0
         return [scalar] * expected_len
 
     def _relocate_scalar_scores_to_mask(
@@ -4291,6 +4302,23 @@ class RayPPOTrainer:
                 self._extract_final_answer(str(output_text or "")) for output_text in sample_answer_aux_outputs
             ],
         }
+        for key in (
+            "gemini_verdict",
+            "gemini_reason",
+            "gemini_failed",
+            "gemini_error",
+            "gemini_raw_text",
+        ):
+            values = reward_extra_infos_dict.get(key, None)
+            if values is None:
+                continue
+            if isinstance(values, np.ndarray):
+                values = values.tolist()
+            elif not isinstance(values, list):
+                values = [values] * len(sample_scores)
+            if len(values) < len(sample_scores):
+                values = list(values) + [None] * (len(sample_scores) - len(values))
+            val_extra_columns[key] = values[: len(sample_scores)]
         self._maybe_log_sample_table(
             split="val",
             raw_prompts=sample_raw_prompts,

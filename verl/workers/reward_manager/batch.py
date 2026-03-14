@@ -70,17 +70,32 @@ class BatchRewardManager(AbstractRewardManager):
         data_sources = data.non_tensor_batch[self.reward_fn_key]
         rollout_reward_scores = data.non_tensor_batch.get("reward_scores", [{} for _ in range(len(data))])
         extras = data.non_tensor_batch.get("extra_info", [{} for _ in range(len(data))])
+        raw_prompts = data.non_tensor_batch.get("raw_prompt", None)
+        if raw_prompts is not None and hasattr(raw_prompts, "tolist"):
+            raw_prompts = raw_prompts.tolist()
 
         for i in range(len(data)):
             extras[i]["rollout_reward_scores"] = rollout_reward_scores[i]
 
-        scores = self.compute_score(
-            data_sources=data_sources,
-            solution_strs=responses_str,
-            ground_truths=ground_truths,
-            extra_infos=extras,
+        score_kwargs: dict[str, Any] = {
+            "data_sources": data_sources,
+            "solution_strs": responses_str,
+            "ground_truths": ground_truths,
+            "extra_infos": extras,
             **self.reward_kwargs,
-        )
+        }
+        if raw_prompts is not None:
+            score_kwargs["raw_prompts"] = raw_prompts
+
+        try:
+            scores = self.compute_score(**score_kwargs)
+        except TypeError as exc:
+            # Backward compatibility: older reward functions may not accept raw_prompts.
+            if "raw_prompts" in str(exc) and "raw_prompts" in score_kwargs:
+                score_kwargs.pop("raw_prompts", None)
+                scores = self.compute_score(**score_kwargs)
+            else:
+                raise
 
         return scores
 
