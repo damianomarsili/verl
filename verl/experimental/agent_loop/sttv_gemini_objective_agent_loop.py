@@ -242,6 +242,7 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
         latest_bbox_block: str,
         current_answer_output: str,
         proposed_self_edits: str,
+        images: list[Image.Image],
     ) -> dict[str, Any]:
         async with self.gemini_call_semaphore:
             return await asyncio.to_thread(
@@ -252,7 +253,7 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
                 detected_objects=latest_bbox_block,
                 current_answer=current_answer_output,
                 proposed_self_edits=proposed_self_edits,
-                images=[],
+                images=images,
             )
 
     async def _request_gemini_answer_score(
@@ -852,6 +853,7 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
                 latest_bbox_block=latest_bbox_block,
                 current_answer_output=current_answer_output,
                 proposed_self_edits=logic_output_text,
+                images=gemini_images,
             )
             logic_teacher_time_s = float(time.perf_counter() - t_logic_teacher_start)
             teacher_edits_raw = teacher_judgment.get("teacher_edits", [])
