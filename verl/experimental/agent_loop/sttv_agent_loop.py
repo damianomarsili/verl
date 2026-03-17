@@ -48,7 +48,7 @@ BBOX_2D_ENTRY_PATTERN = re.compile(
     flags=re.IGNORECASE,
 )
 VERIFIER_EDIT_PATTERN = re.compile(r"(?i)^EDIT\s+(?P<idx>\d+)\s*:\s*(?P<body>.+)$")
-VERIFIER_DISALLOWED_REMOVE_PATTERN = re.compile(r"(?i)^REMOVE\s+\d+\s*$")
+VERIFIER_REMOVE_PATTERN = re.compile(r"(?i)^REMOVE\s+(?P<idx>\d+)\s*$")
 VERIFIER_ADD_PATTERN = re.compile(
     r'(?i)^ADD\s+label\s*=\s*"(?P<label>[^"\n]+?)"\s*,\s*\['
     r"\s*(?P<x1>-?\d+(?:\.\d+)?)\s*,\s*(?P<y1>-?\d+(?:\.\d+)?)\s*,\s*"
@@ -457,6 +457,7 @@ class SttvAgentLoop(AgentLoopBase):
         cleaned = text.replace("<|im_end|>", "").strip()
         valid_indices = set(range(1, len(entries) + 1))
         index_actions: dict[int, tuple[str, int]] = {}
+        remove_actions: dict[int, tuple[str, int]] = {}
         raw_add_actions: list[tuple[str, int, tuple[str, float, float, float, float]]] = []
         line_order = 0
 
@@ -492,6 +493,9 @@ class SttvAgentLoop(AgentLoopBase):
 
         duplicate_add_existing_count = 0
         disallowed_remove_count = 0
+        invalid_remove_count = 0
+        remove_add_duplicate_count = 0
+        removed_signatures: set[tuple[str, float, float, float, float]] = set()
 
         for raw_line in cleaned.splitlines():
             line = raw_line.strip()
@@ -516,8 +520,30 @@ class SttvAgentLoop(AgentLoopBase):
                     line_order += 1
                 continue
 
-            if VERIFIER_DISALLOWED_REMOVE_PATTERN.match(line) is not None:
-                disallowed_remove_count += 1
+            remove_match = VERIFIER_REMOVE_PATTERN.match(line)
+            if remove_match is not None:
+                try:
+                    idx = int(remove_match.group("idx"))
+                except (TypeError, ValueError):
+                    invalid_remove_count += 1
+                    continue
+                if idx not in valid_indices:
+                    invalid_remove_count += 1
+                    continue
+                if idx not in remove_actions:
+                    remove_actions[idx] = (f"REMOVE {idx}", line_order)
+                    line_order += 1
+                    removed_entry = entries[idx - 1]
+                    rx1, ry1, rx2, ry2 = removed_entry.coords[:4]
+                    removed_signatures.add(
+                        _canonical_signature(
+                            label=removed_entry.label,
+                            x1=rx1,
+                            y1=ry1,
+                            x2=rx2,
+                            y2=ry2,
+                        )
+                    )
                 continue
 
             add_match = VERIFIER_ADD_PATTERN.match(line)
@@ -543,6 +569,10 @@ class SttvAgentLoop(AgentLoopBase):
                     f"[{_format_coord(x1)}, {_format_coord(y1)}, {_format_coord(x2)}, {_format_coord(y2)}]"
                 )
                 signature = _canonical_signature(label=label, x1=x1, y1=y1, x2=x2, y2=y2)
+                if signature in removed_signatures:
+                    # Contradictory instruction: removing then re-adding the same box.
+                    remove_add_duplicate_count += 1
+                    continue
                 raw_add_actions.append((normalized, line_order, signature))
                 line_order += 1
 
@@ -557,17 +587,29 @@ class SttvAgentLoop(AgentLoopBase):
             add_seen.add(signature)
             add_actions.append((line, order))
 
-        normalized_lines: list[tuple[str, int]] = list(index_actions.values()) + add_actions
+        normalized_lines: list[tuple[str, int]] = (
+            list(index_actions.values()) + list(remove_actions.values()) + add_actions
+        )
         normalized_lines.sort(key=lambda item: item[1])
         has_effect = len(normalized_lines) > 0
-        feedback_valid_for_reward = has_effect and duplicate_add_existing_count == 0 and disallowed_remove_count == 0
+        feedback_valid_for_reward = (
+            has_effect
+            and duplicate_add_existing_count == 0
+            and disallowed_remove_count == 0
+            and invalid_remove_count == 0
+            and remove_add_duplicate_count == 0
+        )
         feedback_info = {
             "feedback_has_effect": bool(has_effect),
             "feedback_valid_for_reward": bool(feedback_valid_for_reward),
             "feedback_has_duplicate_add_existing": bool(duplicate_add_existing_count > 0),
             "feedback_has_disallowed_remove": bool(disallowed_remove_count > 0),
+            "feedback_has_invalid_remove": bool(invalid_remove_count > 0),
+            "feedback_has_remove_add_duplicate": bool(remove_add_duplicate_count > 0),
             "feedback_duplicate_add_existing_count": int(duplicate_add_existing_count),
             "feedback_disallowed_remove_count": int(disallowed_remove_count),
+            "feedback_invalid_remove_count": int(invalid_remove_count),
+            "feedback_remove_add_duplicate_count": int(remove_add_duplicate_count),
         }
         if len(normalized_lines) == 0:
             no_op = "NO_VALID_CORRECTIONS. Re-emit all boxes unchanged in one <bbox_2d> block."
@@ -1099,11 +1141,23 @@ class SttvAgentLoop(AgentLoopBase):
                             "sttv_loc_verifier_feedback_has_disallowed_remove": bool(
                                 feedback_info.get("feedback_has_disallowed_remove", False)
                             ),
+                            "sttv_loc_verifier_feedback_has_invalid_remove": bool(
+                                feedback_info.get("feedback_has_invalid_remove", False)
+                            ),
+                            "sttv_loc_verifier_feedback_has_remove_add_duplicate": bool(
+                                feedback_info.get("feedback_has_remove_add_duplicate", False)
+                            ),
                             "sttv_loc_verifier_feedback_duplicate_add_existing_count": int(
                                 feedback_info.get("feedback_duplicate_add_existing_count", 0)
                             ),
                             "sttv_loc_verifier_feedback_disallowed_remove_count": int(
                                 feedback_info.get("feedback_disallowed_remove_count", 0)
+                            ),
+                            "sttv_loc_verifier_feedback_invalid_remove_count": int(
+                                feedback_info.get("feedback_invalid_remove_count", 0)
+                            ),
+                            "sttv_loc_verifier_feedback_remove_add_duplicate_count": int(
+                                feedback_info.get("feedback_remove_add_duplicate_count", 0)
                             ),
                         }
                     )

@@ -565,6 +565,14 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
                                     "feedback_has_disallowed_remove", False
                                 )
                             ),
+                            "sttv_loc_verifier_feedback_has_invalid_remove": bool(
+                                feedback_info.get("feedback_has_invalid_remove", False)
+                            ),
+                            "sttv_loc_verifier_feedback_has_remove_add_duplicate": bool(
+                                feedback_info.get(
+                                    "feedback_has_remove_add_duplicate", False
+                                )
+                            ),
                             "sttv_loc_verifier_feedback_duplicate_add_existing_count": int(
                                 feedback_info.get(
                                     "feedback_duplicate_add_existing_count", 0
@@ -572,6 +580,14 @@ class SttvAllVerifiersAgentLoop(SttvAgentLoop):
                             ),
                             "sttv_loc_verifier_feedback_disallowed_remove_count": int(
                                 feedback_info.get("feedback_disallowed_remove_count", 0)
+                            ),
+                            "sttv_loc_verifier_feedback_invalid_remove_count": int(
+                                feedback_info.get("feedback_invalid_remove_count", 0)
+                            ),
+                            "sttv_loc_verifier_feedback_remove_add_duplicate_count": int(
+                                feedback_info.get(
+                                    "feedback_remove_add_duplicate_count", 0
+                                )
                             ),
                         }
                     )
