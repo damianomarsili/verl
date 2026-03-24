@@ -765,7 +765,7 @@ class RayPPOTrainer:
             except (TypeError, ValueError):
                 return default
 
-        return {
+        reward_kwargs: dict[str, Any] = {
             "sttv_sam3_confidence_threshold": _coerce_float("sttv_sam3_confidence_threshold", 0.5),
             "sttv_sam3_device": str(reward_cfg.get("sttv_sam3_device", "cuda") or "cuda"),
             "sttv_sam3_devices": reward_cfg.get("sttv_sam3_devices", ""),
@@ -800,6 +800,26 @@ class RayPPOTrainer:
                 True,
             ),
         }
+
+        # Forward remaining custom reward kwargs (not just STTV SAM3 knobs) so
+        # answer/logic reward functions receive Gemini auth/runtime settings in
+        # multi-objective mode.
+        excluded_keys = {
+            "path",
+            "name",
+            "loc_call_name",
+            "loc_verifier_name",
+            "answer_logic_verifier_name",
+        }
+        for raw_key, raw_value in dict(reward_cfg).items():
+            key = str(raw_key)
+            if key in excluded_keys:
+                continue
+            if key in reward_kwargs:
+                continue
+            reward_kwargs[key] = raw_value
+
+        return reward_kwargs
 
     def _extract_sttv_mask_tensor(
         self,
@@ -2128,6 +2148,7 @@ class RayPPOTrainer:
         self,
         aux_batch: Optional[DataProto],
         reward_fn: Optional[Callable[..., Any]],
+        reward_kwargs: Optional[dict[str, Any]] = None,
     ) -> tuple[Optional[torch.Tensor], int, list[float]]:
         if aux_batch is None or len(aux_batch) == 0:
             return None, 0, []
@@ -2200,6 +2221,7 @@ class RayPPOTrainer:
                     ground_truths=[ground_truths_all[idx] for idx in missing_override_indices],
                     extra_infos=[extra_infos_all[idx] for idx in missing_override_indices],
                     raw_prompts=[raw_prompts_all[idx] for idx in missing_override_indices],
+                    **(reward_kwargs or {}),
                 )
                 normalized_missing = self._normalize_flat_rewards(
                     raw_rewards,
@@ -5555,6 +5577,7 @@ class RayPPOTrainer:
                                 ) = self._compute_sttv_answer_aux_reward_tensor(
                                     answer_aux_batch,
                                     sttv_reward_fns.get("answer"),
+                                    reward_kwargs=sttv_reward_kwargs,
                                 )
                                 metrics["sttv/answer_aux_reward_eval_time_s"] = float(
                                     time.perf_counter() - t_answer_aux_reward_start

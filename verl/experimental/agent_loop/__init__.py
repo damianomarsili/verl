@@ -14,11 +14,21 @@
 
 from .agent_loop import AgentLoopBase, AgentLoopManager, AgentLoopWorker, AsyncLLMServerManager
 from .single_turn_agent_loop import SingleTurnAgentLoop
+from .sttv_answer_only_agent_loop import SttvAnswerOnlyAgentLoop
 from .sttv_all_verifiers_agent_loop import SttvAllVerifiersAgentLoop
 from .sttv_agent_loop import SttvAgentLoop
+from .sttv_implicit_grounding_agent_loop import SttvImplicitGroundingAgentLoop
 from .sttv_no_verifier_agent_loop import SttvNoVerifierAgentLoop
 from .tool_agent_loop import ToolAgentLoop
 
-_ = [SingleTurnAgentLoop, ToolAgentLoop, SttvAgentLoop, SttvNoVerifierAgentLoop, SttvAllVerifiersAgentLoop]
+_ = [
+    SingleTurnAgentLoop,
+    ToolAgentLoop,
+    SttvAgentLoop,
+    SttvNoVerifierAgentLoop,
+    SttvAllVerifiersAgentLoop,
+    SttvAnswerOnlyAgentLoop,
+    SttvImplicitGroundingAgentLoop,
+]
 
 __all__ = ["AgentLoopBase", "AgentLoopManager", "AsyncLLMServerManager", "AgentLoopWorker"]
