@@ -31,6 +31,7 @@ class SttvAnswerOnlyAgentLoop(SttvNoVerifierAgentLoop):
             f"{query_text}\n\n"
             "Please answer the query by first reasoning inside <reason> tags and then putting ONLY your final answer "
             "inside <answer>. Ensure that the answer is either yes/no, one word, or one number. "
+            "Unless explicitly specified otherwise, assume all metric quantities are 3D and depth-aware. "
             "Do not round answers, express all ratios as unrounded decimals. "
             "Nothing else."
         )

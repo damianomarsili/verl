@@ -107,6 +107,7 @@ class SttvImplicitGroundingAgentLoop(SttvGeminiObjectiveAgentLoop):
             "Please answer the query by first reasoning inside <reason> tags with numbered steps "
             "(1., 2., 3., ... one step per line), then putting ONLY your final answer inside <answer>. "
             "Ensure that the answer is either yes/no, one word, or one number. "
+            "Unless explicitly specified otherwise, assume all metric quantities are 3D and depth-aware. "
             "Do not round answers, express all ratios as unrounded decimals. "
             "Nothing else."
         )
@@ -179,6 +180,7 @@ class SttvImplicitGroundingAgentLoop(SttvGeminiObjectiveAgentLoop):
             "You MUST incorporate the feedback and MUST NOT make unrelated changes. "
             "Please output exactly one full <reason> block and then one full <answer> block. "
             "Ensure that the answer is either yes/no, one word, or one number. "
+            "Unless explicitly specified otherwise, assume all metric quantities are 3D and depth-aware. "
             "Do not round answers, express all ratios as unrounded decimals. Nothing else."
         )
         return await self._generate_answer_from_prompt(
