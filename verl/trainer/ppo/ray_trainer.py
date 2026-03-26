@@ -74,9 +74,42 @@ from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_pad
 
 
 ANSWER_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.IGNORECASE | re.DOTALL)
+STTV_TAG_BLOCK_PATTERN = re.compile(
+    r"(?is)<(?P<tag>reason|answer)>\s*(?P<payload>.*?)\s*</(?P=tag)>"
+)
 STTV_AUX_MM_CHUNK_SIZE = 8
 STTV_PAD_RATIO_WARN_THRESHOLD = 0.1
 STTV_IMAGE_DECODE_CACHE_SIZE = 1024
+
+
+def _sttv_strip_format_special_tokens(text: str) -> str:
+    cleaned = str(text or "")
+    cleaned = cleaned.replace("<|im_end|>", "")
+    cleaned = cleaned.replace("<|endoftext|>", "")
+    return cleaned.strip()
+
+
+def _sttv_is_strict_reason_answer_format(text: str) -> bool:
+    if not text:
+        return False
+    cleaned = _sttv_strip_format_special_tokens(text)
+    tag_blocks = list(STTV_TAG_BLOCK_PATTERN.finditer(cleaned))
+    if len(tag_blocks) == 0:
+        return False
+    tags: list[str] = []
+    cursor = 0
+    for match in tag_blocks:
+        if cleaned[cursor : match.start()].strip():
+            return False
+        tag = str(match.group("tag") or "").strip().lower()
+        payload = str(match.group("payload") or "").strip()
+        if not tag or not payload:
+            return False
+        tags.append(tag)
+        cursor = match.end()
+    if cleaned[cursor:].strip():
+        return False
+    return tags == ["reason", "answer"]
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -2169,8 +2202,28 @@ class RayPPOTrainer:
         )
         if len(call_records) < total_rows:
             call_records.extend([{}] * (total_rows - len(call_records)))
+        solution_strs_raw = aux_batch.non_tensor_batch.get(
+            "sttv_answer_solution_str",
+            np.array([""] * total_rows, dtype=object),
+        )
+        solution_strs_for_format = (
+            solution_strs_raw.tolist() if isinstance(solution_strs_raw, np.ndarray) else list(solution_strs_raw)
+        )
+        if len(solution_strs_for_format) < total_rows:
+            solution_strs_for_format.extend([""] * (total_rows - len(solution_strs_for_format)))
+        format_valid_flags = [
+            _sttv_is_strict_reason_answer_format(str(solution_strs_for_format[row_idx] or ""))
+            for row_idx in range(total_rows)
+        ]
         missing_override_indices: list[int] = []
         for row_idx, call_record in enumerate(call_records[:total_rows]):
+            format_valid = bool(format_valid_flags[row_idx])
+            if isinstance(call_record, dict):
+                call_record["sttv_answer_format_valid_for_reward"] = bool(format_valid)
+            if not format_valid:
+                override_values[row_idx] = 0.0
+                reward_values[row_idx] = 0.0
+                continue
             override_value: Optional[float] = None
             if isinstance(call_record, dict):
                 raw_override = call_record.get("answer_reward_override", None)

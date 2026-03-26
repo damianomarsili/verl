@@ -465,6 +465,14 @@ class SttvImplicitGroundingAgentLoop(SttvGeminiObjectiveAgentLoop):
                 }
             )
 
+        answer_format_valid = self._is_strict_reason_answer_output(
+            str(final_answer_call.get("answer_output_text", "") or "")
+        )
+        final_answer_call["answer_format_valid_for_reward"] = bool(answer_format_valid)
+        if not answer_format_valid:
+            final_answer_score = 0.0
+            final_answer_call["answer_reward_override"] = 0.0
+
         if not validate_mode:
             final_answer_call["answer_reward_override"] = float(final_answer_score)
         if "answer_gemini_score_time_s" not in final_answer_call:

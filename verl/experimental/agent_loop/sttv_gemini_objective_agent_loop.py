@@ -36,6 +36,9 @@ from training.gemini_objectives import (
 LOGIC_STEP_EDIT_PATTERN = re.compile(r"(?i)^EDIT_STEP\s+(?P<idx>\d+)\s*:\s*(?P<body>.+)$")
 REASON_BLOCK_PATTERN = re.compile(r"(?is)<reason>\s*(?P<body>.*?)\s*</reason>")
 REASON_STEP_LINE_PATTERN = re.compile(r"^\s*(?P<idx>\d+)\.\s*(?P<body>.+?)\s*$")
+STRICT_REASON_ANSWER_BLOCK_PATTERN = re.compile(
+    r"(?is)<(?P<tag>reason|answer)>\s*(?P<payload>.*?)\s*</(?P=tag)>"
+)
 
 
 @register("sttv_gemini_objective_agent")
@@ -151,6 +154,28 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
             if step_idx not in step_indices:
                 step_indices.append(step_idx)
         return step_indices
+
+    def _is_strict_reason_answer_output(self, text: str) -> bool:
+        cleaned = str(text or "").replace("<|im_end|>", "").replace("<|endoftext|>", "").strip()
+        if not cleaned:
+            return False
+        matches = list(STRICT_REASON_ANSWER_BLOCK_PATTERN.finditer(cleaned))
+        if len(matches) == 0:
+            return False
+        tags: list[str] = []
+        cursor = 0
+        for match in matches:
+            if cleaned[cursor : match.start()].strip():
+                return False
+            tag = str(match.group("tag") or "").strip().lower()
+            payload = str(match.group("payload") or "").strip()
+            if not tag or not payload:
+                return False
+            tags.append(tag)
+            cursor = match.end()
+        if cleaned[cursor:].strip():
+            return False
+        return tags == ["reason", "answer"]
 
     def _parse_logic_step_edits_optional(
         self, text: str, current_answer_output: str
@@ -1066,6 +1091,14 @@ class SttvGeminiObjectiveAgentLoop(SttvAgentLoop):
                     "answer_solution_str": final_answer_call["answer_solution_str"],
                 }
             )
+
+        answer_format_valid = self._is_strict_reason_answer_output(
+            str(final_answer_call.get("answer_output_text", "") or "")
+        )
+        final_answer_call["answer_format_valid_for_reward"] = bool(answer_format_valid)
+        if not answer_format_valid:
+            final_answer_score = 0.0
+            final_answer_call["answer_reward_override"] = 0.0
 
         if not validate_mode:
             final_answer_call["answer_reward_override"] = float(final_answer_score)
