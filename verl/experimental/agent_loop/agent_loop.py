@@ -436,7 +436,9 @@ class AgentLoopWorker:
             temperature=config.temperature,
             top_p=config.top_p,
             top_k=config.top_k,
-            repetition_penalty=1.0,
+            repetition_penalty=config.repetition_penalty,
+            presence_penalty=config.presence_penalty,
+            frequency_penalty=config.frequency_penalty,
             logprobs=config.calculate_log_probs,
         )
 
@@ -445,6 +447,9 @@ class AgentLoopWorker:
             sampling_params["top_p"] = config.val_kwargs.top_p
             sampling_params["top_k"] = config.val_kwargs.top_k
             sampling_params["temperature"] = config.val_kwargs.temperature
+            sampling_params["repetition_penalty"] = config.val_kwargs.repetition_penalty
+            sampling_params["presence_penalty"] = config.val_kwargs.presence_penalty
+            sampling_params["frequency_penalty"] = config.val_kwargs.frequency_penalty
 
         # by default, we assume it's a single turn agent
         if "agent_name" not in batch.non_tensor_batch:

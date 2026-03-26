@@ -16,6 +16,15 @@ top_k: -1
 # Top-p sampling parameter. Default 1.0.
 top_p: 1
 
+# Repetition penalty for sampling.
+repetition_penalty: 1.0
+
+# Presence penalty for sampling.
+presence_penalty: 0.0
+
+# Frequency penalty for sampling.
+frequency_penalty: 0.0
+
 # typically the same as data max prompt length
 # same as data.max_prompt_length if it exists
 prompt_length: ${oc.select:data.max_prompt_length,512}
@@ -145,6 +154,15 @@ val_kwargs:
 
   # Sampling temperature for rollout.
   temperature: 0
+
+  # Repetition penalty for sampling.
+  repetition_penalty: 1.0
+
+  # Presence penalty for sampling.
+  presence_penalty: 0.0
+
+  # Frequency penalty for sampling.
+  frequency_penalty: 0.0
 
   # whether to repeat n times for validation
   n: 1
