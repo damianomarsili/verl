@@ -33,7 +33,7 @@ class SttvImplicitGroundingAgentLoop(SttvGeminiObjectiveAgentLoop):
     """Implicit-grounding Gemini loop.
 
     Pipeline:
-    query -> <reason><answer> -> one logic self-verifier call -> rewritten <reason><answer>.
+    query -> <reason><answer> -> logic self-verifier call(s) -> rewritten <reason><answer>.
 
     No explicit grounding/bbox generation, no grounding verifier, no grounding context compaction.
     """
@@ -42,12 +42,13 @@ class SttvImplicitGroundingAgentLoop(SttvGeminiObjectiveAgentLoop):
         self,
         *args: Any,
         logic_verifier_rounds: int = 1,
+        logic_verifier_rounds_min: Optional[int] = None,
+        logic_verifier_rounds_max: Optional[int] = None,
         logic_verifier_max_new_tokens: int = 96,
         logic_self_verifier_prompt_path: Optional[str] = None,
         gemini_logic_teacher_prompt_path: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
-        del logic_verifier_rounds  # fixed to one round for this variant
         super().__init__(
             *args,
             loc_verifier_rounds=0,
@@ -69,7 +70,14 @@ class SttvImplicitGroundingAgentLoop(SttvGeminiObjectiveAgentLoop):
             gemini_logic_teacher_prompt_path,
             default_filename="gemini_logic_teacher_judge_implicit_grounding_instructions.txt",
         )
-        self.logic_verifier_rounds = 1
+        fixed_rounds = max(0, int(logic_verifier_rounds))
+        rounds_min = fixed_rounds if logic_verifier_rounds_min is None else max(0, int(logic_verifier_rounds_min))
+        rounds_max = fixed_rounds if logic_verifier_rounds_max is None else max(0, int(logic_verifier_rounds_max))
+        if rounds_max < rounds_min:
+            rounds_max = rounds_min
+        self.logic_verifier_rounds = fixed_rounds
+        self.logic_verifier_rounds_min = int(rounds_min)
+        self.logic_verifier_rounds_max = int(rounds_max)
         self.total_epochs = int(
             getattr(self.config.trainer, "total_epochs", 1) or 1
         )
@@ -77,6 +85,23 @@ class SttvImplicitGroundingAgentLoop(SttvGeminiObjectiveAgentLoop):
             self.steps_per_epoch = max(1, self.total_training_steps // self.total_epochs)
         else:
             self.steps_per_epoch = 1
+
+    def _sample_logic_verifier_rounds(
+        self,
+        *,
+        uid: str,
+        global_steps: int,
+    ) -> int:
+        rounds_min = max(0, int(self.logic_verifier_rounds_min))
+        rounds_max = max(rounds_min, int(self.logic_verifier_rounds_max))
+        if rounds_max <= rounds_min:
+            return rounds_min
+        digest = hashlib.sha1(
+            f"logic_rounds:{uid}:{global_steps}".encode("utf-8")
+        ).digest()
+        draw = int.from_bytes(digest[:8], byteorder="big")
+        span = rounds_max - rounds_min + 1
+        return int(rounds_min + (draw % span))
 
     def _choose_logic_edit_source(
         self,
@@ -255,244 +280,251 @@ class SttvImplicitGroundingAgentLoop(SttvGeminiObjectiveAgentLoop):
         ]
         sttv_answer_logic_verifier_calls: list[dict[str, Any]] = []
 
-        # One logic self-verifier call.
-        logic_prompt_text = self._build_logic_self_verifier_prompt(query, current_answer_output)
-        (
-            logic_output_text,
-            logic_prompt_token_ids,
-            logic_output_token_ids,
-            logic_output_log_probs,
-            logic_images,
-            logic_multi_modal_inputs,
-        ) = await self._build_logic_verifier_messages(
-            images=images,
-            prompt=logic_prompt_text,
-            generate_logprobs=bool(sampling_params.get("logprobs", False)),
-            metrics=metrics,
+        sampled_logic_rounds = self._sample_logic_verifier_rounds(
+            uid=uid,
+            global_steps=global_steps,
         )
-        self_feedback, self_parse_valid, self_feedback_info = self._parse_logic_step_edits_optional(
-            logic_output_text, current_answer_output
-        )
-
-        if validate_mode:
-            teacher_judgment: dict[str, Any] = {}
-            logic_teacher_time_s = 0.0
-            teacher_output_text = ""
-            teacher_feedback = ""
-            teacher_parse_valid = True
-            teacher_feedback_info = {
-                "logic_feedback_has_effect": False,
-                "logic_feedback_valid_for_reward": True,
-                "logic_feedback_has_reason_edit": False,
-                "logic_feedback_num_step_edits": 0,
-                "logic_feedback_step_indices": [],
-            }
-            current_answer_score = 0.0
-            self_edit_score = 0.0
-            self_edit_reason = ""
-        else:
-            t_logic_teacher_start = time.perf_counter()
-            teacher_judgment = await self._request_gemini_logic_teacher_judgment(
-                query=query,
-                latest_bbox_block="",
-                current_answer_output=current_answer_output,
-                proposed_self_edits=logic_output_text,
-                images=gemini_images,
-            )
-            logic_teacher_time_s = float(time.perf_counter() - t_logic_teacher_start)
-            teacher_edits_raw = teacher_judgment.get("teacher_edits", [])
-            if isinstance(teacher_edits_raw, (list, tuple)):
-                teacher_output_text = "\n".join(
-                    str(line or "").strip()
-                    for line in teacher_edits_raw
-                    if str(line or "").strip()
-                )
-            else:
-                teacher_output_text = str(teacher_edits_raw or "").strip()
-            teacher_feedback, teacher_parse_valid, teacher_feedback_info = self._parse_logic_step_edits_optional(
-                teacher_output_text, current_answer_output
-            )
-            current_answer_score = float(teacher_judgment.get("current_answer_score", 0.0) or 0.0)
-            self_edit_score = float(teacher_judgment.get("self_edit_score", 0.0) or 0.0)
-            self_edit_reason = str(teacher_judgment.get("self_edit_reason", "") or "").strip()
-
-        teacher_judgment_failed = bool(teacher_judgment.get("failed", False))
-
-        edit_source = self._choose_logic_edit_source(
+        selected_edit_source_for_sample = self._choose_logic_edit_source(
             uid=uid,
             global_steps=global_steps,
             validate_mode=validate_mode,
         )
-        force_logic_reward_invalid = False
-        if not validate_mode and teacher_judgment_failed:
-            force_logic_reward_invalid = True
-            if edit_source == "teacher":
-                edit_source = "self"
-
-        if edit_source == "self":
-            selected_feedback = self_feedback
-            selected_feedback_info = self_feedback_info
-        else:
-            selected_feedback = teacher_feedback
-            selected_feedback_info = teacher_feedback_info
-        if validate_mode and not str(selected_feedback or "").strip():
-            selected_feedback = (
-                "No valid self-verifier feedback was produced. "
-                "Re-emit the current answer unchanged."
-            )
-
-        logic_call_record = {
-            "round_index": 0,
-            "answer_call_index": int(answer_call_index),
-            "logic_feedback": str(self_feedback),
-            "logic_feedback_parse_valid": bool(self_parse_valid),
-            "logic_feedback_valid_for_reward": bool(
-                self_feedback_info.get("logic_feedback_valid_for_reward", False)
-            )
-            and not force_logic_reward_invalid,
-            "logic_feedback_has_reason_edit": bool(
-                self_feedback_info.get("logic_feedback_has_reason_edit", False)
-            ),
-            "logic_feedback_num_step_edits": int(
-                self_feedback_info.get("logic_feedback_num_step_edits", 0)
-            ),
-            "logic_feedback_step_indices": list(
-                self_feedback_info.get("logic_feedback_step_indices", [])
-            ),
-            "logic_verifier_prompt_text": logic_prompt_text,
-            "logic_verifier_output_text": logic_output_text,
-            "logic_verifier_prompt_token_ids": logic_prompt_token_ids,
-            "logic_verifier_output_token_ids": logic_output_token_ids,
-            "logic_verifier_output_log_probs": logic_output_log_probs,
-            "logic_verifier_images": logic_images,
-            "logic_verifier_multi_modal_inputs": logic_multi_modal_inputs,
-            "logic_teacher_output_text": teacher_output_text,
-            "logic_teacher_output_raw_text": str(teacher_judgment.get("raw_text", "") or ""),
-            "logic_teacher_time_s": float(logic_teacher_time_s),
-            "logic_teacher_skipped_validate": bool(validate_mode),
-            "logic_teacher_feedback": str(teacher_feedback),
-            "logic_teacher_parse_valid": bool(teacher_parse_valid),
-            "logic_teacher_num_step_edits": int(
-                teacher_feedback_info.get("logic_feedback_num_step_edits", 0)
-            ),
-            "logic_teacher_step_indices": list(
-                teacher_feedback_info.get("logic_feedback_step_indices", [])
-            ),
-            "logic_edit_source": str(edit_source),
-            "logic_selected_feedback": str(selected_feedback),
-            "logic_selected_num_step_edits": int(
-                selected_feedback_info.get("logic_feedback_num_step_edits", 0)
-            ),
-            "sttv_answer_logic_verifier_self_edit_score": float(self_edit_score),
-            "sttv_answer_logic_verifier_self_edit_reason": self_edit_reason,
-            "sttv_answer_logic_verifier_current_answer_score": float(current_answer_score),
-            "sttv_answer_logic_verifier_final_answer_score": float(current_answer_score),
-            "sttv_answer_logic_verifier_rewrite_skipped_no_edits": False,
-        }
-        sttv_answer_logic_verifier_calls.append(logic_call_record)
-
-        # Rewrite once from selected feedback.
         final_answer_call = dict(current_answer_aux_record)
-        final_answer_score = float(current_answer_score)
-        rewrite_skipped_no_edits = not bool(str(selected_feedback or "").strip())
-        if rewrite_skipped_no_edits:
-            if validate_mode:
-                final_answer_score = 0.0
-                final_answer_call["answer_gemini_score_time_s"] = 0.0
-            elif not teacher_judgment_failed:
-                final_answer_score = float(current_answer_score)
-                final_answer_call["answer_reward_override"] = float(current_answer_score)
-                final_answer_call["answer_gemini_score_time_s"] = 0.0
-            else:
-                t_answer_grade_start = time.perf_counter()
-                final_answer_judgment = await self._request_gemini_answer_score(
-                    query=query,
-                    candidate_response=final_answer_call["answer_solution_str"],
-                    images=gemini_images,
-                )
-                answer_gemini_score_time_s = float(time.perf_counter() - t_answer_grade_start)
-                final_answer_score = float(final_answer_judgment.get("score", 0.0) or 0.0)
-                final_answer_call["answer_reward_override"] = float(final_answer_score)
-                final_answer_call["answer_gemini_score_time_s"] = float(answer_gemini_score_time_s)
-        else:
+
+        for logic_round_index in range(sampled_logic_rounds):
+            logic_prompt_text = self._build_logic_self_verifier_prompt(query, current_answer_output)
             (
-                rewrite_prompt_text,
-                rewrite_output_text,
-                rewrite_prompt_token_ids,
-                rewrite_output_token_ids,
-                rewrite_output_log_probs,
-                rewrite_images,
-                rewrite_multi_modal_inputs,
-            ) = await self._build_answer_rewrite_aux_messages(
+                logic_output_text,
+                logic_prompt_token_ids,
+                logic_output_token_ids,
+                logic_output_log_probs,
+                logic_images,
+                logic_multi_modal_inputs,
+            ) = await self._build_logic_verifier_messages(
                 images=images,
-                query=query,
-                current_answer_output=current_answer_output,
-                logic_feedback=selected_feedback,
-                sampling_params=sampling_params,
+                prompt=logic_prompt_text,
+                generate_logprobs=bool(sampling_params.get("logprobs", False)),
                 metrics=metrics,
             )
+            self_feedback, self_parse_valid, self_feedback_info = self._parse_logic_step_edits_optional(
+                logic_output_text, current_answer_output
+            )
 
-            answer_call_index += 1
-            current_answer_output = str(rewrite_output_text or "")
-            final_answer_call = {
-                "call_index": int(answer_call_index),
-                "answer_prompt_text": rewrite_prompt_text,
-                "answer_output_text": current_answer_output,
-                "answer_prompt_token_ids": rewrite_prompt_token_ids,
-                "answer_output_token_ids": rewrite_output_token_ids,
-                "answer_output_log_probs": rewrite_output_log_probs,
-                "answer_images": rewrite_images,
-                "answer_multi_modal_inputs": rewrite_multi_modal_inputs,
-                "answer_latest_bbox_block": "",
-                "answer_solution_str": current_answer_output,
-            }
             if validate_mode:
-                final_answer_score = 0.0
-                final_answer_call["answer_gemini_score_time_s"] = 0.0
+                teacher_judgment: dict[str, Any] = {}
+                logic_teacher_time_s = 0.0
+                teacher_output_text = ""
+                teacher_feedback = ""
+                teacher_parse_valid = True
+                teacher_feedback_info = {
+                    "logic_feedback_has_effect": False,
+                    "logic_feedback_valid_for_reward": True,
+                    "logic_feedback_has_reason_edit": False,
+                    "logic_feedback_num_step_edits": 0,
+                    "logic_feedback_step_indices": [],
+                }
+                current_answer_score = 0.0
+                self_edit_score = 0.0
+                self_edit_reason = ""
             else:
-                t_answer_grade_start = time.perf_counter()
-                final_answer_judgment = await self._request_gemini_answer_score(
+                t_logic_teacher_start = time.perf_counter()
+                teacher_judgment = await self._request_gemini_logic_teacher_judgment(
                     query=query,
-                    candidate_response=final_answer_call["answer_solution_str"],
+                    latest_bbox_block="",
+                    current_answer_output=current_answer_output,
+                    proposed_self_edits=logic_output_text,
                     images=gemini_images,
                 )
-                answer_gemini_score_time_s = float(time.perf_counter() - t_answer_grade_start)
-                final_answer_score = float(final_answer_judgment.get("score", 0.0) or 0.0)
-                final_answer_call["answer_reward_override"] = float(final_answer_score)
-                final_answer_call["answer_gemini_score_time_s"] = float(answer_gemini_score_time_s)
-            sttv_answer_calls.append(
-                {
+                logic_teacher_time_s = float(time.perf_counter() - t_logic_teacher_start)
+                teacher_edits_raw = teacher_judgment.get("teacher_edits", [])
+                if isinstance(teacher_edits_raw, (list, tuple)):
+                    teacher_output_text = "\n".join(
+                        str(line or "").strip()
+                        for line in teacher_edits_raw
+                        if str(line or "").strip()
+                    )
+                else:
+                    teacher_output_text = str(teacher_edits_raw or "").strip()
+                teacher_feedback, teacher_parse_valid, teacher_feedback_info = self._parse_logic_step_edits_optional(
+                    teacher_output_text, current_answer_output
+                )
+                current_answer_score = float(teacher_judgment.get("current_answer_score", 0.0) or 0.0)
+                self_edit_score = float(teacher_judgment.get("self_edit_score", 0.0) or 0.0)
+                self_edit_reason = str(teacher_judgment.get("self_edit_reason", "") or "").strip()
+
+            teacher_judgment_failed = bool(teacher_judgment.get("failed", False))
+            edit_source = str(selected_edit_source_for_sample)
+            force_logic_reward_invalid = bool(
+                (not validate_mode) and teacher_judgment_failed and (edit_source == "teacher")
+            )
+
+            if edit_source == "self":
+                selected_feedback = self_feedback
+                selected_feedback_info = self_feedback_info
+            else:
+                selected_feedback = teacher_feedback
+                selected_feedback_info = teacher_feedback_info
+            if validate_mode and not str(selected_feedback or "").strip():
+                selected_feedback = (
+                    "No valid self-verifier feedback was produced. "
+                    "Re-emit the current answer unchanged."
+                )
+
+            logic_call_record = {
+                "round_index": int(logic_round_index),
+                "sampled_logic_rounds": int(sampled_logic_rounds),
+                "answer_call_index": int(answer_call_index),
+                "logic_feedback": str(self_feedback),
+                "logic_feedback_parse_valid": bool(self_parse_valid),
+                "logic_feedback_valid_for_reward": bool(
+                    self_feedback_info.get("logic_feedback_valid_for_reward", False)
+                )
+                and not force_logic_reward_invalid,
+                "logic_feedback_has_reason_edit": bool(
+                    self_feedback_info.get("logic_feedback_has_reason_edit", False)
+                ),
+                "logic_feedback_num_step_edits": int(
+                    self_feedback_info.get("logic_feedback_num_step_edits", 0)
+                ),
+                "logic_feedback_step_indices": list(
+                    self_feedback_info.get("logic_feedback_step_indices", [])
+                ),
+                "logic_verifier_prompt_text": logic_prompt_text,
+                "logic_verifier_output_text": logic_output_text,
+                "logic_verifier_prompt_token_ids": logic_prompt_token_ids,
+                "logic_verifier_output_token_ids": logic_output_token_ids,
+                "logic_verifier_output_log_probs": logic_output_log_probs,
+                "logic_verifier_images": logic_images,
+                "logic_verifier_multi_modal_inputs": logic_multi_modal_inputs,
+                "logic_teacher_output_text": teacher_output_text,
+                "logic_teacher_output_raw_text": str(teacher_judgment.get("raw_text", "") or ""),
+                "logic_teacher_time_s": float(logic_teacher_time_s),
+                "logic_teacher_skipped_validate": bool(validate_mode),
+                "logic_teacher_feedback": str(teacher_feedback),
+                "logic_teacher_parse_valid": bool(teacher_parse_valid),
+                "logic_teacher_num_step_edits": int(
+                    teacher_feedback_info.get("logic_feedback_num_step_edits", 0)
+                ),
+                "logic_teacher_step_indices": list(
+                    teacher_feedback_info.get("logic_feedback_step_indices", [])
+                ),
+                "logic_edit_source": str(edit_source),
+                "logic_edit_source_sample": str(selected_edit_source_for_sample),
+                "logic_selected_feedback": str(selected_feedback),
+                "logic_selected_num_step_edits": int(
+                    selected_feedback_info.get("logic_feedback_num_step_edits", 0)
+                ),
+                "sttv_answer_logic_verifier_self_edit_score": float(self_edit_score),
+                "sttv_answer_logic_verifier_self_edit_reason": self_edit_reason,
+                "sttv_answer_logic_verifier_current_answer_score": float(current_answer_score),
+                "sttv_answer_logic_verifier_final_answer_score": float(current_answer_score),
+                "sttv_answer_logic_verifier_rewrite_skipped_no_edits": False,
+            }
+
+            final_answer_score = float(current_answer_score)
+            rewrite_skipped_no_edits = not bool(str(selected_feedback or "").strip())
+            if rewrite_skipped_no_edits:
+                final_answer_call = dict(current_answer_aux_record)
+                if validate_mode:
+                    final_answer_score = 0.0
+                    final_answer_call["answer_gemini_score_time_s"] = 0.0
+                elif not teacher_judgment_failed:
+                    final_answer_score = float(current_answer_score)
+                    final_answer_call["answer_reward_override"] = float(current_answer_score)
+                    final_answer_call["answer_gemini_score_time_s"] = 0.0
+                else:
+                    t_answer_grade_start = time.perf_counter()
+                    final_answer_judgment = await self._request_gemini_answer_score(
+                        query=query,
+                        candidate_response=final_answer_call["answer_solution_str"],
+                        images=gemini_images,
+                    )
+                    answer_gemini_score_time_s = float(time.perf_counter() - t_answer_grade_start)
+                    final_answer_score = float(final_answer_judgment.get("score", 0.0) or 0.0)
+                    final_answer_call["answer_reward_override"] = float(final_answer_score)
+                    final_answer_call["answer_gemini_score_time_s"] = float(answer_gemini_score_time_s)
+            else:
+                (
+                    rewrite_prompt_text,
+                    rewrite_output_text,
+                    rewrite_prompt_token_ids,
+                    rewrite_output_token_ids,
+                    rewrite_output_log_probs,
+                    rewrite_images,
+                    rewrite_multi_modal_inputs,
+                ) = await self._build_answer_rewrite_aux_messages(
+                    images=images,
+                    query=query,
+                    current_answer_output=current_answer_output,
+                    logic_feedback=selected_feedback,
+                    sampling_params=sampling_params,
+                    metrics=metrics,
+                )
+
+                answer_call_index += 1
+                current_answer_output = str(rewrite_output_text or "")
+                final_answer_call = {
                     "call_index": int(answer_call_index),
                     "answer_prompt_text": rewrite_prompt_text,
                     "answer_output_text": current_answer_output,
-                    "answer_solution_str": final_answer_call["answer_solution_str"],
+                    "answer_prompt_token_ids": rewrite_prompt_token_ids,
+                    "answer_output_token_ids": rewrite_output_token_ids,
+                    "answer_output_log_probs": rewrite_output_log_probs,
+                    "answer_images": rewrite_images,
+                    "answer_multi_modal_inputs": rewrite_multi_modal_inputs,
+                    "answer_latest_bbox_block": "",
+                    "answer_solution_str": current_answer_output,
                 }
+                if validate_mode:
+                    final_answer_score = 0.0
+                    final_answer_call["answer_gemini_score_time_s"] = 0.0
+                else:
+                    t_answer_grade_start = time.perf_counter()
+                    final_answer_judgment = await self._request_gemini_answer_score(
+                        query=query,
+                        candidate_response=final_answer_call["answer_solution_str"],
+                        images=gemini_images,
+                    )
+                    answer_gemini_score_time_s = float(time.perf_counter() - t_answer_grade_start)
+                    final_answer_score = float(final_answer_judgment.get("score", 0.0) or 0.0)
+                    final_answer_call["answer_reward_override"] = float(final_answer_score)
+                    final_answer_call["answer_gemini_score_time_s"] = float(answer_gemini_score_time_s)
+                sttv_answer_calls.append(
+                    {
+                        "call_index": int(answer_call_index),
+                        "answer_prompt_text": rewrite_prompt_text,
+                        "answer_output_text": current_answer_output,
+                        "answer_solution_str": final_answer_call["answer_solution_str"],
+                    }
+                )
+
+            answer_format_valid = self._is_strict_reason_answer_output(
+                str(final_answer_call.get("answer_output_text", "") or "")
             )
+            final_answer_call["answer_format_valid_for_reward"] = bool(answer_format_valid)
+            if not answer_format_valid:
+                final_answer_score = 0.0
+                final_answer_call["answer_reward_override"] = 0.0
 
-        answer_format_valid = self._is_strict_reason_answer_output(
-            str(final_answer_call.get("answer_output_text", "") or "")
-        )
-        final_answer_call["answer_format_valid_for_reward"] = bool(answer_format_valid)
-        if not answer_format_valid:
-            final_answer_score = 0.0
-            final_answer_call["answer_reward_override"] = 0.0
-
-        if not validate_mode:
-            final_answer_call["answer_reward_override"] = float(final_answer_score)
-        if "answer_gemini_score_time_s" not in final_answer_call:
-            final_answer_call["answer_gemini_score_time_s"] = 0.0
-        final_answer_call["gemini_total_time_s"] = float(
-            logic_teacher_time_s + float(final_answer_call.get("answer_gemini_score_time_s", 0.0) or 0.0)
-        )
-        logic_call_record["sttv_answer_logic_verifier_final_answer_score"] = float(final_answer_score)
-        logic_call_record["sttv_answer_logic_verifier_rewrite_skipped_no_edits"] = bool(rewrite_skipped_no_edits)
-        logic_call_record["sttv_answer_logic_verifier_logic_teacher_time_s"] = float(logic_teacher_time_s)
-        logic_call_record["sttv_answer_logic_verifier_answer_gemini_score_time_s"] = float(
-            final_answer_call.get("answer_gemini_score_time_s", 0.0) or 0.0
-        )
-        logic_call_record["sttv_answer_logic_verifier_gemini_total_time_s"] = float(
-            final_answer_call.get("gemini_total_time_s", 0.0) or 0.0
-        )
+            if not validate_mode:
+                final_answer_call["answer_reward_override"] = float(final_answer_score)
+            if "answer_gemini_score_time_s" not in final_answer_call:
+                final_answer_call["answer_gemini_score_time_s"] = 0.0
+            final_answer_call["gemini_total_time_s"] = float(
+                logic_teacher_time_s + float(final_answer_call.get("answer_gemini_score_time_s", 0.0) or 0.0)
+            )
+            logic_call_record["sttv_answer_logic_verifier_final_answer_score"] = float(final_answer_score)
+            logic_call_record["sttv_answer_logic_verifier_rewrite_skipped_no_edits"] = bool(rewrite_skipped_no_edits)
+            logic_call_record["sttv_answer_logic_verifier_logic_teacher_time_s"] = float(logic_teacher_time_s)
+            logic_call_record["sttv_answer_logic_verifier_answer_gemini_score_time_s"] = float(
+                final_answer_call.get("answer_gemini_score_time_s", 0.0) or 0.0
+            )
+            logic_call_record["sttv_answer_logic_verifier_gemini_total_time_s"] = float(
+                final_answer_call.get("gemini_total_time_s", 0.0) or 0.0
+            )
+            sttv_answer_logic_verifier_calls.append(logic_call_record)
+            current_answer_aux_record = dict(final_answer_call)
+            current_answer_output = str(final_answer_call.get("answer_output_text", "") or "")
 
         sttv_answer_aux_call = dict(final_answer_call)
 
