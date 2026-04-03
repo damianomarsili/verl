@@ -1507,6 +1507,31 @@ class RayPPOTrainer:
                 aggregated[row_idx] += float(score)
         return aggregated
 
+    def _count_sttv_aux_rows_by_parent_row(
+        self,
+        *,
+        batch_size: int,
+        aux_batch: Optional[DataProto],
+    ) -> list[int]:
+        counts = [0] * batch_size
+        if aux_batch is None or len(aux_batch) == 0:
+            return counts
+        parent_rows_raw = aux_batch.non_tensor_batch.get("sttv_parent_row_index")
+        if parent_rows_raw is None:
+            return counts
+        if isinstance(parent_rows_raw, np.ndarray):
+            parent_rows = parent_rows_raw.tolist()
+        else:
+            parent_rows = list(parent_rows_raw)
+        for row_idx_raw in parent_rows:
+            try:
+                row_idx = int(row_idx_raw)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= row_idx < batch_size:
+                counts[row_idx] += 1
+        return counts
+
     def _collect_sttv_sample_log_columns(
         self,
         *,
@@ -6196,6 +6221,22 @@ class RayPPOTrainer:
                                     else None
                                 ),
                             )
+                            answer_logic_verifier_round_counts = self._count_sttv_aux_rows_by_parent_row(
+                                batch_size=len(batch),
+                                aux_batch=answer_logic_verifier_aux_batch,
+                            )
+                            answer_logic_verifier_rewards = [
+                                (
+                                    float(reward_sum) / float(round_count)
+                                    if int(round_count) > 0
+                                    else 0.0
+                                )
+                                for reward_sum, round_count in zip(
+                                    answer_logic_verifier_rewards,
+                                    answer_logic_verifier_round_counts,
+                                    strict=True,
+                                )
+                            ]
                             weights = self._get_sttv_multi_objective_weights()
                             metrics["sttv/reward_weight_answer"] = float(weights["answer"])
                             metrics["sttv/reward_weight_loc"] = float(weights["loc"])
