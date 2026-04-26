@@ -18,12 +18,14 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 import os
 import socket
 
+os.environ.setdefault("RAY_ENABLE_UV_RUN_RUNTIME_ENV", "0")
+
 import hydra
 import ray
 from omegaconf import OmegaConf
 
 from verl.experimental.dataset.sampler import AbstractSampler
-from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
+from verl.trainer.constants_ppo import get_ppo_ray_runtime_env, with_default_ray_init_kwargs
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
@@ -43,6 +45,19 @@ def _task_runner_runtime_env(config) -> dict:
     if not sam3_device.startswith("cuda"):
         return {}
     return {"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}}
+
+
+def _get_hf_trust_remote_code(config) -> bool:
+    """Resolve trust_remote_code from data and model config.
+
+    Some multimodal models such as Molmo2 ship their processor through
+    remote code under the model path rather than the data config. When
+    only the model-side flag is enabled, using data.trust_remote_code
+    alone silently drops the processor and later breaks dataset loading.
+    """
+    data_trust_remote_code = bool(config.data.get("trust_remote_code", False))
+    model_trust_remote_code = bool(config.actor_rollout_ref.model.get("trust_remote_code", False))
+    return data_trust_remote_code or model_trust_remote_code
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
@@ -85,11 +100,12 @@ def run_ppo(config, task_runner_class=None) -> None:
             runtime_env_kwargs["env_vars"] = runtime_env_vars
 
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
-        ray_init_kwargs = OmegaConf.create(
-            {**ray_init_kwargs, "runtime_env": runtime_env}
+        ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
+        ray_init_kwargs = with_default_ray_init_kwargs(
+            OmegaConf.to_container(ray_init_kwargs, resolve=True)
         )
         print(f"ray init kwargs: {ray_init_kwargs}")
-        ray.init(**OmegaConf.to_container(ray_init_kwargs))
+        ray.init(**ray_init_kwargs)
 
     if task_runner_class is None:
         task_runner_class = ray.remote(num_cpus=1)(
@@ -355,7 +371,7 @@ class TaskRunner:
         # Instantiate the tokenizer and processor.
         from verl.utils import hf_processor, hf_tokenizer
 
-        trust_remote_code = config.data.get("trust_remote_code", False)
+        trust_remote_code = _get_hf_trust_remote_code(config)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         # Used for multimodal LLM, could be None
         processor = hf_processor(

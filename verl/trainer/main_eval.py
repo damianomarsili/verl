@@ -17,7 +17,10 @@ The input is a parquet file that contains N generated sequences and (optional) t
 
 """
 
+import os
 from collections import defaultdict
+
+os.environ.setdefault("RAY_ENABLE_UV_RUN_RUNTIME_ENV", "0")
 
 import hydra
 import numpy as np
@@ -26,6 +29,7 @@ import ray
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
+from verl.trainer.constants_ppo import with_default_ray_init_kwargs
 from verl.trainer.ppo.reward import get_custom_reward_fn
 from verl.utils.fs import copy_to_local
 
@@ -50,7 +54,9 @@ def main(config):
 
     # Initialize Ray
     if not ray.is_initialized():
-        ray.init(**OmegaConf.to_container(config.ray_kwargs.get("ray_init", {})))
+        ray_init_kwargs = OmegaConf.to_container(config.ray_kwargs.get("ray_init", {}), resolve=True)
+        ray_init_kwargs = with_default_ray_init_kwargs(ray_init_kwargs)
+        ray.init(**ray_init_kwargs)
 
     # evaluate test_score based on data source
     data_source_reward = defaultdict(list)

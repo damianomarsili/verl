@@ -17,6 +17,8 @@ Generate responses given a dataset of prompts
 
 import os
 
+os.environ.setdefault("RAY_ENABLE_UV_RUN_RUNTIME_ENV", "0")
+
 import hydra
 import numpy as np
 import ray
@@ -33,6 +35,7 @@ from omegaconf import OmegaConf
 from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
+from verl.trainer.constants_ppo import with_default_ray_init_kwargs
 from verl.utils import hf_tokenizer
 from verl.utils.fs import copy_to_local
 from verl.utils.hdfs_io import makedirs
@@ -53,8 +56,11 @@ def run_generation(config) -> None:
         runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
+        ray_init_kwargs = with_default_ray_init_kwargs(
+            OmegaConf.to_container(ray_init_kwargs, resolve=True)
+        )
         print(f"ray init kwargs: {ray_init_kwargs}")
-        ray.init(**OmegaConf.to_container(ray_init_kwargs))
+        ray.init(**ray_init_kwargs)
 
     ray.get(main_task.remote(config))
 

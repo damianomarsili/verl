@@ -1,9 +1,52 @@
 # Copyright 2025 Bytedance Ltd. and/or its affiliates
 import logging
 import os
+from typing import Any
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def is_molmo2_chat_template(*, tokenizer: Any = None, processor: Any = None, model_path: str | None = None) -> bool:
+    """Detect Molmo2 chat template usage.
+
+    Molmo2 enforces strict user/assistant alternation and its incremental
+    follow-up turns need slightly different handling from the Qwen-style
+    single-user-turn shortcut used elsewhere in STTV.
+    """
+    if processor is not None:
+        if processor.__class__.__name__ == "Molmo2Processor":
+            return True
+        config = getattr(processor, "config", None)
+        if getattr(config, "model_type", None) == "molmo2":
+            return True
+
+    if tokenizer is not None:
+        name_or_path = str(getattr(tokenizer, "name_or_path", "") or "")
+        if "molmo2" in name_or_path.lower():
+            return True
+
+    if model_path is not None and "molmo2" in str(model_path).lower():
+        return True
+
+    return False
+
+
+def build_molmo2_followup_user_suffix(tokenizer: Any, text: str) -> list[int]:
+    """Build the exact Molmo2 suffix for appending a follow-up user turn.
+
+    This preserves the existing STTV control flow while avoiding the
+    Qwen-style shortcut of tokenizing a standalone user message and then
+    stripping a synthetic system prompt.
+    """
+    suffix = (
+        "<|im_end|>\n"
+        "<|im_start|>user\n"
+        f"{text}"
+        "<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+    return tokenizer.encode(suffix, add_special_tokens=False)
 
 
 def initialize_system_prompt(tokenizer, **apply_chat_template_kwargs) -> list[int]:

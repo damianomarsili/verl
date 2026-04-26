@@ -20,6 +20,7 @@ from tensordict.tensorclass import NonTensorData
 
 os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
+os.environ.setdefault("RAY_ENABLE_UV_RUN_RUNTIME_ENV", "0")
 
 import logging
 
@@ -32,6 +33,7 @@ from torch.utils.data import DistributedSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
+from verl.trainer.constants_ppo import with_default_ray_init_kwargs
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint import CheckpointHandler, OrchestrationMode
 from verl.utils.dataset.dataset_utils import SFTTensorCollator
@@ -350,7 +352,8 @@ class SFTTrainer:
 
 
 def run_sft(config):
-    ray.init()
+    ray_init_kwargs = with_default_ray_init_kwargs()
+    ray.init(**ray_init_kwargs)
     trainer = SFTTrainer(config=config)
     trainer.fit()
 

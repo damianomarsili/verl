@@ -303,7 +303,11 @@ class RLHFDataset(Dataset):
         for message in messages:
             if not images and not videos:
                 continue
-            assert self.processor is not None, "processor is needed to process image and video"
+            assert self.processor is not None, (
+                "processor is needed to process image and video. "
+                "Ensure the model processor loads successfully; for remote-code multimodal models "
+                "such as Molmo2, set actor_rollout_ref.model.trust_remote_code=True."
+            )
 
             content = message["content"]
             if not isinstance(content, str):

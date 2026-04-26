@@ -18,11 +18,13 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 import os
 import socket
 
+os.environ.setdefault("RAY_ENABLE_UV_RUN_RUNTIME_ENV", "0")
+
 import hydra
 import ray
 from omegaconf import OmegaConf
 
-from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
+from verl.trainer.constants_ppo import get_ppo_ray_runtime_env, with_default_ray_init_kwargs
 from verl.trainer.main_ppo import TaskRunner as MainTaskRunner
 from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
 from verl.trainer.ppo.reward import load_reward_manager
@@ -74,8 +76,11 @@ def run_ppo(config, task_runner_class=None) -> None:
 
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
+        ray_init_kwargs = with_default_ray_init_kwargs(
+            OmegaConf.to_container(ray_init_kwargs, resolve=True)
+        )
         print(f"ray init kwargs: {ray_init_kwargs}")
-        ray.init(**OmegaConf.to_container(ray_init_kwargs))
+        ray.init(**ray_init_kwargs)
 
     if task_runner_class is None:
         task_runner_class = ray.remote(num_cpus=1)(TaskRunner)  # please make sure main_task is not scheduled on head

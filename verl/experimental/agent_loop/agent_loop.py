@@ -37,7 +37,7 @@ from verl.experimental.reward_loop import RewardLoopWorker
 from verl.protocol import DataProto, pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
 from verl.utils import hf_processor, hf_tokenizer
-from verl.utils.chat_template import initialize_system_prompt
+from verl.utils.chat_template import initialize_system_prompt, is_molmo2_chat_template
 from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
 from verl.utils.fs import copy_to_local
 from verl.utils.model import compute_position_id_with_mask
@@ -220,8 +220,24 @@ class AgentLoopBase(ABC):
         self.dataset_cls = dataset_cls
         self.dataset_config = dataset_config.config
         self.apply_chat_template_kwargs = self.dataset_config.get("apply_chat_template_kwargs", {})
-        self.system_prompt = initialize_system_prompt(self.tokenizer, **self.apply_chat_template_kwargs)
+        self._is_molmo2_chat_template = is_molmo2_chat_template(
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+            model_path=getattr(self.config.actor_rollout_ref.model, "path", None),
+        )
+        self._system_prompt: Optional[list[int]] = None
         self.loop = get_event_loop()
+
+    def _get_system_prompt(self) -> list[int]:
+        if self._is_molmo2_chat_template:
+            return []
+
+        if self._system_prompt is None:
+            self._system_prompt = initialize_system_prompt(
+                self.tokenizer,
+                **self.apply_chat_template_kwargs,
+            )
+        return self._system_prompt
 
     async def process_vision_info(self, messages: list[dict]) -> dict:
         """Extract images and videos from messages.
@@ -305,7 +321,7 @@ class AgentLoopBase(ABC):
             )
 
         if remove_system_prompt:
-            prompt_ids = prompt_ids[len(self.system_prompt) :]
+            prompt_ids = prompt_ids[len(self._get_system_prompt()) :]
 
         return prompt_ids
 

@@ -14,6 +14,9 @@
 
 import json
 import os
+import socket
+from pathlib import Path
+from typing import Any, Mapping
 
 from ray._private.runtime_env.constants import RAY_JOB_CONFIG_JSON_ENV_VAR
 
@@ -40,6 +43,45 @@ PPO_RAY_RUNTIME_ENV = {
 }
 
 
+def get_default_ray_temp_dir(
+    repo_root: str | os.PathLike[str] | None = None,
+    hostname: str | None = None,
+) -> str:
+    """Return the default Ray temp dir on the writable repo volume.
+
+    Ray defaults to `/tmp`, but this repo often runs on machines where `/tmp`
+    is much smaller than the workspace volume. Use a repo-local path instead,
+    split per host so multi-node jobs do not collide on shared storage.
+    """
+    base_dir = Path(repo_root) if repo_root is not None else Path(__file__).resolve().parents[3]
+    node_name = (hostname or socket.gethostname() or "localhost").split(".", maxsplit=1)[0]
+    return os.fspath(base_dir / ".ray" / node_name)
+
+
+def with_default_ray_init_kwargs(
+    ray_init_kwargs: Mapping[str, Any] | None = None,
+    repo_root: str | os.PathLike[str] | None = None,
+    hostname: str | None = None,
+) -> dict[str, Any]:
+    """Fill Ray init kwargs with a repo-local temp dir when none is configured."""
+    resolved_kwargs = dict(ray_init_kwargs or {})
+
+    configured_temp_dir = resolved_kwargs.get("_temp_dir")
+    if configured_temp_dir:
+        resolved_kwargs["_temp_dir"] = os.fspath(configured_temp_dir)
+        return resolved_kwargs
+
+    env_temp_dir = str(os.environ.get("RAY_TMPDIR", "") or "").strip()
+    if env_temp_dir:
+        resolved_kwargs["_temp_dir"] = env_temp_dir
+        return resolved_kwargs
+
+    default_temp_dir = get_default_ray_temp_dir(repo_root=repo_root, hostname=hostname)
+    Path(default_temp_dir).mkdir(parents=True, exist_ok=True)
+    resolved_kwargs["_temp_dir"] = default_temp_dir
+    return resolved_kwargs
+
+
 def get_ppo_ray_runtime_env():
     """
     A filter function to return the PPO Ray runtime environment.
@@ -51,7 +93,7 @@ def get_ppo_ray_runtime_env():
 
     runtime_env = {
         "env_vars": PPO_RAY_RUNTIME_ENV["env_vars"].copy(),
-        **({"working_dir": None} if working_dir is None else {}),
+        **({"working_dir": working_dir} if isinstance(working_dir, str) and working_dir else {}),
     }
     for key in list(runtime_env["env_vars"].keys()):
         if os.environ.get(key) is not None:

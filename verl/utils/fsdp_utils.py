@@ -17,6 +17,7 @@ import itertools
 import json
 import math
 import os
+import warnings
 from abc import ABC
 from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
@@ -121,12 +122,26 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
         policies.append(size_policy)
     elif fsdp_transformer_layer_cls_to_wrap is not None:
         transformer_cls_to_wrap = set()
+        missing_layer_classes = []
         for layer_class in fsdp_transformer_layer_cls_to_wrap:
             transformer_cls = get_module_class_from_name(module, layer_class)
             if transformer_cls is None:
-                raise Exception("Could not find the transformer layer class to wrap in the model.")
-            else:
-                transformer_cls_to_wrap.add(transformer_cls)
+                missing_layer_classes.append(layer_class)
+                continue
+            transformer_cls_to_wrap.add(transformer_cls)
+
+        if not transformer_cls_to_wrap:
+            raise Exception(
+                "Could not find any transformer layer classes to wrap in the model. "
+                f"Requested classes: {list(fsdp_transformer_layer_cls_to_wrap)}"
+            )
+
+        if missing_layer_classes:
+            warnings.warn(
+                "Some transformer layer classes requested for FSDP wrapping were not found in the model and "
+                f"will be ignored: {missing_layer_classes}",
+                stacklevel=2,
+            )
 
         transformer_policy = functools.partial(
             transformer_auto_wrap_policy,

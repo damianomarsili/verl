@@ -13,7 +13,10 @@
 # limitations under the License.
 
 
+import os
 import logging
+
+os.environ.setdefault("RAY_ENABLE_UV_RUN_RUNTIME_ENV", "0")
 
 import datasets
 import hydra
@@ -22,7 +25,7 @@ import torch
 from omegaconf import OmegaConf
 
 from verl import DataProto
-from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
+from verl.trainer.constants_ppo import get_ppo_ray_runtime_env, with_default_ray_init_kwargs
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.trainer.ppo.utils import Role
 from verl.utils.device import is_cuda_available
@@ -52,8 +55,11 @@ def main(config):
         runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
+        ray_init_kwargs = with_default_ray_init_kwargs(
+            OmegaConf.to_container(ray_init_kwargs, resolve=True)
+        )
         logger.info(f"ray init kwargs: {ray_init_kwargs}")
-        ray.init(**OmegaConf.to_container(ray_init_kwargs))
+        ray.init(**ray_init_kwargs)
 
     # Apply controller nsight profiling if configured
     if (

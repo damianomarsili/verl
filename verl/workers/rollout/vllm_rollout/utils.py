@@ -41,6 +41,14 @@ VLLM_LORA_PATH = "simon_lora_path"
 
 VLLM_ASCEND_REQUIRED_ENV_VARS = {"VLLM_ALL2ALL_BACKEND": "flashinfer_all2allv", "VLLM_ASCEND_ENABLE_NZ": "0"}
 
+MOLMO2_EMBEDDING_KEY = "model.transformer.wte.embedding"
+MOLMO2_NEW_EMBEDDING_KEY = "model.transformer.wte.new_embedding"
+MOLMO2_MERGED_EMBEDDING_KEY_SUFFIXES = (
+    "language_model.embed_tokens.weight",
+    "model.embed_tokens.weight",
+    "embed_tokens.weight",
+)
+
 
 def set_death_signal():
     """Kill the current process when the parent process exits."""
@@ -80,6 +88,86 @@ def get_vllm_max_lora_rank(lora_rank: int):
     for rank in vllm_max_lora_ranks:
         if lora_rank <= rank:
             return rank
+
+
+def _is_molmo2_vllm_model(model: Any) -> bool:
+    config = getattr(model, "config", None)
+    if getattr(config, "model_type", None) == "molmo2":
+        return True
+
+    text_config = getattr(config, "text_config", None)
+    if getattr(text_config, "model_type", None) == "molmo2_text":
+        return True
+
+    return type(model).__name__ == "Molmo2ForConditionalGeneration"
+
+
+def _get_molmo2_base_vocab_size(model: Any) -> int | None:
+    config = getattr(model, "config", None)
+    text_config = getattr(config, "text_config", None) or getattr(config, "llm_config", None) or config
+    return getattr(text_config, "vocab_size", None)
+
+
+def _split_molmo2_merged_embedding(
+    weights: list[tuple[str, torch.Tensor]],
+    model: Any,
+) -> list[tuple[str, torch.Tensor]]:
+    """Convert merged Molmo2 embeddings into the split keys vLLM expects."""
+    base_vocab_size = _get_molmo2_base_vocab_size(model)
+    if base_vocab_size is None:
+        return weights
+
+    normalized_weights: list[tuple[str, torch.Tensor]] = []
+    for name, weight in weights:
+        if any(name.endswith(suffix) for suffix in MOLMO2_MERGED_EMBEDDING_KEY_SUFFIXES):
+            extra_rows = weight.shape[0] - base_vocab_size
+            if extra_rows <= 0:
+                logger.warning(
+                    "Molmo2 merged embedding %s has incompatible shape %s for base vocab size %s; "
+                    "loading it unchanged.",
+                    name,
+                    tuple(weight.shape),
+                    base_vocab_size,
+                )
+                normalized_weights.append((name, weight))
+                continue
+
+            normalized_weights.append((MOLMO2_EMBEDDING_KEY, weight[:base_vocab_size]))
+            normalized_weights.append((MOLMO2_NEW_EMBEDDING_KEY, weight[base_vocab_size:]))
+        else:
+            normalized_weights.append((name, weight))
+
+    return normalized_weights
+
+
+def _prepare_molmo2_bucket_weights(
+    model: Any,
+    weights: list[tuple[str, torch.Tensor]],
+    embedding_cache: dict[str, torch.Tensor],
+    pending_weights: list[tuple[str, torch.Tensor]],
+) -> tuple[list[tuple[str, torch.Tensor]] | None, dict[str, torch.Tensor], list[tuple[str, torch.Tensor]]]:
+    """Make bucketed Molmo2 updates compatible with vLLM's full-call embedding merge."""
+    normalized_weights = _split_molmo2_merged_embedding(weights, model)
+
+    updated_cache = dict(embedding_cache)
+    next_pending = list(pending_weights)
+    for name, weight in normalized_weights:
+        if "wte.embedding" in name:
+            updated_cache["embedding"] = weight
+        elif "wte.new_embedding" in name:
+            updated_cache["new_embedding"] = weight
+        else:
+            next_pending.append((name, weight))
+
+    if "embedding" not in updated_cache or "new_embedding" not in updated_cache:
+        return None, updated_cache, next_pending
+
+    weights_to_load = [
+        (MOLMO2_EMBEDDING_KEY, updated_cache["embedding"]),
+        (MOLMO2_NEW_EMBEDDING_KEY, updated_cache["new_embedding"]),
+        *next_pending,
+    ]
+    return weights_to_load, updated_cache, []
 
 
 # https://github.com/vllm-project/vllm/issues/13175
@@ -180,6 +268,14 @@ class vLLMColocateWorkerExtension:
         if current_platform.device_type == "npu" and self.device is None:
             self.device = torch.device(f"npu:{self.local_rank}")
 
+        is_molmo2_standard_load = (
+            not peft_config and not is_fp8_model(self.model_runner.vllm_config) and _is_molmo2_vllm_model(self.model_runner.model)
+        )
+        if is_molmo2_standard_load:
+            self._molmo2_pending_weights: list[tuple[str, torch.Tensor]] = []
+            if not hasattr(self, "_molmo2_embedding_cache"):
+                self._molmo2_embedding_cache: dict[str, torch.Tensor] = {}
+
         # In async mode, make sure the old lora is removed before adding the new one
         if peft_config and base_sync_done:
             self.remove_lora(VLLM_LORA_INT_ID)
@@ -232,6 +328,13 @@ class vLLMColocateWorkerExtension:
         if shm is not None:
             shm.close()
             del shm
+        if is_molmo2_standard_load and getattr(self, "_molmo2_pending_weights", None):
+            pending_count = len(self._molmo2_pending_weights)
+            self._molmo2_pending_weights = []
+            raise ValueError(
+                "Molmo2 weight update finished before the embedding tensors needed for bucketed loading were received. "
+                f"Deferred bucket size: {pending_count} tensors."
+            )
         gc.collect()
         get_torch_device().ipc_collect()
         get_torch_device().empty_cache()
@@ -257,6 +360,20 @@ class vLLMColocateWorkerExtension:
                 loaded_params = load_quanted_weights(weights, self.model_runner)
                 logger.info(f"FP8 weights loaded (async), loaded_params: {len(loaded_params)}")
             else:
+                if _is_molmo2_vllm_model(self.model_runner.model):
+                    embedding_cache = getattr(self, "_molmo2_embedding_cache", {})
+                    pending_weights = getattr(self, "_molmo2_pending_weights", [])
+                    weights, embedding_cache, pending_weights = _prepare_molmo2_bucket_weights(
+                        self.model_runner.model,
+                        weights,
+                        embedding_cache=embedding_cache,
+                        pending_weights=pending_weights,
+                    )
+                    self._molmo2_embedding_cache = embedding_cache
+                    self._molmo2_pending_weights = pending_weights
+                    if weights is None:
+                        logger.info("Deferring Molmo2 weight bucket until embedding tensors are available.")
+                        return
                 logger.info("Loading standard weights (non-FP8, async)")
                 self.model_runner.model.load_weights(weights)
 
